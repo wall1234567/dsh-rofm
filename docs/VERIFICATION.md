@@ -21,11 +21,11 @@ NODE=node
 "$NODE" --test test/*.test.mjs
 # ✔ tests 119  pass 119  fail 0
 
-# DSH 适配层（mock session/context，含 memory_judge 工具）：53 个测试
+# DSH 适配层（mock session/context，含 memory_judge 工具）：54 个测试
 "$NODE" --test test-adapter/*.test.mjs
-# ✔ tests 53  pass 53  fail 0
+# ✔ tests 54  pass 54  fail 0
 
-# 一次性运行全部（引擎 + 适配层 + 模拟）：173 个测试
+# 一次性运行全部（引擎 + 适配层 + 模拟）：174 个测试
 npm test
 
 # 端到端模拟 + 测试阶段报告
@@ -34,7 +34,7 @@ npm test
 "$NODE" tools/show-recall.mjs
 ```
 
-当前测试数字为引擎 119/119、适配层 53/53（§13 记录了功能修订的运行，§14 记录了
+当前测试数字为引擎 119/119、适配层 54/54（§13 记录了功能修订的运行，§14 记录了
 开源前代码 / 测试审计与新增回归）。
 
 覆盖内容：erf/p(n) 数值、关键词抽取与匹配、α 范围与高 α 警告、压缩触发/20%
@@ -581,3 +581,44 @@ mock 保真度。所有修复都必须先复现、再补回归测试、最后做
 - SPEC §2 “percentages clamped to (0,100]” 与实现“非法值替换为默认值 + warning”措辞可再收紧；
 - `storage.indexFile`/`statsFile` 接受 `../` 相对路径 —— 无权限边界（`storage.dir` 本就允许绝对路径），
   仅建议只在手工配置中这样用。
+
+## 15. 1.1.0：任务区块增强（2026-10-26）
+
+### 15.1 变更
+
+- **复核条目（`rescorePending`）显示完整原文与上次评分理由**：`dsh-rofm:memory-tasks`
+  区块里每条待复核记忆现在形如：
+  ```text
+  1. id=mem-… · 标题=… · 现有 α=0.70 β=+4.0 · 关键词=星港、灰度
+     上次评分理由：用户当时确认这是玩笑
+     原文：
+     user: …
+     assistant: …
+  ```
+  `上次评分理由` 来自 `meta.judgeReason`（无记录时显示 `（无记录）`）；`原文` 是该
+  folder 的**完整原文**（`memoryFolderReview()` 按 `messageToText` 渲染 role 前缀，
+  不截断），原文不可读时保留该条并标记 `（原文为空或不可读）`。
+- **列表上限 6/6 → 12/12**：每轮最多列 12 条待评分新归档 + 12 条待复核；评分口径
+  新增一条复核说明。
+- 版本号 `package.json` / `engine/package.json` = **1.1.0**；`memory_judge` schema
+  未变，任务区块只是追加信息（向后兼容）。
+
+### 15.2 验证（本机真实运行）
+
+- `node --test test/*.test.mjs` → **119/119 pass**；
+- `node --test test-adapter/*.test.mjs` → **54/54 pass**；
+- `npm test`（= `node --test`，含 `test/simulate.mjs`）→ **174/174 pass**；
+- 新增/更新用例：
+  - `memory-tasks section caps each list at 12 entries`：14 个待评分 + 14 个待复核
+    fixture，断言两个列表各只列 12 条；
+  - `re-review entries quote the full original text and the last judge reason`：
+    原文尾部标记（位于 160 字摘要窗口之外）可见、`上次评分理由：用户当时确认这是玩笑`
+    可见、损坏 `context.json` 的 folder 显示 `（原文为空或不可读）` 且工具不崩溃；
+- `node test/simulate.mjs`、`node engine/cli.mjs --help`、`node tools/recall-report.mjs --help`、
+  `node tools/show-recall.mjs --json` 均 exit 0。
+
+### 15.3 注意
+
+- 复核条目显示完整原文会让任务区块变长（每条约为一个 folder 的原文；folder 目标约
+  `compress.targetChunkChars` 默认 1200 字，超大消息按块切分）。12 条时请预留相应
+  上下文空间；如需要可在后续版本加一个可配置的原文显示上限。

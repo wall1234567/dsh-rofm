@@ -1,6 +1,6 @@
 {
   "name": "dsh-rofm-engine",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "private": true,
   "type": "module",
   "description": "Standalone zero-dependency memory engine for the dsh-rofm DSH plugin. This nested package.json only pins ESM resolution for engine/*.js so the engine works regardless of the root package type."

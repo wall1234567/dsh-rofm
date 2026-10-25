@@ -3,6 +3,33 @@
 All notable changes to `dsh-rofm` are documented here.
 The project follows a lightweight [SemVer](https://semver.org/) scheme.
 
+## [1.1.0] — 2026-10-26
+
+### Added（记忆评分任务增强）
+
+- **复核条目显示完整原文与上次评分理由**：`rescorePending` 的 folder 现在在
+  `dsh-rofm:memory-tasks` 区块里附上 `上次评分理由：…`（`meta.judgeReason`，
+  无记录时显示 `（无记录）`）和缩进的 `原文：` 段落（该 folder 的完整原文，按
+  `role: content` 渲染，不截断）。再归档已经把这条回忆从注入块移除，旧实现只给
+  标题/关键词/旧 α/β，模型只能凭标题重判；现在模型能按原文复核。原文不可读时该
+  条仍保留并标记 `（原文为空或不可读）`，不会被静默丢弃。
+- **任务区块列表上限 6 → 12**：每轮最多列 **12 条待评分新归档 + 12 条待复核**；
+  评分口径新增一条“复核条目附带完整原文与上次评分理由”的说明。
+- 版本号 **1.1.0**（新行为，向后兼容：`memory_judge` schema 不变，任务区块只是在
+  原有行后追加信息）。
+
+### Tests
+
+- `test-adapter/plugin-mock.test.mjs`：`memory-tasks section caps each list at 12
+  entries`（14+14 fixtures → 各 12 条）与 `re-review entries quote the full
+  original text and the last judge reason`（超出 160 字摘要窗口的尾部标记、上次
+  评分理由、损坏 folder 的降级显示）。
+
+### Docs
+
+- README §1.2、`docs/SPEC.md` §4.2 与测试矩阵、`docs/VERIFICATION.md` §15 同步；
+  测试基线更新为引擎 119 / 适配层 54（`node --test` 共 174）。
+
 ## [1.0.0] — 2026-10-24（updated 2026-10-25 / 本次修订）
 
 首个开源稳定版（first open-source stable release）。2026-10-25 的修订仍属于 1.0.0

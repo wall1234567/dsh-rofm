@@ -1057,16 +1057,25 @@ test('memory-tasks section lists pending folders with title, summary and the rub
   })
 })
 
-test('memory-tasks section caps each list at 6 entries', async () => {
+test('memory-tasks section caps each list at 12 entries', async () => {
   await withTempDirAsync(async (dir) => {
     const memoryDir = path.join(dir, 'memory')
     mkdirSync(memoryDir, { recursive: true })
-    for (let index = 0; index < 8; index += 1) {
-      writeFolderFixture(memoryDir, `mem-20260101T00000${index}Z-000${index + 1}`, {
+    for (let index = 0; index < 14; index += 1) {
+      writeFolderFixture(memoryDir, `mem-20260101T0000${String(index).padStart(2, '0')}Z-${String(index + 1).padStart(4, '0')}`, {
         text: `PENDING-${index}`,
         createdAt: 1000 + index,
         scored: false,
         keywords: ['pending'],
+      })
+    }
+    for (let index = 0; index < 14; index += 1) {
+      writeFolderFixture(memoryDir, `mem-20260102T0000${String(index).padStart(2, '0')}Z-${String(index + 1).padStart(4, '0')}`, {
+        text: `RESCORE-${index}`,
+        createdAt: 5000 + index,
+        scored: true,
+        rescorePending: true,
+        keywords: ['rescore'],
       })
     }
     const session = new FakeSession({ id: 'session-cap' })
@@ -1075,8 +1084,62 @@ test('memory-tasks section caps each list at 6 entries', async () => {
     const plugin = new RofmPlugin(ctx, makeOverrides(memoryDir))
     plugin.start()
     const text = tasksText(capture, session)
-    const itemLines = text.split('\n').filter((line) => /^\d+\. id=/.test(line))
-    assert.equal(itemLines.length, 6, `only six pending entries are listed, got ${itemLines.length}`)
+    const [pendingPart = '', rescorePart = ''] = text.split('### 待复核的已召回记忆')
+    const countItems = (part) => (part.match(/^\d+\. id=/gm) ?? []).length
+    assert.equal(countItems(pendingPart), 12, 'only twelve pending entries are listed')
+    assert.equal(countItems(rescorePart), 12, 'only twelve re-review entries are listed')
+  })
+})
+
+test('re-review entries quote the full original text and the last judge reason', async () => {
+  await withTempDirAsync(async (dir) => {
+    const memoryDir = path.join(dir, 'memory')
+    mkdirSync(memoryDir, { recursive: true })
+    // The tail marker sits far beyond the 160-char summary window, so finding it
+    // in the task section proves the full archived text is rendered.
+    const longText = `REVIEW-BEGIN-${'甲'.repeat(260)}-REVIEW-END-MARKER`
+    const id = 'mem-20260103T000000Z-0001'
+    writeFolderFixture(memoryDir, id, { text: longText, createdAt: 1000, alpha: 0.7, beta: 4, keywords: ['星港', '灰度'] })
+    // Give the folder a short title and the reason recorded by its last judgement,
+    // so the test can tell title / reason / body apart.
+    const metaPath = path.join(memoryDir, id, 'meta.json')
+    const meta = JSON.parse(readFileSync(metaPath, 'utf8'))
+    meta.title = '短标题'
+    meta.judgeReason = '用户当时确认这是玩笑'
+    writeFileSync(metaPath, JSON.stringify(meta))
+    const indexPath = path.join(memoryDir, 'index.json')
+    const index = JSON.parse(readFileSync(indexPath, 'utf8'))
+    index.folders.find((folder) => folder.id === id).title = '短标题'
+    writeFileSync(indexPath, JSON.stringify(index))
+
+    // A second folder whose context.json is unreadable must stay in the queue,
+    // flagged instead of dropped.
+    const corruptId = 'mem-20260103T000000Z-0002'
+    writeFolderFixture(memoryDir, corruptId, { text: 'CORRUPT-CONTENT', createdAt: 2000 })
+    rmSync(path.join(memoryDir, corruptId, 'context.json'))
+
+    const session = new FakeSession({ id: 'session-review' })
+    appendSystem(session)
+    const { ctx, capture } = makeContext(session)
+    const plugin = new RofmPlugin(ctx, makeOverrides(memoryDir))
+    plugin.start()
+    markRescorePending(plugin, session, memoryDir, id)
+    markRescorePending(plugin, session, memoryDir, corruptId)
+    const text = tasksText(capture, session)
+
+    assert.ok(text.includes('### 待复核的已召回记忆（只需判断 alpha / beta 是否要修改，不新建记忆）'))
+    assert.ok(text.includes(`id=${id}`))
+    assert.ok(text.includes('标题=短标题'))
+    assert.ok(text.includes('现有 α=0.70 β=+4.0'))
+    assert.ok(text.includes('上次评分理由：用户当时确认这是玩笑'), 'shows the last judge reason')
+    assert.ok(text.includes('原文：'))
+    assert.ok(text.includes('REVIEW-END-MARKER'), 'full original text, not the 160-char summary')
+    assert.ok(text.includes('user: REVIEW-BEGIN-'), 'renders the archived messages with role prefixes')
+    assert.ok(text.length > longText.length, 'the task section really contains the full body')
+    // Unreadable folder: listed with explicit fallbacks instead of crashing.
+    assert.ok(text.includes(`id=${corruptId}`))
+    assert.ok(text.includes('上次评分理由：（无记录）'))
+    assert.ok(text.includes('（原文为空或不可读）'))
   })
 })
 

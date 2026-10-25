@@ -5,7 +5,7 @@
 `CHANGELOG.md`、GitHub Actions CI（`.github/workflows/ci.yml`）。
 
 > 发布前检查：`npm test`（= `node --test`）、`node test/simulate.mjs` 全部通过
-> （当前基线：引擎 119、适配层 53，共 173 个测试）；`npm pack --dry-run` 的文件清单里
+> （当前基线：引擎 119、适配层 54，共 174 个测试）；`npm pack --dry-run` 的文件清单里
 > 没有 `memory/` 运行时数据；`git status` 干净；`memory/` 里只有 `.gitkeep`。
 
 ## 1. 认证（三选一）

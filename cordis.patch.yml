@@ -1,0 +1,29 @@
+# ============================================================================
+# dsh-rofm —— DSH bundle patch
+# ============================================================================
+# 只插入一个纯 Host 插件行：没有 Client 半区，没有额外进程。
+#
+# 安装（本地目录会以 link 形式挂进当前 profile）：
+#   plugin_manager(action: "install_bundle", target: "<插件目录绝对路径>")
+#   从 GitHub clone 下来的目录同样适用。
+#
+# 关闭插件的两种方式：
+#   1. 在插件管理里禁用 dsh-rofm 这一行（Cordis 会卸载监听器，彻底停止）；
+#   2. 把 config.json 里的 "enabled" 改成 false（下一次事件起直接返回，不读不写）。
+#
+# 绝大多数参数都在插件目录的 config.json 里调，不需要动这里。
+# 如果你想在 profile 层覆盖少数参数，取消下面 config 的注释即可（整体覆盖 config.json，
+# 未写的字段用插件内置默认值）：
+# ============================================================================
+
+- insert:
+    - id: dsh-rofm
+      name: dsh-rofm
+      # config:
+      #   compress:
+      #     triggerPercent: 60
+      #     compressPercent: 20
+      #   recall:
+      #     firstGenMax: 10
+      #     mu: 5
+      #     sigma: 3

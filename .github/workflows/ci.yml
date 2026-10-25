@@ -1,0 +1,43 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: node ${{ matrix.node }} / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        node: [20, 22, 24]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      # `shell: bash` keeps the test-file glob identical on Windows runners.
+      - name: Engine tests (zero dependencies)
+        shell: bash
+        run: node --test test/*.test.mjs
+
+      - name: DSH adapter tests (mocked session/context)
+        shell: bash
+        run: node --test test-adapter/*.test.mjs
+
+      - name: End-to-end simulation
+        shell: bash
+        run: node test/simulate.mjs
+
+      - name: CLI smoke test
+        shell: bash
+        run: node engine/cli.mjs --help

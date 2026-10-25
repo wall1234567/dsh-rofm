@@ -1,0 +1,72 @@
+{
+  "_readme": "这是 dsh-rofm 的主配置文件；改完保存即可，插件会在下一次用户消息/模型步骤前按文件内容自动热加载（mtime 相同也能识别；写到一半的坏 JSON 会保留上一次可用配置）。所有 *_Percent 都是百分数。注意：importance 的 α 是回忆概率乘数，调高 importance.max 或让大量文件夹拿到 0.9+ 会让它们几乎每次都被回忆，请慎重设置高重要性。归档不调用模型：新归档先以“待评分”落盘（未评分的记忆不参与回忆），由当前会话模型结合当前语境通过 memory_judge 工具提交 α（0.01~1）、β（信赖度 -10~10，不参与回忆概率，只用于提示阅读模型该回忆的可信度）与关键词。β 范围是固定常量，不提供配置项。",
+  "enabled": true,
+  "compress": {
+    "enabled": true,
+    "triggerPercent": 60,
+    "compressPercent": 20,
+    "contextWindowTokens": 0,
+    "minContextTokens": 512,
+    "minMessagesToCompress": 4,
+    "minChunkChars": 200,
+    "targetChunkChars": 1200,
+    "maxFoldersPerRun": 100,
+    "keepRecentMessages": 2,
+    "maxBoundaryOvershoot": 1.25,
+    "applyToSubagents": false,
+    "applyToMainSessions": true,
+    "preStepEnabled": true,
+    "emergencyPercent": 85,
+    "emergencyCompressPercent": 40,
+    "maxExtraPasses": 2,
+    "hardLimitPercent": 95
+  },
+  "importance": {
+    "min": 0.01,
+    "max": 1,
+    "warnAbove": 0.8,
+    "weights": {
+      "keywords": 0.3,
+      "decisions": 0.25,
+      "userDensity": 0.2,
+      "code": 0.1,
+      "recency": 0.15
+    }
+  },
+  "keywords": {
+    "min": 3,
+    "max": 8,
+    "extraStopwords": [],
+    "matchMode": "contains"
+  },
+  "recall": {
+    "enabled": true,
+    "firstGenMax": 10,
+    "mu": 5,
+    "sigma": 3,
+    "maxGeneration": 0,
+    "probabilityScale": 1,
+    "seed": 0,
+    "sort": "createdAt",
+    "applyToSubagents": false,
+    "applyToMainSessions": true,
+    "maxRecalledBlocks": 64,
+    "maxRecalledChars": 120000,
+    "persistInjected": true,
+    "triggerSourceKinds": ["user"]
+  },
+  "storage": {
+    "dir": "memory",
+    "perSession": true,
+    "indexFile": "index.json",
+    "statsFile": "stats.jsonl",
+    "maxFolders": 10000
+  },
+  "logging": {
+    "enabled": true,
+    "verbose": false
+  },
+  "test": {
+    "dryRun": false
+  }
+}

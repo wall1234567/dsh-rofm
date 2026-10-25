@@ -1,0 +1,19 @@
+# Runtime memory data — this directory itself must exist (requirement: memory/ inside the plugin).
+# Only the placeholder is tracked so a fresh clone has the folder.
+memory/*
+!memory/.gitkeep
+
+# DSH / editor noise
+node_modules/
+.DS_Store
+Thumbs.db
+*.log
+
+# Local scratch / secrets / coverage
+.work/
+*.tmp
+*.tgz
+.npmrc
+.env
+.env.*
+coverage/

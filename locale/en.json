@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Memory Recall",
+    "description": "Archives the earliest conversation context into memory/ folders as *pending* entries (no model call during archiving); the next request's system prompt gets a memory-scoring task section and the current session model submits α, trust β and keywords through the memory_judge tool in its own context — unscored memories are not recalled. Later matching memories are recalled by keyword with importance-weighted probability, with a per-memory β usage preamble; when the context exceeds the threshold again the oldest recalled entries are removed from the injected block and marked for re-review (no new folders are created). Restarts restore a v2 snapshot of the recalled block. Disabling the plugin unregisters the tool, the prompt sections and every listener."
+  }
+}

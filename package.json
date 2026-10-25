@@ -1,0 +1,59 @@
+{
+  "name": "dsh-rofm",
+  "version": "1.0.0",
+  "description": "DSH 长期记忆插件：上下文超过阈值时把最早的一段对话归档进 memory/ 回忆文件夹，之后按关键词与重要性概率自动回忆。 · DSH long-term memory: archives the earliest context into memory/ folders and recalls it by keyword probability.",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "test": "node --test",
+    "simulate": "node test/simulate.mjs",
+    "cli": "node engine/cli.mjs --help",
+    "check": "node --test && node test/simulate.mjs && node engine/cli.mjs --help"
+  },
+  "exports": {
+    ".": "./index.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "lib",
+    "engine",
+    "tools",
+    "locale/*.json",
+    "icon.svg",
+    "cordis.patch.yml",
+    "config.json",
+    "memory/.gitkeep",
+    "docs",
+    "README.md",
+    "LICENSE"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "memory",
+    "recall",
+    "context"
+  ],
+  "author": "dsh-rofm contributors",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/wall1234567/dsh-rofm.git"
+  },
+  "homepage": "https://github.com/wall1234567/dsh-rofm#readme",
+  "bugs": {
+    "url": "https://github.com/wall1234567/dsh-rofm/issues"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT"
+}

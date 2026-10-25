@@ -1,0 +1,8 @@
+# Keep sources LF in the repository regardless of the authoring OS.
+* text=auto
+*.js text eol=lf
+*.mjs text eol=lf
+*.json text eol=lf
+*.md text eol=lf
+*.yml text eol=lf
+*.svg text eol=lf

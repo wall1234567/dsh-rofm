@@ -75,6 +75,10 @@ The project follows a lightweight [SemVer](https://semver.org/) scheme.
   `node tools/selfcheck.mjs` 在本机真实数据上 **4 passed, 1 warnings, 0 failed**（WARN 为
   旧版本遗留的多条注记，历史数据不算 FAIL）。
 
+- **CI 兼容**：`node:zlib` 的 zstd 只从 Node 22.15/23.8 起提供，Node 20 上 `test/repair-session-log.test.mjs`
+  与 `test/selfcheck.test.mjs` 自动 skip（其余用例照常跑），CI 矩阵保持 Node 20/22/24 × Linux/Windows，
+  并新增 `tools/selfcheck.mjs` 冒烟步骤。
+
 ### Docs
 
 - README：头部 v1.2 摘要、§1.1（标题规则/注记合并/ pinned 分类）、§1.2（100+100 与上下文代价）、

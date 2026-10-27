@@ -41,3 +41,9 @@ jobs:
       - name: CLI smoke test
         shell: bash
         run: node engine/cli.mjs --help
+
+      # No DSH session logs on runners: the session-log check reports a WARN and
+      # the tool still exits 0 — this only proves the shipped CLI runs end to end.
+      - name: Self-check smoke test
+        shell: bash
+        run: node tools/selfcheck.mjs

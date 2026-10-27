@@ -338,7 +338,7 @@ function withTempDir(fn) {
   try {
     return fn(dir)
   } finally {
-    rmSync(dir, { recursive: true, force: true })
+    rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 })
   }
 }
 
@@ -348,7 +348,7 @@ async function withTempDirAsync(fn) {
   try {
     return await fn(dir)
   } finally {
-    rmSync(dir, { recursive: true, force: true })
+    rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 })
   }
 }
 

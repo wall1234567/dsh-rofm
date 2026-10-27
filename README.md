@@ -453,7 +453,8 @@ git clone https://github.com/<you>/dsh-rofm.git
   回忆/找图仍可用，不会因为某个版本缺服务而崩掉；
 - 归档事务失败会回滚刚写的 `memory/` 文件夹，会话上下文保持原样（版本差异退化为“不归档”，不是“坏数据”）；
 - 代码只用 ES2022 级语法与 Node 内建模块（`node:fs/path/crypto`），DSH 自带 Node 运行时满足；
-  独立引擎在 Node 20+ 可运行；
+  独立引擎在 Node 20+ 可运行；`tools/repair-session-log.mjs` 与 `tools/selfcheck.mjs` 的 zstd
+  会话日志处理需要 Node ≥22.15（`node:zlib` 的 zstd API；旧版 Node 上相关测试自动 skip）；
 - **每会话独立目录**：一套代码不依赖全局状态，升级/多会话并发都不会串记忆。
 
 ---

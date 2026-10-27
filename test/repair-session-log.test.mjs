@@ -8,6 +8,7 @@
 
 import assert from 'node:assert/strict'
 import test from 'node:test'
+import zlib from 'node:zlib'
 
 import {
   decodeJournal,
@@ -15,6 +16,13 @@ import {
   locateFrames,
   repairJournalText,
 } from '../tools/repair-session-log.mjs'
+
+// node:zlib's zstd codecs landed in Node 22.15/23.8. The repair tool itself cannot
+// encode/decode zstd journals on older Node, so these cases are skipped there
+// (the rest of the engine suite still runs).
+const ZSTD_SUPPORTED =
+  typeof zlib.zstdCompressSync === 'function' && typeof zlib.zstdDecompressSync === 'function'
+const testIfZstd = ZSTD_SUPPORTED ? test : test.skip
 
 const HEADER = JSON.stringify({ type: 'session', version: 4, id: 'session-x', createdAt: 1, cwd: 'C:/work' })
 
@@ -37,7 +45,7 @@ function journal(...lines) {
   return [HEADER, ...lines].join('\n') + '\n'
 }
 
-test('repair: an id-less synthetic user message gains exactly one id', () => {
+testIfZstd('repair: an id-less synthetic user message gains exactly one id', () => {
   const input = journal(userEvent(1, undefined), JSON.stringify({ type: 'turn/start', seq: 2, data: { turn: 1 } }))
   const result = repairJournalText(input, { idFactory: () => 'fixed-id' })
   assert.equal(result.changed, true)
@@ -51,7 +59,7 @@ test('repair: an id-less synthetic user message gains exactly one id', () => {
   assert.equal(result.text.split('\n')[0], HEADER, 'the header line is preserved')
 })
 
-test('repair: a journal that already carries ids is left untouched (idempotent)', () => {
+testIfZstd('repair: a journal that already carries ids is left untouched (idempotent)', () => {
   const input = journal(userEvent(1, 'already-there'))
   const first = repairJournalText(input, { idFactory: () => 'new-id' })
   assert.equal(first.changed, false)
@@ -64,7 +72,7 @@ test('repair: a journal that already carries ids is left untouched (idempotent)'
   assert.equal(again.changed, false, 'a repaired journal reports no further repairs')
 })
 
-test('repair: message-bearing events use data.message, user/message uses data itself', () => {
+testIfZstd('repair: message-bearing events use data.message, user/message uses data itself', () => {
   const assistant = JSON.stringify({
     type: 'assistant/message',
     seq: 1,
@@ -77,7 +85,7 @@ test('repair: message-bearing events use data.message, user/message uses data it
   assert.equal(message.source.model, 'm')
 })
 
-test('repair: a message missing role/source/content is reported, not invented', () => {
+testIfZstd('repair: a message missing role/source/content is reported, not invented', () => {
   const hollow = JSON.stringify({ type: 'user/message', seq: 7, data: { surfaceOp: 'append' } })
   const result = repairJournalText(journal(hollow), { idFactory: () => 'x' })
   assert.equal(result.changed, false)
@@ -87,14 +95,14 @@ test('repair: a message missing role/source/content is reported, not invented', 
   assert.match(result.unrepairable[0].reason, /role\/source\/content/)
 })
 
-test('repair: an unparsable event line is reported instead of dropped', () => {
+testIfZstd('repair: an unparsable event line is reported instead of dropped', () => {
   const result = repairJournalText(journal('{not json'), { idFactory: () => 'x' })
   assert.equal(result.unrepairable.length, 1)
   assert.equal(result.unrepairable[0].type, 'unparsable-line')
   assert.ok(result.text.includes('{not json'), 'the broken line is preserved for a human')
 })
 
-test('journal: decode/encode round-trips a multi-frame zstd container', () => {
+testIfZstd('journal: decode/encode round-trips a multi-frame zstd container', () => {
   const events = []
   for (let seq = 0; seq < 300; seq += 1) events.push(userEvent(seq, `id-${seq}`))
   const text = journal(...events)

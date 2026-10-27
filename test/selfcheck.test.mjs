@@ -10,12 +10,18 @@
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
 import fs from 'node:fs'
+import zlib from 'node:zlib'
 import os from 'node:os'
 import path from 'node:path'
 import test, { after } from 'node:test'
 import { fileURLToPath } from 'node:url'
 
 import { encodeJournal } from '../tools/repair-session-log.mjs'
+
+// zstd session-log fixtures need node:zlib zstd (Node 22.15+); skip on older Node.
+const ZSTD_SUPPORTED =
+  typeof zlib.zstdCompressSync === 'function' && typeof zlib.zstdDecompressSync === 'function'
+const testIfZstd = ZSTD_SUPPORTED ? test : test.skip
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const SELFCHECK = path.join(REPO_ROOT, 'tools', 'selfcheck.mjs')
@@ -298,7 +304,7 @@ function writeSessionLog(sessionsDir, sessionId, events) {
 // tests
 // ---------------------------------------------------------------------------
 
-test('selfcheck: a healthy store and recall state pass and exit 0', () => {
+testIfZstd('selfcheck: a healthy store and recall state pass and exit 0', () => {
   const root = makeTempDir()
   const store = createGoodStore(root)
   const sessionsDir = createEmptySessionsDir(root)
@@ -313,7 +319,7 @@ test('selfcheck: a healthy store and recall state pass and exit 0', () => {
   assert.equal(findCheck(json, 'session logs').status, 'WARN')
 })
 
-test('selfcheck: corrupt index.json fails the memory store check', () => {
+testIfZstd('selfcheck: corrupt index.json fails the memory store check', () => {
   const { store, sessionsDir } = corruptStoreFixture((fixture) => {
     fs.writeFileSync(path.join(fixture.storeDir, 'index.json'), '{ this is not json', 'utf8')
   })
@@ -325,7 +331,7 @@ test('selfcheck: corrupt index.json fails the memory store check', () => {
   assert.equal(json.exitCode, 1)
 })
 
-test('selfcheck: an out-of-range meta alpha fails the memory store check', () => {
+testIfZstd('selfcheck: an out-of-range meta alpha fails the memory store check', () => {
   const { store, sessionsDir } = corruptStoreFixture((fixture) => {
     const metaPath = path.join(fixture.storeDir, fixture.meta.id, 'meta.json')
     writeJson(metaPath, { ...fixture.meta, alpha: 2.5 })
@@ -337,7 +343,7 @@ test('selfcheck: an out-of-range meta alpha fails the memory store check', () =>
   assert.equal(status, 1)
 })
 
-test('selfcheck: an unsafe folder id in index.json fails the memory store check', () => {
+testIfZstd('selfcheck: an unsafe folder id in index.json fails the memory store check', () => {
   const { store, sessionsDir } = corruptStoreFixture((fixture) => {
     writeJson(path.join(fixture.storeDir, 'index.json'), {
       version: 1,
@@ -353,7 +359,7 @@ test('selfcheck: an unsafe folder id in index.json fails the memory store check'
   assert.equal(status, 1)
 })
 
-test('selfcheck: a corrupt stats.jsonl line fails the memory store check', () => {
+testIfZstd('selfcheck: a corrupt stats.jsonl line fails the memory store check', () => {
   const { store, sessionsDir } = corruptStoreFixture((fixture) => {
     fs.appendFileSync(path.join(fixture.storeDir, 'stats.jsonl'), '{broken telemetry line\n', 'utf8')
   })
@@ -364,7 +370,7 @@ test('selfcheck: a corrupt stats.jsonl line fails the memory store check', () =>
   assert.equal(status, 1)
 })
 
-test('selfcheck: an inconsistent recall-state snapshot fails the recall state check', () => {
+testIfZstd('selfcheck: an inconsistent recall-state snapshot fails the recall state check', () => {
   const { store, sessionsDir } = corruptStoreFixture((fixture) => {
     // A v2 snapshot whose ids array and additions array disagree.
     writeJson(path.join(fixture.storeDir, 'recall-state.json'), recallStatePayload(fixture.meta, { ids: [] }))
@@ -377,7 +383,7 @@ test('selfcheck: an inconsistent recall-state snapshot fails the recall state ch
   assert.equal(json.exitCode, 1)
 })
 
-test('selfcheck: two dsh-rofm checkpoint notes on one final surface are a WARN (legacy)', () => {
+testIfZstd('selfcheck: two dsh-rofm checkpoint notes on one final surface are a WARN (legacy)', () => {
   const root = makeTempDir()
   const sessionsDir = path.join(root, 'sessions')
   fs.mkdirSync(sessionsDir, { recursive: true })
@@ -392,7 +398,7 @@ test('selfcheck: two dsh-rofm checkpoint notes on one final surface are a WARN (
   assert.ok(json.checks.every((entry) => entry.status !== 'FAIL'))
 })
 
-test('selfcheck: a note appendix with re-injected runtime context is a FAIL', () => {
+testIfZstd('selfcheck: a note appendix with re-injected runtime context is a FAIL', () => {
   const root = makeTempDir()
   const sessionsDir = path.join(root, 'sessions')
   fs.mkdirSync(sessionsDir, { recursive: true })
@@ -413,7 +419,7 @@ test('selfcheck: a note appendix with re-injected runtime context is a FAIL', ()
   assert.equal(status, 1)
 })
 
-test('selfcheck: a foreign checkpoint is counted but does not fail', () => {
+testIfZstd('selfcheck: a foreign checkpoint is counted but does not fail', () => {
   const root = makeTempDir()
   const sessionsDir = path.join(root, 'sessions')
   fs.mkdirSync(sessionsDir, { recursive: true })
@@ -430,7 +436,7 @@ test('selfcheck: a foreign checkpoint is counted but does not fail', () => {
   assert.equal(status, 0)
 })
 
-test('selfcheck: --json returns the documented machine-readable shape', () => {
+testIfZstd('selfcheck: --json returns the documented machine-readable shape', () => {
   const root = makeTempDir()
   const store = createGoodStore(root)
   const sessionsDir = createEmptySessionsDir(root)
@@ -462,7 +468,7 @@ test('selfcheck: --json returns the documented machine-readable shape', () => {
   assert.ok(stdout.trimStart().startsWith('{'), '--json prints JSON only, no human lines')
 })
 
-test('selfcheck: human output uses check lines and the summary line', () => {
+testIfZstd('selfcheck: human output uses check lines and the summary line', () => {
   const root = makeTempDir()
   const store = createGoodStore(root)
   const sessionsDir = createEmptySessionsDir(root)
@@ -484,7 +490,7 @@ test('selfcheck: human output uses check lines and the summary line', () => {
   assert.match(String(bad.stdout), /^selfcheck: \d+ passed, \d+ warnings, [1-9]\d* failed$/m)
 })
 
-test('selfcheck: --help exits 0 and documents the options', () => {
+testIfZstd('selfcheck: --help exits 0 and documents the options', () => {
   const result = runCli(['--help'])
   assert.equal(result.status, 0)
   const stdout = String(result.stdout)
@@ -494,7 +500,7 @@ test('selfcheck: --help exits 0 and documents the options', () => {
   }
 })
 
-test('selfcheck: --session limits the session-log check to one session id', () => {
+testIfZstd('selfcheck: --session limits the session-log check to one session id', () => {
   const root = makeTempDir()
   const sessionsDir = path.join(root, 'sessions')
   fs.mkdirSync(sessionsDir, { recursive: true })

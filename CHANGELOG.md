@@ -3,6 +3,38 @@
 All notable changes to `dsh-rofm` are documented here.
 The project follows a lightweight [SemVer](https://semver.org/) scheme.
 
+## [1.2.1] — 2026-10-28
+
+### Fixed
+
+- **高 α 警告真正落地（用户反馈修复）**：`importance.warnAbove` 的警告此前只存在于引擎
+  `plan.warnings`，DSH 适配层从不记录——README 却写着“会记录警告”。现在
+  `lib/plugin.js compressOnce()` 把 plan 中的新警告（排除启动时已打印的配置警告）以
+  `archive: …` 写进宿主日志，并把 `warnings` 数组写入 `compress-applied` 遥测。
+- **`memory_judge` 对超阈值 α 回传提醒**：模型提交 α > `importance.warnAbove`（默认
+  `0.8`）时**仍按提交值生效**（`warnAbove` 是提醒阈值，不是上限），但工具返回值新增
+  `warnings: string[]`，render 后模型看到「注意：α=0.95 超过 importance.warnAbove=0.8…
+  建议复核时下调（本次已按提交值生效，未拦截）」。
+
+### Docs
+
+- README：`α > warnAbove` 修正为 `α > importance.warnAbove（默认 0.8）`，并说明警告的
+  可见位置（插件日志 / `compress-applied.warnings` 遥测 / `memory_judge` 返回值）；
+  补充 `memory_judge` output 的 `warnings` 字段；测试计数 302 → 304。
+- `docs/SPEC.md`：修订说明、§4.2 output schema / execute 行为、§9 `compress-applied`
+  遥测示例与说明、§10 测试计数；`docs/VERIFICATION.md` 新增 §18 1.2.1 验证记录。
+
+### Tests
+
+- 新增用例：`memory_judge` 对 α=0.95 返回提醒且值保留 0.95、α=0.5 无提醒；归档时引擎
+  警告出现在宿主日志与 `compress-applied.warnings`；当前基线 **304/304**（引擎 188 +
+  适配层 115 + simulate 1）。
+
+### Version
+
+- `package.json` / `engine/package.json` → **1.2.1**（行为补丁；`config.json` 无新增键，
+  向后兼容）。
+
 ## [1.2.0] — 2026-10-28
 
 ### Added（用户请求的改进）

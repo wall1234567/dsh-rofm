@@ -817,3 +817,25 @@ mock 保真度。所有修复都必须先复现、再补回归测试、最后做
 - **任务区块变大**：100+100 上限下，满额待复核（每条完整原文+上次评分理由）可能给每轮
   上下文增加数万字符；提交评分后会立刻缩短，建议一次多提交几条。
 - 标题去重只作用于**同一次归档**；不同归档之间的同名标题不会互相加序号。
+
+## 18. v1.2.1 补丁：高 α 警告真正落地（2026-10-28）
+
+> 本节是 1.2.1 的验证记录；测试数字以本节为准（**304/304**）。
+
+### 18.1 修复内容
+
+- 引擎 `importance.warnAbove` 警告此前只进 `plan.warnings`，DSH 适配层从不写日志/遥测 →
+  `lib/plugin.js compressOnce()` 现在把 plan 中的新警告（排除启动时已打印的配置警告）以
+  `archive: …` 写入宿主日志，并把 `warnings` 数组写进 `compress-applied` 遥测；
+- `memory_judge` 提交 α > `importance.warnAbove`（默认 0.8）时**仍按提交值生效**（不是上限），
+  但返回值新增 `warnings: string[]`，render 后模型看到「注意：α=… 超过 importance.warnAbove=…」提醒；
+- README/SPEC 修正 `α > warnAbove` 的表述（补默认值 0.8 与警告可见位置：插件日志 /
+  `compress-applied.warnings` / `memory_judge` 返回值）。
+
+### 18.2 验证结果
+
+- `node --test` → **304/304**（引擎 188 + 适配层 115 + simulate 1）；
+- 新增用例：`memory_judge` 对 α=0.95 返回提醒且 α 保留 0.95、α=0.5 无提醒；归档时引擎警告
+  出现在宿主日志与 `compress-applied.warnings`；
+- `node tools/selfcheck.mjs` → 5 passed / 0 failed；
+- CI：Node 20/22/24 × Ubuntu/Windows 全绿。

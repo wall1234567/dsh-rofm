@@ -533,6 +533,7 @@ test('start() registers the memory-tasks section and the memory_judge + memory_r
     assert.deepEqual(tool.output.schema.properties.updated.items, { type: 'string' })
     assert.deepEqual(tool.output.schema.properties.kept.items, { type: 'string' })
     assert.equal(tool.output.schema.properties.rejected.items.type, 'object')
+    assert.equal(tool.output.schema.properties.warnings.items.type, 'string')
     assert.equal(tool.timeoutMs, 5000)
     assert.equal(tool.isConcurrencySafe(), false)
     // Rendered text summary (not the raw JSON) is what the model reads back.
@@ -568,6 +569,56 @@ test('start() registers the memory-tasks section and the memory_judge + memory_r
     assert.equal(capture.tools[1].disposed, true, 'disabling the plugin unregisters memory_recall')
     assert.ok(capture.tools[2].definition.name === 'memory_image', 'memory_image is registered too')
     assert.equal(capture.tools[2].disposed, true, 'disabling the plugin unregisters memory_image')
+  })
+})
+
+test('memory_judge flags α above importance.warnAbove back to the model (1.2.1, non-blocking)', async () => {
+  await withTempDirAsync(async (dir) => {
+    const memoryDir = path.join(dir, 'memory')
+    const { session, capture } = await archiveConversation(memoryDir)
+    const pending = readIndexFile(memoryDir).folders.filter((folder) => folder.scored === false)
+    assert.ok(pending.length > 0, 'the archive produced pending folders')
+    const id = pending[0].id
+    const keywords = ['部署', 'docker', '端口']
+    const high = await executeJudge(capture, session, [{ id, alpha: 0.95, beta: 4, keywords }])
+    assert.deepEqual(high.updated, [id])
+    // Not a cap: the submitted value is honored, but the model gets a reminder.
+    assert.equal(high.warnings.length, 1)
+    assert.match(high.warnings[0], /α=0\.95 超过 importance\.warnAbove=0\.8/)
+    assert.match(high.warnings[0], /未拦截/)
+    assert.equal(readMeta(memoryDir, id).alpha, 0.95)
+    const renderedHigh = judgeDefinition(capture).output.render({}, high)
+    assert.match(renderedHigh[0].text, /注意：/)
+    assert.match(renderedHigh[0].text, /超过 importance\.warnAbove=0\.8/)
+    // A normal α produces no reminder (and the renderer adds no "注意：" line).
+    const normal = await executeJudge(capture, session, [{ id, alpha: 0.5, keywords }])
+    assert.deepEqual(normal.updated, [id])
+    assert.deepEqual(normal.warnings, [])
+    const renderedNormal = judgeDefinition(capture).output.render({}, normal)
+    assert.ok(!renderedNormal[0].text.includes('注意：'), renderedNormal[0].text)
+    assert.equal(readMeta(memoryDir, id).alpha, 0.5)
+  })
+})
+
+test('archive writes engine warnings to the host log and the telemetry event (1.2.1)', async () => {
+  await withTempDirAsync(async (dir) => {
+    const memoryDir = path.join(dir, 'memory')
+    const session = new FakeSession({ id: 'session-warn', contextWindow: 1000 })
+    appendSystem(session)
+    appendConversation(session, 14)
+    const { ctx, capture } = makeContext(session)
+    const overrides = makeOverrides(memoryDir)
+    // Any heuristic α (≥ importance.min = 0.01) is above warnAbove=0 → every
+    // folder produced by this archive carries the engine's high-α warning.
+    overrides.importance = { ...overrides.importance, warnAbove: 0 }
+    const plugin = new RofmPlugin(ctx, overrides)
+    plugin.start()
+    await plugin.compressWithEscalation(session, 1, plugin.currentConfig(), 'test')
+    const logged = capture.logs.filter(([level, message]) => level === 'warn' && message.includes('exceeds importance.warnAbove'))
+    assert.ok(logged.length > 0, `the warning is logged, got: ${JSON.stringify(capture.logs.slice(-6))}`)
+    const applied = readStatsEvents(memoryDir).filter((event) => event.type === 'compress-applied').at(-1)
+    assert.ok(Array.isArray(applied.warnings) && applied.warnings.length > 0, 'warnings are persisted in compress-applied')
+    assert.ok(applied.warnings.some((warning) => warning.includes('exceeds importance.warnAbove')))
   })
 })
 

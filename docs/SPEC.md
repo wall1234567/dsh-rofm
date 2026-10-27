@@ -55,6 +55,16 @@ The DSH plugin (`index.js` at the repo root) is a thin adapter around it.
 > the `selfcheck` npm script). `package.json` and `engine/package.json` are
 > `1.2.0`; still no new configuration keys. Adapter-side details are in §4.2,
 > §5.4–§5.6 and §10.
+>
+> **Revision note (2026-10-28, v1.2.1).** Patch release for the high-α warning:
+> the `importance.warnAbove` warning is now actually surfaced by the adapter —
+> a host log line (`archive: alpha=… exceeds importance.warnAbove=…`) plus a
+> `warnings` array on the `compress-applied` telemetry event (it previously only
+> existed in the engine plan and was dropped). `memory_judge` now returns a
+> model-visible, non-blocking `warnings` entry when a submitted α exceeds
+> `importance.warnAbove` (default 0.8); the value is still honored — the
+> threshold is a reminder, not a cap. `package.json` / `engine/package.json` →
+> `1.2.1`; no new configuration keys.
 
 Repository layout (owned files):
 
@@ -384,6 +394,7 @@ The DSH adapter writes two more event types:
  "beforePercent":63.2,"afterPercent":43.1,"removedTokens":3300,
  "pinnedShadowed":1,"pinnedRecorded":1,"pinnedChars":48,
  "mergedCheckpoints":1,"archiveSegments":4,
+ "warnings":["alpha=0.9 exceeds importance.warnAbove=0.8; …"],
  "folderIds":["mem-…"],
  "folderMetadata":[{"id":"mem-…","alpha":0,"beta":0,"keywords":[],
    "alphaSource":"pending","keywordsSource":"pending","betaSource":"pending",
@@ -400,7 +411,9 @@ archiving (§5), the number of archived images (`folderMetadata[].images`, v1.2
 (`pinnedRecorded`, v1.2) and the appendix size (`pinnedChars`). Since v1.2 it also
 records the checkpoint-note merge: `mergedCheckpoints` (number of previous
 dsh-rofm notes merged into this one) and `archiveSegments` (the cumulative
-segment count now shown as `N` in the surviving note, §5.4). `rearchive` records
+segment count now shown as `N` in the surviving note, §5.4). Since v1.2.1 an
+optional `warnings` array records engine/plan warnings raised during the archive
+(e.g. an α above `importance.warnAbove`). `rearchive` records
 recalled folders removed from the injected block and marked `rescorePending`
 (§5.6, no new folders). The engine writes neither event.
 
@@ -676,8 +689,12 @@ stay pending):
   个关键词；待评分新记忆必填，复核已有记忆可省略”, `keep` = “true 表示保持现有
   α/β 不变（复核时无需修改可用）”, `reason` = “一句话理由（可选）”.
 - **output schema**: `{ updated: string[], kept: string[],
-  rejected: [{ id, reason }] }`; `output.render` returns one text block, e.g.
+  rejected: [{ id, reason }], warnings: string[] }`; `output.render` returns one
+  text block, e.g.
   `已更新 2 条（mem-…、mem-…）；保持 1 条；拒绝 1 条（mem-…: unknown folder id）。`
+  A submitted `alpha` above `importance.warnAbove` is honored but adds a
+  `warnings` entry, rendered as an extra line (v1.2.1, non-blocking):
+  `注意：α=0.95 超过 importance.warnAbove=0.8（mem-…）：…（本次已按提交值生效，未拦截）`.
   `timeoutMs: 5000`, `isConcurrencySafe: () => false`.
 - **execute behaviour**:
   - `session = exec.agent.session`; missing session / row disabled for this
@@ -690,6 +707,9 @@ stay pending):
   - a **pending new** folder (`scored:false`, detected from meta/index) must
     receive `alpha` + `beta` + `keywords`; partial submissions are rejected
     (`new memory needs alpha, beta and keywords`);
+  - `alpha` above `importance.warnAbove` (default `0.8`) is **not** capped — it is
+    written as submitted and a model-visible `warnings` entry is returned so the
+    model can re-check it (v1.2.1, non-blocking);
   - `alpha` (if given) must be a finite number, clamped to
     `[importance.min, importance.max]` (4 decimals); `beta` (if given) must be
     finite, then `normalizeBeta` (clamp ±10, 1 decimal); `keywords` (if given)
@@ -1529,9 +1549,9 @@ Required coverage:
     - R5: `test/selfcheck.test.mjs` covers `tools/selfcheck.mjs` (CLI flags,
       PASS/WARN/FAIL classification, exit codes, JSON summary).
 
-As of the v1.2.0 revision the suites are **188/188 (engine)** and **113/113
+As of the v1.2.1 revision the suites are **188/188 (engine)** and **115/115
 (adapter)**, all passing; `node --test` (no arguments) runs engine + adapter +
-simulation files together (**302 passing**). Run `node --test test/*.test.mjs`,
+simulation files together (**304 passing**). Run `node --test test/*.test.mjs`,
 `node --test test-adapter/*.test.mjs`, `node test/simulate.mjs`,
 `node tools/selfcheck.mjs`, `node engine/cli.mjs --help`,
 `node tools/recall-report.mjs --help` and `node tools/repair-session-log.mjs --help`

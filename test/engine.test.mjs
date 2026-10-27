@@ -130,7 +130,7 @@ test('config: maxFoldersPerRun ships 500 and validation still accepts 500', () =
   assert.equal(accepted.storage.maxFolders, 10000)
   // The nested engine package version tracks the plugin release.
   const enginePackage = JSON.parse(fs.readFileSync(path.join(PLUGIN_ROOT, 'engine', 'package.json'), 'utf8'))
-  assert.equal(enginePackage.version, '1.2.0')
+  assert.equal(enginePackage.version, '1.2.1')
 })
 
 test('config: config.json + overrides deep merge, unknown keys preserved', () => {

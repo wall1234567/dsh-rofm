@@ -10,7 +10,7 @@
     "minMessagesToCompress": 4,
     "minChunkChars": 200,
     "targetChunkChars": 1200,
-    "maxFoldersPerRun": 100,
+    "maxFoldersPerRun": 500,
     "keepRecentMessages": 2,
     "maxBoundaryOvershoot": 1.25,
     "applyToSubagents": false,

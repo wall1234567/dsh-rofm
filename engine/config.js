@@ -92,7 +92,7 @@ export const DEFAULT_CONFIG = {
     minMessagesToCompress: 4,
     minChunkChars: 200, // a recall folder smaller than this is merged forward
     targetChunkChars: 1200, // split the removed span into folders of ~this size
-    maxFoldersPerRun: 100, // safety cap per archival run
+    maxFoldersPerRun: 500, // safety cap per archival run
     keepRecentMessages: 2, // never remove the newest N messages
     // Turn-boundary alignment may remove more than compressPercent. If the next
     // user boundary would overshoot the target by more than this factor, fall

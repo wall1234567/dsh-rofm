@@ -50,7 +50,7 @@ export { computeImportance, alphaForFolder, DECISION_MARKERS } from './importanc
 export { erf, recallProbability, createRng } from './recall.js'
 
 // compression
-export { planCompression, commitCompression, buildArchiveNote } from './compress.js'
+export { planCompression, commitCompression, buildArchiveNote, parseArchiveNote } from './compress.js'
 
 // recall
 export { recall, buildRecallBlock, formatBeta, RECALL_BLOCK_PREAMBLE } from './recall.js'

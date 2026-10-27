@@ -9,6 +9,7 @@
 > **§2–§12 是历史版本（0.1.x–0.3.0）的验证记录**，其中提到的“归档时额外调用模型打分”
 > （`lib/llm-metadata.js`）与 `recall.pressureChars` 压力裁剪等机制已被本次修订取代/移除，
 > 仅作历史留档，**不代表当前行为**。
+> **v1.2.0 的当前行为与验证数字以 §17 为准**（§1 的数字已同步到 v1.2.0）。
 
 ## 1. 自动化测试
 
@@ -17,25 +18,30 @@
 ```bash
 NODE=node
 
-# 引擎（零依赖、独立于 DSH，含开源前审计回归）：119 个测试
+# 引擎（零依赖、独立于 DSH，含开源前审计回归/会话日志修复工具/自检工具测试）：188 个测试
 "$NODE" --test test/*.test.mjs
-# ✔ tests 119  pass 119  fail 0
+# ✔ tests 188  pass 188  fail 0
 
-# DSH 适配层（mock session/context，含 memory_judge 工具）：54 个测试
+# DSH 适配层（mock session/context，含 memory_judge / memory_recall / memory_image）：113 个测试
 "$NODE" --test test-adapter/*.test.mjs
-# ✔ tests 54  pass 54  fail 0
+# ✔ tests 113  pass 113  fail 0
 
-# 一次性运行全部（引擎 + 适配层 + 模拟）：174 个测试
+# 一次性运行全部（引擎 + 适配层 + 模拟）：302 个测试
 npm test
+
+# 独立自检（v1.2 R5；有 FAIL 时退出码 1）
+"$NODE" tools/selfcheck.mjs
+"$NODE" tools/selfcheck.mjs --with-tests   # 额外跑 node --test
 
 # 端到端模拟 + 测试阶段报告
 "$NODE" test/simulate.mjs
 "$NODE" tools/recall-report.mjs --help
 "$NODE" tools/show-recall.mjs
+"$NODE" tools/repair-session-log.mjs --help
 ```
 
-当前测试数字为引擎 119/119、适配层 54/54（§13 记录了功能修订的运行，§14 记录了
-开源前代码 / 测试审计与新增回归）。
+当前测试数字为引擎 188/188、适配层 113/113（`node --test` 共 302/302，含 1 个
+`test/simulate.mjs` 文件；§13/§14/§15 记录了历史功能修订，§16 记录 v1.2，§17 记录 v1.2.0）。
 
 覆盖内容：erf/p(n) 数值、关键词抽取与匹配、α 范围与高 α 警告、压缩触发/20%
 选取/保留最近消息/不拆 tool 对/分文件夹、回忆第一代上限、代数链、已尝试排除、
@@ -43,7 +49,9 @@ createdAt 排序、损坏 index 重建、原子写、1000 文件夹性能、报�
 pre-step 归档（待评分，不调用模型）、超过 emergency 线后的多轮紧急归档、合成上下文不归档、
 β 归一化/回忆块/遥测、未评分不可回忆、`memory_judge` 工具、任务区块、
 回忆块再归档（rescorePending）、重启记忆 v2 快照恢复；以及 §14 的开源前审计回归
-（原型污染、代理对拆分、CLI 严格参数、工具损坏数据降级、真实 Session 契约等）。
+（原型污染、代理对拆分、CLI 严格参数、工具损坏数据降级、真实 Session 契约等）、
+§17 的 v1.2 R1–R5（500 上限 / 100+100 任务区块 / 标题规则 / 注记合并 / pinned 记录策略 /
+自检工具）。
 
 ## 2. 真实 DSH 端到端验证（2026-10-23）
 
@@ -474,8 +482,9 @@ cd dsh-rofm          # 本仓库根目录
   按 token 累计取**最早** `compressPercent`（默认 20%，目标值）的已用上下文，向完整 user 回合
   边界对齐（不拆 tool-call/tool-result；下一个 user 边界超过目标 `maxBoundaryOvershoot`（1.25）
   倍则回退上一边界）；最新 `keepRecentMessages`（默认 2）条永不移除；按 `targetChunkChars`
-  （约 1200 字）分文件夹（保持完整 user 回合、单条超大消息按字符拆、<200 字尾块合并、
-  单次 ≤ `maxFoldersPerRun` 100）；**归档不调用模型**：文件夹以 `scored:false` 待评分落盘，
+  （约 1200 字）分文件夹（保持完整 user 回合、单条超大消息只在**句子边界**切分、
+  <200 字尾块合并、单次 ≤ `maxFoldersPerRun` **500**（v1.2 R1，此前 100））；
+  **归档不调用模型**：文件夹以 `scored:false` 待评分落盘，
   由当前模型经 `memory_judge` 评分后才可回忆；然后用 DSH compaction checkpoint 把该段替换成
   一条 `[memory]` 归档说明（模型不再看到原文；日志/界面仍保留原文可回看）；
 - **再归档（本次修订新增）** = 被加回的回忆块也参与归档：与普通归档**同触发、同占比**
@@ -622,3 +631,189 @@ mock 保真度。所有修复都必须先复现、再补回归测试、最后做
 - 复核条目显示完整原文会让任务区块变长（每条约为一个 folder 的原文；folder 目标约
   `compress.targetChunkChars` 默认 1200 字，超大消息按块切分）。12 条时请预留相应
   上下文空间；如需要可在后续版本加一个可配置的原文显示上限。
+
+## 16. v1.2：用户改进与最终形态（2026-10-26 起；注入位置 2026-10-27 回退）
+
+> 本插件在 v1.2 期间试验过“回忆块 = 系统提示词之后的第一条历史消息”，随后按用户要求**回退**到
+> 系统提示词 section；早期试验形态曾因漏写 message `id` 使部分会话日志无法加载，已提供
+> `tools/repair-session-log.mjs` 修复。下面是最终形态的验证清单。
+
+### 16.1 变更清单与验证点
+
+1. **α 用户喜好**
+   - 行为：`memory_judge` description / `alpha` 参数说明 / “记忆评分任务” α 口径三处都包含
+     “用户明确表达的喜好/厌恶/习惯/长期偏好 → 高 α”条款（逐字见 SPEC §4.2、README §1.2）。
+   - 验证：`node --test test-adapter/scoring-rubric.test.mjs`（3/3）与 plugin-mock 的
+     “memory-tasks section lists pending folders … and the rubric”。
+2. **句子完整性拆分**
+   - 行为：超长消息只在句末/换行切分，跨目标句子整体移动，文件夹可 > `targetChunkChars`；
+     拼接与原文逐字一致、不拆代理对。
+   - 验证：`node --test test/compress.test.mjs`（25/25）。
+3. **回忆块注入位置（回退）**
+   - 行为：恢复为 `dsh-rofm:recall` system prompt section（order 100）；注入/恢复/再归档设置
+     `forceNewSeries`，`onPreStep` 返回 `startsRequestSeries: true` 触发头节点重写；
+     不再写任何 `rofm-recall` 历史消息。
+   - 验证：`plugin-mock` 的 “start() registers … two prompt sections” 与
+     “recall … before thinking”（断言 `startsRequestSeries` 一次为 true、下一 step 为 undefined）；
+     `audit-tests-real-api-conformance` 的 pre-step 用例同样断言 true/undefined。
+   - 真实侧：请求的 system prompt 里能看到 `## 记忆回忆（按创建时间从早到晚）` 区块；
+     会话日志不应新增 `rofm-recall` 的 user/message。
+4. **图片文件夹 + 路径提示**
+   - 行为：归档时图片块 → `[图片：（name）]` + `<session>/images/<name>` + `meta.images` +
+     `images/index.json`；回忆块与 `memory_recall` 文本把占位符展开成**绝对路径**
+     （文件丢失标 `（缺失）`），不再重新上传附件。
+   - 验证：`node --test test/images.test.mjs`（含 `injectImagePaths`/索引用例）与 plugin-mock 的
+     “I4: archived images are stored as files, shown by path in the recall block, and findable
+     via memory_image”（断言文件字节、`meta.images`、索引、块内路径、工具返回路径）。
+   - 真实侧：归档后 `ls memory/sessions/<id>/images/` 可见文件；回忆块中应出现
+     `[图片：（…，文件：<绝对路径>）]`；用 `read_image` 读该路径可查看。
+5. **`memory_recall` 工具**
+   - 行为：关键词主动回忆 + 连续未命中 3 次提醒 / 6 次停用到下一轮；结果含 α/β/关键词/原文，
+     图片以文件路径列出；不触碰注入块。
+   - 验证：`node --test test-adapter/recall-tool.test.mjs`（图片路径过滤/展开、3/6 升级）
+     与 plugin-mock 的 “I5: memory_recall recalls by keyword and escalates…”。
+6. **`memory_image` 工具**
+   - 行为：只读查找归档图片；按 query（记忆关键词/标题/文件名）、memoryId（记忆文件夹 id）、
+     name（文件名子串）过滤，返回绝对路径/存在性/元数据/所属记忆；无过滤返回最近归档。
+   - 验证：`node --test test-adapter/image-tool.test.mjs`（25/25，覆盖过滤/排序/limit/空态/
+     禁用的会话/渲染），以及 plugin-mock I4 里的端到端查找与渲染。
+7. **fallback 渲染一致性**
+   - 行为：`renderRecallBlockFallback()` 导出；引擎渲染失败时才使用；两者逐字节相同。
+   - 验证：`node --test test-adapter/recall-render.test.mjs`（3/3）。
+8. **pinned 合并（v1.2 I7；v1.2 R4 已收紧，见 §17）**
+   - 行为（v1.2）：压缩替换区间里的 pinned 节点原文并入 checkpoint 归档说明；不变成回忆文件夹；
+     说明仍需小于被替换内容，否则跳过压缩。**v1.2 起**只有
+     `subagent-settled`/`subagent-error-details`/`tool-jobs`/`user-approval` 等一次性通知
+     写入注记附录；runtime-context/time-context/skill-catalog/in-history system 副本
+     **不再写入**（宿主会重新注入，静默 shadow、不变成文件夹）。
+   - 验证：plugin-mock 的 I7 用例已按 v1.2 R4 更新（附录只含一次性通知、遥测
+     `pinnedRecorded`/`pinnedShadowed` 正确、重新注入类内容不出现）。
+9. **会话日志修复工具**
+   - 行为：只给缺 message `id` 的日志事件补 uuid（不猜 role/source/content），
+     支持 `--dry-run`，默认写 `.bak-<时间戳>`，多帧 zstd 原样重编码。
+   - 验证：`node --test test/repair-session-log.test.mjs`（6/6，含 plain 与多帧 zstd 往返）。
+
+### 16.2 本次运行结果（v1.2 当时，本机真实执行；v1.2 数字见 §17）
+
+- `node --test test/*.test.mjs` → **168/168 pass**
+- `node --test test-adapter/*.test.mjs` → **110/110 pass**
+- `npm test`（= `node --test`，含 `test/simulate.mjs`）→ **279/279 pass**
+- `node test/simulate.mjs`、`node engine/cli.mjs --help`、`node tools/recall-report.mjs --help`、
+  `node tools/show-recall.mjs --json`、`node tools/repair-session-log.mjs --help` 均 exit 0
+- `node --check`（lib/*.js）通过；`git diff --check` 干净
+
+### 16.3 兼容性与已知限制
+
+- `config.json` 无新增键；旧配置、旧 `memory/` 文件夹（无 `meta.images`）、旧 v1/v2
+  `recall-state.json` 均兼容（无 `images` 的文件夹行为与 1.1.0 完全一致）。
+- 没有 `ctx.attachments` 服务的宿主上，归档图片只保留占位文本；回忆/找图仍可用（路径标记缺失）。
+- 回忆块回到系统提示词后，任何回忆变化都会让宿主重写头节点（`startsRequestSeries`），
+  会失效整段前缀缓存；这是 v1.1 既有行为，不是本次新增。
+- v1.2 早期试验写入的无 `id` `rofm-recall` 消息不会自动消失；用
+  `tools/repair-session-log.mjs`（先 `--dry-run`）修复后重启 DSH。
+- `tools/show-recall.mjs` / `tools/recall-report.mjs` 只展示图片数量/索引信息，不展示图片内容。
+- `memory_judge` 成功改动任务列表后触发 `startsRequestSeries` 头节点重写，避免每轮评分追加整份系统提示词。
+- `记忆评分任务` 每轮上限：v1.2 期间为 50+50 条（2026-10-27 起；此前各 12 条），
+  **v1.2 起为 100+100 条（见 §17，R1）**。待复核条目带完整原文与上次评分理由，
+  100 条时区块会明显变长；待评分 100 条约增加上万字符，提交评分后会立即缩短。
+- 真实宿主（desktop profile）需要重载插件后才会运行新代码；v1.2 早期历史消息形态的会话在回退后
+  不会自动迁移，如需清理用上面的修复工具。
+
+## 17. v1.2.0：R1–R5（2026-10-28）
+
+> 本节是 v1.2.0 的**当前行为**验证记录。§1 的测试数字已同步到本次运行；
+> 历史小节（§1–§16）里凡是与本节冲突的，以本节为准。
+
+### 17.1 变更与验证点
+
+1. **R1 上限（500 / 100+100）**
+   - 行为：`compress.maxFoldersPerRun` 默认 **500**（`engine/config.js` `DEFAULT_CONFIG`
+     与随包 `config.json` 同步，`storage.maxFolders` 仍 10000）；「记忆评分任务」区块
+     每轮最多列 **100 条待评分 + 100 条待复核**（`lib/plugin.js` `TASKS_LIST_LIMIT = 100`，
+     已导出）。代价：待复核条目每条带完整原文与上次评分理由，满额时区块可能增加数万字符。
+   - 验证：`test/engine.test.mjs` / `test/audit-engine.test.mjs` 断言默认值 500；
+     `test-adapter/plugin-mock.test.mjs` 的 “memory-tasks section caps each list at 100
+     entries”（100+100 夹具只列前 100 条）；`tools/selfcheck.mjs` config/engine 两项
+     独立断言 500 与标题唯一性冒烟。
+2. **R2 标题规则**
+   - 行为：优先取 chunk 内第一条内容非空的用户消息；从回合中间开始的 chunk 在本次归档的
+     移除区间里向前继承最近一条用户消息；否则 chunk 首条消息；仍为空则 `第N段对话`；
+     最多 24 个 Unicode 码点；同一归档内重复标题加全角 `（<folder 序号>）`，唯一标题不变。
+   - 验证：`test/compress.test.mjs` 新增 4 个 R2 用例（中途继承 / 重复编号且唯一标题不变 /
+     无用户文本回退 / 既有标题用例保持通过）。
+3. **R3 checkpoint 注记合并**
+   - 行为：每次归档把替换区间前方本插件旧注记合并为**一条**，N 累加为**累计归档段数**，
+     旧注记文本（含附录）丢弃；`buildArchiveNote(plan,{totalSegments})` 支持累计 N
+     （不传时输出与旧版逐字节相同）；新增 `parseArchiveNote()`（锚定开头、兼容带/不带关键词、
+     容忍附录）；外来 checkpoint 不合并/不改写并阻止区间继续向前扩张；遥测新增
+     `mergedCheckpoints` / `archiveSegments`。
+   - 验证：`test/compress.test.mjs`（build/parse 用例，含外来文本返回 null 与附录容忍）；
+     `test-adapter/plugin-mock.test.mjs` 的 R3 用例（旧注记合并、旧附录丢弃、外来 checkpoint
+     终止合并且保持原样、两次真实归档端到端后 surface 只剩一条注记且 N 累计）。
+   - 真实数据解析回放：本机 `~/.dsh/sessions` 下 109 份会话日志中，共 24 条
+     `compaction/summary` 事件；其中 **23 条是本插件注记，23/23 全部被 `parseArchiveNote`
+     正确解析**（含 2 条带 pinned 附录），另 1 条是其它压缩器写的 summary，被正确判定为
+     外来 checkpoint（`parseArchiveNote` 返回 `null`，不参与合并/统计）。
+4. **R4 pinned 记录策略**
+   - 行为：宿主每轮重新注入的 pinned 内容（runtime-context / time-context / skill-catalog /
+     in-history `system/message`、`developer/message` 副本 / 遗留 `rofm-recall`）**不写入注记**、
+     静默 shadow、永不变成回忆文件夹；`subagent-settled` / `subagent-error-details` /
+     `tool-jobs` / `user-approval` 只记录**本次归档事务 shadow 到**的；未知来源按记录处理；
+     外来 checkpoint 不合并/不改写。附录固定标记改为
+     `[memory] 本次归档区间内还有 N 条非对话上下文（子代理/后台任务/审批等一次性通知，宿主不会重新注入），已并入本说明以免丢失：`。
+   - 验证：`test-adapter/plugin-mock.test.mjs` 的 R4 用例（重新注入类 pinned 不出现于注记、
+     四类一次性通知只来自本次事务、附录标记文本、`pinnedRecorded` 遥测）；
+     `lib/surface.js` 的 `classifyPinnedMessage` / `shouldRecordPinned` 为纯函数，
+     由上述用例覆盖。
+5. **R5 自检工具**
+   - 行为：新增 `tools/selfcheck.mjs`（零依赖、不 import `lib/plugin.js`）与 npm script
+     `selfcheck`；检查 config / engine 默认值 + `planCompression` 冒烟 / memory store /
+     recall state / 会话日志注记（zstd 解帧重放 `surfaceOp`）/ 可选 `node --test`；
+     每项 PASS / WARN / FAIL，**有 FAIL 才退出 1**。
+   - 验证：`test/selfcheck.test.mjs`（13 个用例，黑盒 spawn 工具，覆盖 `--json`、
+    `--memory-dir`/`--sessions-dir`、退出码与 PASS/WARN/FAIL 判定）。
+   - 真实数据运行（本机）：默认 4 passed / 1 warnings / 0 failed，退出码 0；
+     WARN 是**旧版本遗留**（session-f908562e 的最终 surface 上仍有 2 条 v1.2 之前的注记、
+     旧注记附录里含重新注入类内容），按设计只报 WARN、不算 FAIL。
+     `--with-tests` 时 5 passed / 1 warnings / 0 failed，测试套件项输出
+     `node --test passed (302 passed, 0 failed)`。
+
+### 17.2 本次运行结果（本机真实执行）
+
+```bash
+# 引擎（含 tools/selfcheck.mjs 的测试）：188/188 pass
+"$NODE" --test test/*.test.mjs
+# 适配层：113/113 pass
+"$NODE" --test test-adapter/*.test.mjs
+# 全部（引擎 + 适配层 + test/simulate.mjs）：302/302 pass
+"$NODE" --test
+
+# 自检工具（真实 memory/ 与历史会话日志）
+"$NODE" tools/selfcheck.mjs
+#   [PASS] config / engine / memory store / recall state
+#   [WARN] session logs — 3 legacy warning(s)（旧版遗留）
+#   selfcheck: 4 passed, 1 warnings, 0 failed   (exit 0)
+"$NODE" tools/selfcheck.mjs --with-tests
+#   [PASS] test suite — node --test passed (302 passed, 0 failed)
+#   selfcheck: 5 passed, 1 warnings, 0 failed   (exit 0)
+
+"$NODE" test/simulate.mjs
+"$NODE" engine/cli.mjs --help
+"$NODE" tools/recall-report.mjs --help
+"$NODE" tools/show-recall.mjs --json
+"$NODE" tools/repair-session-log.mjs --help
+# 均 exit 0
+```
+
+### 17.3 兼容性与已知限制（v1.2）
+
+- `config.json` **无新增键**；旧配置、旧记忆文件夹（无 `meta.images`/旧 note 格式）、
+  旧 v1/v2 `recall-state.json`、旧会话日志均向后兼容。
+- **旧版本遗留的多条注记不会被自动改写**：v1.2 只在新的归档发生时把旧注记自然合并；
+  历史会话里已有的多条 `[memory]` 注记/含重新注入内容的旧附录保持原样
+  （`tools/selfcheck.mjs` 报 WARN 而非 FAIL）。新会话/新归档会收敛到一条累计注记。
+- **注记合并只在向后扩张安全时发生**：遇到外来 checkpoint、未知 pinned 或真实对话节点就停止，
+  因此不是“每次都会合并”；没有旧注记可合时 N 仍是本次 folder 数（行为与旧版一致）。
+- **任务区块变大**：100+100 上限下，满额待复核（每条完整原文+上次评分理由）可能给每轮
+  上下文增加数万字符；提交评分后会立刻缩短，建议一次多提交几条。
+- 标题去重只作用于**同一次归档**；不同归档之间的同名标题不会互相加序号。

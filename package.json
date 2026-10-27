@@ -1,14 +1,15 @@
 {
   "name": "dsh-rofm",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "DSH 长期记忆插件：上下文超过阈值时把最早的一段对话归档进 memory/ 回忆文件夹，之后按关键词与重要性概率自动回忆。 · DSH long-term memory: archives the earliest context into memory/ folders and recalls it by keyword probability.",
   "type": "module",
   "main": "index.js",
   "scripts": {
     "test": "node --test",
     "simulate": "node test/simulate.mjs",
+    "selfcheck": "node tools/selfcheck.mjs",
     "cli": "node engine/cli.mjs --help",
-    "check": "node --test && node test/simulate.mjs && node engine/cli.mjs --help"
+    "check": "node --test && node test/simulate.mjs && node tools/selfcheck.mjs && node engine/cli.mjs --help"
   },
   "exports": {
     ".": "./index.js",

@@ -113,10 +113,11 @@ test('importance: repeated high-alpha computation keeps a single warning', () =>
 // ---------------------------------------------------------------------------
 // compress: oversized-message slicing must not split a UTF-16 surrogate pair
 // ---------------------------------------------------------------------------
-// A message bigger than targetChunkChars is split by raw content.slice(offset,
-// offset+targetChars). When targetChars lands between the two code units of an
-// astral character (emoji, supplementary CJK), each folder keeps half a
-// surrogate: the archived text renders as mojibake in the recall block.
+// An oversized string message is split with sentence-aware splitting
+// (engine/compress.js `splitSentences`; a single long sentence may produce a
+// folder larger than targetChunkChars). When a cut lands near an astral
+// character (emoji, supplementary CJK), each folder must still keep whole
+// code points: half a surrogate would render as mojibake in the recall block.
 test('compress: huge-message slicing never splits a surrogate pair', () => {
   const emoji = '\u{1F600}' // one code point, two UTF-16 code units
   const huge = 'a'.repeat(249) + emoji + 'b'.repeat(600)

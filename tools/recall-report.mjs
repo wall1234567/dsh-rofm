@@ -175,27 +175,55 @@ function formatBetaLine(stats) {
  * only the creation count is reported here.
  */
 function workStats(events) {
-  const stats = { rearchiveEvents: 0, rearchivedFolders: 0, rearchivedTokens: 0, pendingCreated: 0 }
+  const stats = {
+    rearchiveEvents: 0,
+    rearchivedFolders: 0,
+    rearchivedTokens: 0,
+    pendingCreated: 0,
+    // v1.2: archived images (`compress-applied.folderMetadata[].images`) and the
+    // pinned host-context nodes merged into the checkpoint note instead of being
+    // silently shadowed (`pinnedShadowed` / `pinnedChars`). v1.2 adds the
+    // checkpoint-note merge counters (`mergedCheckpoints`, cumulative
+    // `archiveSegments`) and `pinnedRecorded` (only one-shot notices are copied
+    // into the note; re-injected host context is dropped).
+    archivedImages: 0,
+    pinnedShadowed: 0,
+    pinnedRecorded: 0,
+    pinnedChars: 0,
+    mergedCheckpoints: 0,
+    archiveSegments: 0,
+  }
   for (const event of Array.isArray(events) ? events : []) {
     if (!event || typeof event !== 'object') continue
     if (event.type === 'rearchive') {
       stats.rearchiveEvents += 1
       if (Array.isArray(event.removedIds)) stats.rearchivedFolders += event.removedIds.length
       if (Number.isFinite(event.removedTokens)) stats.rearchivedTokens += event.removedTokens
-    } else if (event.type === 'compress-applied' && Array.isArray(event.folderMetadata)) {
+    } else if (event.type === 'compress-applied') {
+      if (Number.isFinite(event.pinnedShadowed)) stats.pinnedShadowed += event.pinnedShadowed
+      if (Number.isFinite(event.pinnedRecorded)) stats.pinnedRecorded += event.pinnedRecorded
+      if (Number.isFinite(event.pinnedChars)) stats.pinnedChars += event.pinnedChars
+      if (Number.isFinite(event.mergedCheckpoints)) stats.mergedCheckpoints += event.mergedCheckpoints
+      // Cumulative per archive, so the latest event carries the current total.
+      if (Number.isFinite(event.archiveSegments)) stats.archiveSegments = Math.max(stats.archiveSegments, event.archiveSegments)
+      if (!Array.isArray(event.folderMetadata)) continue
       for (const entry of event.folderMetadata) {
         if (entry && entry.scored === false) stats.pendingCreated += 1
+        if (entry && Number.isFinite(entry.images)) stats.archivedImages += entry.images
       }
     }
   }
   return stats
 }
 
-/** Two aligned lines for re-archive + pending counts. */
+/** Aligned lines for re-archive + pending + v1.2/v1.2 image/pinned/note counters. */
 function formatWorkLines(stats) {
   return (
     `${'re-archive events'.padEnd(24)}: ${stats.rearchiveEvents}, recalled folders removed: ${stats.rearchivedFolders}, tokens: ${stats.rearchivedTokens}\n` +
-    `${'pending folders created'.padEnd(24)}: ${stats.pendingCreated} (awaiting memory_judge)\n`
+    `${'pending folders created'.padEnd(24)}: ${stats.pendingCreated} (awaiting memory_judge)\n` +
+    `${'archived images'.padEnd(24)}: ${stats.archivedImages} (copied to images/)\n` +
+    `${'pinned context merged'.padEnd(24)}: ${stats.pinnedRecorded} recorded / ${stats.pinnedShadowed} shadowed, ${stats.pinnedChars} chars (into checkpoint notes)\n` +
+    `${'checkpoint notes merged'.padEnd(24)}: ${stats.mergedCheckpoints} previous note(s), latest cumulative segments: ${stats.archiveSegments}\n`
   )
 }
 

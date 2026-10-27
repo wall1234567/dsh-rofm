@@ -17,7 +17,9 @@
  *   starts at a user message whenever possible;
  * - the newest `keepRecentMessages` messages are never removed;
  * - the removed span is split into ~`targetChunkChars` folders (tiny tail merged),
- *   each with its own α, keywords and title.
+ *   each with its own α, keywords and title; an oversized message is cut only at
+ *   sentence boundaries, so a longer sentence may make its folder exceed
+ *   `targetChunkChars` (sentence integrity wins over the size target).
  */
 
 import { DEFAULT_BETA, DEFAULT_CONFIG, resolveMemoryDir } from './config.js'
@@ -60,13 +62,42 @@ function messagesChars(messages) {
   return total
 }
 
-function titleOf(messages) {
-  const source = Array.isArray(messages) ? messages : []
-  const firstUser = source.find((message) => message && message.role === 'user')
-  const first = firstUser || source[0]
-  if (!first) return ''
-  const text = String(first.content || '').replace(/\s+/g, ' ').trim()
+/** Normalize a message content value into a title: whitespace collapsed, trimmed
+ * and capped to 24 Unicode code points (the documented `meta.title` limit). */
+function normalizeTitle(content) {
+  const text = String(content === undefined || content === null ? '' : content).replace(/\s+/g, ' ').trim()
   return [...text].slice(0, 24).join('')
+}
+
+/** Title of the first user message in `messages` whose content is non-empty. */
+function firstUserTitle(messages) {
+  const source = Array.isArray(messages) ? messages : []
+  for (const message of source) {
+    if (!message || message.role !== 'user') continue
+    const title = normalizeTitle(message.content)
+    if (title) return title
+  }
+  return ''
+}
+
+/** Title of one chunk (v1.2 R2): the chunk's first user message; otherwise the
+ * nearest preceding user message in the archived span (a chunk may start
+ * mid-turn at an assistant/tool message); otherwise the chunk's first message
+ * (legacy fallback). A chunk whose first user message has empty content also
+ * inherits. Returns '' when there is no text at all — the caller numbers it. */
+function titleOf(chunkMessages, removedMessages, chunkStart) {
+  const own = firstUserTitle(chunkMessages)
+  if (own) return own
+  const removed = Array.isArray(removedMessages) ? removedMessages : []
+  const lastIndex = Number.isInteger(chunkStart) ? Math.min(chunkStart - 1, removed.length - 1) : removed.length - 1
+  for (let index = lastIndex; index >= 0; index -= 1) {
+    const message = removed[index]
+    if (!message || message.role !== 'user') continue
+    const inherited = normalizeTitle(message.content)
+    if (inherited) return inherited
+  }
+  const source = Array.isArray(chunkMessages) ? chunkMessages : []
+  return source.length > 0 ? normalizeTitle(source[0].content) : ''
 }
 
 /** Split messages into user turns: [{ start, msgs }]. */
@@ -87,10 +118,68 @@ function userTurnSegments(messages) {
   return segments
 }
 
+/** Sentence terminators that end a sentence without needing a following space:
+ * Chinese `。！？；…` and a newline. */
+const CJK_SENTENCE_END = /[。！？；…]/
+/** Latin terminators end a sentence only before whitespace (or the text end), so
+ * decimals (`3.14`) and version strings (`v1.2.0`) are never cut. */
+const LATIN_SENTENCE_END = /[.!?;]/
+/** Closing quotes/brackets that belong to the sentence being ended. */
+const SENTENCE_CLOSER = /[”’"'』」）)\]】》]/
+
+/** Index just past the first sentence boundary at/after `start`, or -1 when the
+ * rest of the text has no boundary (the rest counts as one long sentence). A
+ * boundary keeps its terminator run (`……`, `！？`, `?!`) and closing quotes, so
+ * the next fragment always starts at the first character of a new sentence. */
+function findSentenceEnd(content, start) {
+  for (let index = start; index < content.length; index += 1) {
+    const char = content[index]
+    const atEnd = index + 1 >= content.length
+    const cjk = CJK_SENTENCE_END.test(char)
+    const latin = LATIN_SENTENCE_END.test(char) && (atEnd || /\s/.test(content[index + 1]))
+    if (char !== '\n' && !cjk && !latin) continue
+    let end = index + 1
+    while (
+      end < content.length &&
+      (CJK_SENTENCE_END.test(content[end]) || LATIN_SENTENCE_END.test(content[end]) || SENTENCE_CLOSER.test(content[end]))
+    ) {
+      end += 1
+    }
+    return end
+  }
+  return -1
+}
+
+/** Split one message's text into fragments at sentence boundaries, packing whole
+ * sentences up to ~targetChars. A single sentence longer than targetChars is kept
+ * whole in its own fragment: sentence integrity outranks the size target, so the
+ * resulting folder may exceed targetChunkChars (the accepted trade-off). Slicing
+ * only ever happens after a terminator, and concatenating the fragments returns
+ * `content` unchanged. */
+function splitSentences(content, targetChars) {
+  const fragments = []
+  let current = ''
+  let offset = 0
+  while (offset < content.length) {
+    const boundary = findSentenceEnd(content, offset)
+    const end = boundary === -1 ? content.length : boundary
+    const sentence = content.slice(offset, end)
+    offset = end
+    if (current.length > 0 && current.length + sentence.length > targetChars) {
+      fragments.push(current)
+      current = ''
+    }
+    current += sentence
+  }
+  if (current.length > 0) fragments.push(current)
+  return fragments
+}
+
 /** Greedy split into chunks of ~targetChars while keeping whole user turns.
  * A single message can be larger than targetChars (a huge tool result). Such a
- * message is split by character count so each resulting folder is small enough
- * for the LLM scorer to see its complete content. */
+ * message is split at sentence boundaries so no recall folder ends mid-sentence;
+ * a sentence longer than targetChars stays whole (the folder may exceed the
+ * target, which is accepted for sentence integrity). */
 function chunkSegments(segments, targetChars) {
   const chunks = []
   let current = { start: 0, end: 0, msgs: [], chars: 0 }
@@ -116,18 +205,8 @@ function chunkSegments(segments, targetChars) {
       const start = segment.start + index
       const chars = messagesChars([message])
       if (chars > targetChars && typeof message.content === 'string') {
-        const content = message.content
-        for (let offset = 0; offset < content.length; ) {
-          let end = Math.min(content.length, offset + targetChars)
-          // Never cut a UTF-16 surrogate pair in half: if the slice would end on
-          // a high surrogate, include its low surrogate in the same fragment
-          // (a folder must not start/end with a lone surrogate half).
-          if (end < content.length) {
-            const code = content.charCodeAt(end - 1)
-            if (code >= 0xd800 && code <= 0xdbff) end += 1
-          }
-          pushMessage({ role: message.role, content: content.slice(offset, end) }, start)
-          offset = end
+        for (const fragment of splitSentences(message.content, targetChars)) {
+          pushMessage({ role: message.role, content: fragment }, start)
         }
       } else {
         pushMessage(message, start)
@@ -341,6 +420,9 @@ export function planCompression(options = {}) {
   for (let index = 0; index < folderCount; index += 1) {
     const chunk = chunks[index]
     const chunkMessages = chunk.msgs
+    // v1.2 R2: prefer the first user message, inherit the turn's user message
+    // when the chunk starts mid-turn, and only then fall back to the chunk head.
+    const title = titleOf(chunkMessages, remove, chunk.start) || `第${index + 1}段对话`
     const createdAt = baseNow - (folderCount - 1 - index)
     // Keywords describe the conversation content, not rendered role prefixes.
     const text = chunkMessages.map((message) => String((message && message.content) || '')).join('\n')
@@ -365,7 +447,7 @@ export function planCompression(options = {}) {
       keywords,
       keywordsSource: 'heuristic',
       scored: true,
-      title: titleOf(chunkMessages),
+      title,
       stats: { messages: chunkMessages.length, chars, tokens },
       signals: importance.signals,
       source: {
@@ -376,6 +458,18 @@ export function planCompression(options = {}) {
       },
     }
     folderPlans.push({ id: meta.id, meta, messages: chunkMessages })
+  }
+
+  // v1.2 R2: within one archival run identical titles are disambiguated with the
+  // folder's 1-based index, e.g. `重复标题（2）`. Unique titles stay untouched.
+  const titleCounts = new Map()
+  for (const folderPlan of folderPlans) {
+    const baseTitle = folderPlan.meta.title
+    titleCounts.set(baseTitle, (titleCounts.get(baseTitle) || 0) + 1)
+  }
+  for (let index = 0; index < folderPlans.length; index += 1) {
+    const baseTitle = folderPlans[index].meta.title
+    if (titleCounts.get(baseTitle) > 1) folderPlans[index].meta.title = `${baseTitle}（${index + 1}）`
   }
 
   plan.shouldCompress = folderPlans.length > 0
@@ -519,15 +613,25 @@ export function commitCompression(plan, options = {}) {
   }
 }
 
+/** The exact prefix/grammar of the note produced by {@link buildArchiveNote}. It
+ * is anchored at the start but deliberately not at the end (`$`): the compress
+ * path may append a `\n\n` appendix with pinned non-conversation context. */
+const ARCHIVE_NOTE_RE = /^\[memory\] (\d+) 段更早的对话已归档到 memory\/(?:（关键词：(.+?)）)?。需要时会自动回忆。/
+
 /**
  * Build the single small note that replaces the removed span in the
  * model-visible conversation, e.g.
  * `[memory] 3 段更早的对话已归档到 memory/（关键词：部署、docker、端口）。需要时会自动回忆。`
  *
  * @param {ReturnType<typeof planCompression>} plan
+ * @param {{ totalSegments?: number }} [options] `totalSegments` — a positive
+ *   finite integer — overrides the `N` in “N 段更早的对话”. The compress path
+ *   uses the cumulative segment count when it merged previous dsh-rofm
+ *   checkpoints, so the single surviving note keeps counting (v1.2 R3). When
+ *   absent/invalid the output is byte-identical to the historical note.
  * @returns {string}
  */
-export function buildArchiveNote(plan) {
+export function buildArchiveNote(plan, options = {}) {
   const folders = plan && Array.isArray(plan.folders) ? plan.folders : []
   if (!folders.length) return ''
   const keywords = []
@@ -539,11 +643,40 @@ export function buildArchiveNote(plan) {
     }
     if (keywords.length >= 5) break
   }
-  const folderText = `${folders.length} 段更早的对话`
+  const requestedTotal = options && typeof options === 'object' ? options.totalSegments : undefined
+  const totalSegments =
+    typeof requestedTotal === 'number' && Number.isFinite(requestedTotal) && Number.isInteger(requestedTotal) && requestedTotal > 0
+      ? requestedTotal
+      : folders.length
+  const folderText = `${totalSegments} 段更早的对话`
   if (keywords.length > 0) {
     return `[memory] ${folderText}已归档到 memory/（关键词：${keywords.join('、')}）。需要时会自动回忆。`
   }
   return `[memory] ${folderText}已归档到 memory/。需要时会自动回忆。`
+}
+
+/**
+ * Parse a checkpoint note produced by {@link buildArchiveNote} (v1.2 R3).
+ * Recognizes both the keyword and the plain form, anchored at the START of the
+ * text but tolerant of a following `\n\n` appendix. Foreign checkpoints (other
+ * compressors) and non-note strings return `null`.
+ *
+ * @param {unknown} text
+ * @returns {{ segments: number, keywords: string[] } | null}
+ */
+export function parseArchiveNote(text) {
+  if (typeof text !== 'string') return null
+  const match = ARCHIVE_NOTE_RE.exec(text)
+  if (!match) return null
+  const segments = Number.parseInt(match[1], 10)
+  if (!Number.isFinite(segments) || segments <= 0) return null
+  const keywords = typeof match[2] === 'string'
+    ? match[2]
+        .split('、')
+        .map((keyword) => keyword.trim())
+        .filter((keyword) => keyword.length > 0)
+    : []
+  return { segments, keywords }
 }
 
 /** Extra helper: normalize messages before planning (used by the adapter/CLI). */

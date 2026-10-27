@@ -450,8 +450,9 @@ test('conformance: memory_judge is a complete real ToolDefinition and output.ren
   buildConversation(session, 14)
   const { plugin, capture } = archive(session, memoryDir)
   await plugin.compressWithEscalation(session, 1, plugin.currentConfig(), 'test')
-  assert.equal(capture.tools.length, 1, 'exactly one tool definition is registered')
-  const definition = capture.tools[0]
+  assert.equal(capture.tools.length, 3, 'memory_judge + memory_recall + memory_image definitions are registered')
+  const definition = capture.tools.find((entry) => entry.name === 'memory_judge')
+  assert.ok(definition, 'memory_judge is registered')
 
   // ToolDefinition required members (real @deepseek-ai tools contract).
   for (const key of ['name', 'description', 'parameters', 'output', 'execute']) {
@@ -490,9 +491,11 @@ test('conformance: memory_judge is a complete real ToolDefinition and output.ren
 
 // ---------------------------------------------------------------------------
 // 3. agent/pre-step is a real waterfall: the decision must preserve the
-//    downstream {kind:'enter', messages} object and only add startsRequestSeries.
+//    downstream {kind:'enter', messages} object. Recall is injected as a durable
+//    surface history message (earliest position), so no request-series flag is
+//    produced.
 // ---------------------------------------------------------------------------
-test('conformance: pre-step waterfall returns a legal PreStepDecision with startsRequestSeries', async () => {
+test('conformance: pre-step waterfall preserves the decision and requests a new series for recall injection', async () => {
   const memoryDir = path.join(tempDir(), 'memory')
   const session = new StrictSession({ contextWindow: 1000 })
   const { ctx } = pluginContext(session)
@@ -519,9 +522,12 @@ test('conformance: pre-step waterfall returns a legal PreStepDecision with start
     { agent: agentFor(session), messages: downstreamMessages, turn: 1, step: 1, signal: new AbortController().signal },
     async () => ({ kind: 'enter', messages: downstreamMessages }),
   )
-  // Real PreStepDecision: {kind:'enter', messages: UserMessage[], startsRequestSeries?: true}
+  // Real PreStepDecision: {kind:'enter', messages: UserMessage[]}
   assert.equal(decision.kind, 'enter')
   assert.deepEqual(decision.messages, downstreamMessages, 'downstream messages must be preserved')
+  // The recall block is a system-prompt section again (v1.1 layout): after a new
+  // injection the host must rewrite the head system node instead of appending an
+  // in-history system update, so the decision declares a new request series.
   assert.equal(decision.startsRequestSeries, true, 'recall injection must force a new request series')
 
   // The flag is consumed once: the next step of the same turn must not repeat it.

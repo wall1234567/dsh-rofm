@@ -137,7 +137,15 @@ function seedReportFixture(dir) {
   engine.appendStats(dir, cfg, { type: 'recall', addedFolders: 1, added: [{ id: 'legacy-no-beta' }] })
   // Work aggregate source: re-archive + pending folders from compress-applied.
   engine.appendStats(dir, cfg, { type: 'rearchive', removedIds: ['r1', 'r2'], removedTokens: 512 })
-  engine.appendStats(dir, cfg, { type: 'compress-applied', folderMetadata: [{ scored: false }, { scored: false }, { scored: true }] })
+  engine.appendStats(dir, cfg, {
+    type: 'compress-applied',
+    pinnedShadowed: 2,
+    pinnedRecorded: 2,
+    pinnedChars: 96,
+    mergedCheckpoints: 2,
+    archiveSegments: 182,
+    folderMetadata: [{ scored: false, images: 1 }, { scored: false, images: 0 }, { scored: true, images: 2 }],
+  })
 }
 
 test('report tool: --json exposes the documented betaStats and workStats aggregates (SPEC §9)', () => {
@@ -149,8 +157,20 @@ test('report tool: --json exposes the documented betaStats and workStats aggrega
 
   // β≥7 / 0≤β<7 / β<0 bucketing, mean rounded to 2dp, legacy events ignored.
   assert.deepEqual(parsed.betaStats, { n: 4, mean: 1.94, aboveOrEqual7: 1, between0And7: 2, negative: 1 })
-  // workStats keys are exactly the documented ones.
-  assert.deepEqual(parsed.workStats, { rearchiveEvents: 1, rearchivedFolders: 2, rearchivedTokens: 512, pendingCreated: 2 })
+  // workStats keys are exactly the documented ones (v1.2 adds image/pinned
+  // counters; v1.2 adds the checkpoint-note merge counters).
+  assert.deepEqual(parsed.workStats, {
+    rearchiveEvents: 1,
+    rearchivedFolders: 2,
+    rearchivedTokens: 512,
+    pendingCreated: 2,
+    archivedImages: 3,
+    pinnedShadowed: 2,
+    pinnedRecorded: 2,
+    pinnedChars: 96,
+    mergedCheckpoints: 2,
+    archiveSegments: 182,
+  })
 })
 
 test('report tool: text report prints the β trust line and the work lines (SPEC §9)', () => {
@@ -161,6 +181,9 @@ test('report tool: text report prints the β trust line and the work lines (SPEC
   assert.match(runResult.stdout, /beta \(trust\)\s+: n=4, mean=\+1\.94, β≥7: 1, 0≤β<7: 2, β<0: 1/)
   assert.match(runResult.stdout, /re-archive events\s+: 1, recalled folders removed: 2, tokens: 512/)
   assert.match(runResult.stdout, /pending folders created\s+: 2 \(awaiting memory_judge\)/)
+  assert.match(runResult.stdout, /archived images\s+: 3 \(copied to images\/\)/)
+  assert.match(runResult.stdout, /pinned context merged\s+: 2 recorded \/ 2 shadowed, 96 chars \(into checkpoint notes\)/)
+  assert.match(runResult.stdout, /checkpoint notes merged\s+: 2 previous note\(s\), latest cumulative segments: 182/)
 })
 
 test('report tool: no β telemetry prints the documented n/a line (SPEC §9)', () => {

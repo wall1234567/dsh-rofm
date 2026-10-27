@@ -145,6 +145,9 @@ function loadSession(dir) {
       title: meta.title ?? folder.title ?? '',
       chars: Number(stats.chars ?? folder.chars ?? 0),
       tokens: Number(stats.tokens ?? folder.tokens ?? 0),
+      // v1.2: archived images live as files under <memoryDir>/images/; the folder
+      // meta only records their names/metadata, so report the count here.
+      images: Array.isArray(meta.images) ? meta.images.length : 0,
       messages,
       meta: { alpha: meta.alpha, beta, keywords: meta.keywords, createdAt: meta.createdAt, messages, stats },
     }
@@ -291,6 +294,7 @@ const result = {
     keywords: folder.keywords,
     title: folder.title,
     chars: folder.chars,
+    images: folder.images ?? 0,
     contextFile: path.join(dir, folder.id, 'context.json'),
     metaFile: path.join(dir, folder.id, 'meta.json'),
   })),
@@ -301,6 +305,7 @@ const result = {
     rescorePending: session.folders.filter((folder) => folder.rescorePending).length,
     corrupt: session.folders.filter((folder) => folder.corrupt === true).length,
     recallable: recallable.length,
+    images: session.folders.reduce((sum, folder) => sum + (folder.images ?? 0), 0),
   },
   recallState: session.recallState,
   recalls: session.recalls,
@@ -326,6 +331,7 @@ for (const folder of result.folders) {
   const flagText = flags.length > 0 ? `  [${flags.join('、')}]` : ''
   console.log(`- ${folder.id}  α=${folder.alpha}  β=${formatBeta(folder.beta)}  ${folder.chars} 字${flagText}`)
   console.log(`  关键词: ${folder.keywords.join('、') || '(尚未评分)'}`)
+  if ((folder.images ?? 0) > 0) console.log(`  图片: ${folder.images} 张（${path.join(dir, 'images')}）`)
   const judged = folder.judgedAt ? `  judgedAt=${new Date(folder.judgedAt).toISOString()}` : ''
   const pendingSince = folder.pending && folder.pendingSince ? `  pendingSince=${new Date(folder.pendingSince).toISOString()}` : ''
   console.log(

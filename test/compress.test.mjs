@@ -15,6 +15,7 @@ import {
   loadConfig,
   loadIndex,
   memoryPaths,
+  parseArchiveNote,
   planCompression,
   readFolder,
   readStats,
@@ -204,8 +205,8 @@ test('compress: maxFoldersPerRun caps the folder count', () => {
   for (let index = 0; index < 12; index += 1) messages.push({ role: 'user', content: `消息 ${index} ${'q'.repeat(80)}`, tokens: 100 })
   const plan = planCompression({ messages, usedPercent: 95, cfg, totalUsedTokens: 1200 })
   assert.ok(plan.folders.length <= 3, `got ${plan.folders.length} folders`)
-  // A single oversized message may be split into several pieces so folders stay
-  // small enough for complete-content LLM scoring; coverage is >= removed count.
+  // A single oversized message may be split into several pieces (at sentence
+  // boundaries); coverage is >= removed count.
   assert.ok(plan.folders.reduce((sum, folder) => sum + folder.messages.length, 0) >= plan.remove.length)
 })
 
@@ -401,7 +402,9 @@ test('compress: one oversized user turn is split into multiple folders', () => {
 })
 
 test('compress: a single message larger than targetChunkChars is split for the LLM scorer', () => {
-  const huge = `BEGIN-${'x'.repeat(2000)}-END`
+  // Sentence-punctuated huge text: the message still crosses several folders, and
+  // the splitter may only cut after a sentence terminator (sentence integrity).
+  const huge = `BEGIN-${'这是一句需要被完整保留的内容。'.repeat(120)}-END`
   const messages = [
     { role: 'user', content: huge, tokens: 500 },
     { role: 'assistant', content: 'noted', tokens: 10 },
@@ -418,10 +421,15 @@ test('compress: a single message larger than targetChunkChars is split for the L
   assert.ok(maxChars <= 350, `folder too large for complete-content scoring: ${maxChars} chars`)
   const allText = plan.folders.flatMap((folder) => folder.messages.map((message) => String(message.content))).join('')
   assert.ok(allText.includes('BEGIN-') && allText.includes('-END'), 'huge message content is preserved across folders')
+  // Cutting is only allowed at sentence ends, so the pieces must rebuild the
+  // removed span exactly (huge message, then the following removed messages).
+  assert.equal(allText, `${huge}notedu2ok`, 'the sentence-punctuated huge message is preserved exactly across folders')
 })
 
 test('compress: meta.source seqStart/seqEnd stay on the real source message for split fragments', () => {
-  const huge = `BEGIN-${'x'.repeat(2500)}-END`
+  // Sentence-punctuated huge text: it is split into several fragments (cut points
+  // are sentence ends), which is what the seqStart/seqEnd assertions need.
+  const huge = `BEGIN-${'需要拆分到多个回忆文件夹的完整句子。'.repeat(100)}-END`
   const messages = [
     { role: 'user', content: huge, tokens: 1250 },
     { role: 'user', content: '下一个问题', tokens: 5 },
@@ -463,4 +471,315 @@ test('commit: storage.maxFolders refuses the whole archive instead of writing a 
   assert.ok(committed.warnings.some((warning) => /maxFolders/.test(warning)))
   assert.equal(fs.readdirSync(dir).filter((name) => name.startsWith('mem-')).length, 0, 'no folder was written')
   assert.equal(loadIndex(dir, cfg).folders.length, 0)
+})
+
+// ---------------------------------------------------------------------------
+// sentence integrity when splitting an oversized message into folders
+// (the user request: never cut inside a sentence; a folder may grow instead)
+// ---------------------------------------------------------------------------
+
+test('compress: oversized Chinese message is split only at sentence ends, text preserved exactly', () => {
+  const sentences = Array.from({ length: 120 }, (_, index) => `第${index}句：部署 docker 端口配置已经确认完毕。`)
+  const original = sentences.join('')
+  const messages = [
+    { role: 'user', content: original, tokens: 1000 },
+    { role: 'user', content: '继续处理下一项', tokens: 5 },
+    { role: 'user', content: '保留 1', tokens: 5 },
+    { role: 'user', content: '保留 2', tokens: 5 },
+  ]
+  const cfg = makeCfg({
+    compress: { compressPercent: 20, targetChunkChars: 200, minChunkChars: 50, maxFoldersPerRun: 100, keepRecentMessages: 2 },
+  })
+  const plan = planCompression({ messages, usedPercent: 80, cfg, totalUsedTokens: 5000, windowTokens: 6000 })
+  assert.equal(plan.shouldCompress, true)
+  assert.equal(plan.remove.length, 1, 'only the oversized message is removed')
+  assert.ok(plan.folders.length >= 2, `expected several folders, got ${plan.folders.length}`)
+  const fragments = plan.folders.flatMap((folder) => folder.messages.map((message) => String(message.content)))
+  assert.equal(fragments.join(''), original, 'chunks concatenated must equal the original text exactly')
+  // Every fragment (but the last, which needs no trailing boundary) ends right
+  // after a sentence terminator: no fragment may stop mid-sentence.
+  for (let index = 0; index < fragments.length - 1; index += 1) {
+    assert.match(fragments[index], /[。！？；…\n]$/, `fragment ${index} does not end at a sentence boundary`)
+  }
+  // Stronger: every fragment is a concatenation of complete known sentences.
+  const sentenceSet = new Set(sentences)
+  for (const fragment of fragments) {
+    const pieces = fragment.match(/[^。]*。/g) || []
+    assert.equal(pieces.join(''), fragment, 'a fragment must end at a sentence boundary')
+    for (const piece of pieces) assert.ok(sentenceSet.has(piece), `fragment contains a partial sentence: ${piece.slice(0, 24)}`)
+  }
+})
+
+test('compress: one long sentence longer than targetChunkChars stays whole, folder may exceed it', () => {
+  // No terminator at all: the whole message is one sentence. It must never be
+  // cut to satisfy targetChunkChars — the folder grows instead.
+  const original = `BEGIN-${'x'.repeat(2500)}-END`
+  const messages = [
+    { role: 'user', content: original, tokens: 1250 },
+    { role: 'user', content: '下一个问题', tokens: 5 },
+    { role: 'assistant', content: '嗯', tokens: 5 },
+    { role: 'user', content: '保留1', tokens: 5 },
+    { role: 'assistant', content: '保留2', tokens: 5 },
+  ]
+  const cfg = makeCfg({
+    compress: { compressPercent: 20, targetChunkChars: 250, minChunkChars: 50, maxFoldersPerRun: 100, keepRecentMessages: 2 },
+  })
+  const plan = planCompression({ messages, usedPercent: 80, cfg, totalUsedTokens: 5000, windowTokens: 6000 })
+  assert.equal(plan.shouldCompress, true)
+  assert.equal(plan.remove.length, 1, 'only the oversized message is removed')
+  assert.equal(plan.folders.length, 1, 'a single sentence must never be split to satisfy targetChunkChars')
+  const folder = plan.folders[0]
+  assert.equal(folder.messages.length, 1, 'the long sentence is one whole fragment')
+  assert.equal(String(folder.messages[0].content), original, 'the long sentence is preserved whole')
+  assert.ok(folder.meta.stats.chars > 250, `folder text must be allowed to exceed targetChunkChars: ${folder.meta.stats.chars} chars`)
+})
+
+test('compress: sentence-split folders still plan/commit end-to-end (count, exact text, ordering)', () => {
+  const memoryDir = tempDir()
+  const sentences = Array.from({ length: 80 }, (_, index) => `第${index}句：这一轮要把完整句子放进回忆文件夹。`)
+  const original = sentences.join('')
+  const messages = [
+    { role: 'user', content: original, tokens: 1250 },
+    { role: 'user', content: '下一个问题', tokens: 5 },
+    { role: 'assistant', content: '嗯', tokens: 5 },
+    { role: 'user', content: '保留1', tokens: 5 },
+    { role: 'assistant', content: '保留2', tokens: 5 },
+  ]
+  const cfg = makeCfg({
+    compress: { compressPercent: 20, targetChunkChars: 240, minChunkChars: 80, maxFoldersPerRun: 100, keepRecentMessages: 2 },
+  })
+  const plan = planCompression({
+    messages,
+    usedPercent: 80,
+    cfg,
+    totalUsedTokens: 5000,
+    windowTokens: 6000,
+    sessionId: 'sentence-split',
+    now: 1700000000123,
+  })
+  assert.equal(plan.shouldCompress, true)
+  assert.equal(plan.remove.length, 1)
+  assert.ok(plan.folders.length >= 2 && plan.folders.length <= 100, `unexpected folder count ${plan.folders.length}`)
+
+  const result = commitCompression(plan, { memoryDir, cfg, sessionId: 'sentence-split' })
+  assert.equal(result.folders.length, plan.folders.length, 'plan and commit agree on the folder count')
+  assert.equal(loadIndex(memoryDir, cfg).folders.length, plan.folders.length)
+  const onDiskText = result.folders.flatMap((folder) =>
+    readFolder(memoryDir, folder.id).messages.map((message) => String(message.content)),
+  )
+  assert.equal(onDiskText.join(''), original, 'committed folders preserve the original text exactly')
+  const createdAts = result.folders.map((folder) => folder.meta.createdAt)
+  assert.deepEqual(createdAts, createdAts.slice().sort((a, b) => a - b), 'createdAt keeps chronological order')
+  const compressEvents = readStats(memoryDir, cfg).filter((event) => event.type === 'compress')
+  assert.equal(compressEvents.length, 1)
+  assert.equal(compressEvents[0].folderIds.length, result.folders.length)
+  assert.equal(compressEvents[0].removedChars, plan.removeChars)
+})
+
+test('compress: sentence splitting never cuts a UTF-16 surrogate pair', () => {
+  const emoji = '\u{1F600}' // one code point, two UTF-16 code units
+  const sentences = Array.from({ length: 60 }, (_, index) => `${emoji}第${index}句内容${emoji}。`)
+  // A final unpunctuated emoji run is one long sentence kept whole; it ends with a
+  // complete pair (a low surrogate at the very end is legitimate).
+  const original = `${sentences.join('')}${emoji.repeat(300)}`
+  const messages = [
+    { role: 'user', content: original, tokens: 1250 },
+    { role: 'user', content: '下一个问题', tokens: 5 },
+    { role: 'assistant', content: '嗯', tokens: 5 },
+    { role: 'user', content: '保留1', tokens: 5 },
+    { role: 'assistant', content: '保留2', tokens: 5 },
+  ]
+  const cfg = makeCfg({
+    compress: { compressPercent: 20, targetChunkChars: 120, minChunkChars: 1, maxFoldersPerRun: 100, keepRecentMessages: 2 },
+  })
+  const plan = planCompression({ messages, usedPercent: 80, cfg, totalUsedTokens: 5000, windowTokens: 6000 })
+  assert.equal(plan.shouldCompress, true)
+  assert.equal(plan.remove.length, 1)
+  const fragments = plan.folders.flatMap((folder) => folder.messages.map((message) => String(message.content)))
+  assert.equal(fragments.join(''), original, 'fragments preserve the original text exactly')
+  assert.ok(fragments.length > 1, 'the message really was split')
+  for (const fragment of fragments) {
+    const first = fragment.charCodeAt(0)
+    const last = fragment.charCodeAt(fragment.length - 1)
+    assert.ok(!(first >= 0xdc00 && first <= 0xdfff), `fragment starts with a lone low surrogate: ${JSON.stringify(fragment.slice(0, 2))}`)
+    assert.ok(!(last >= 0xd800 && last <= 0xdbff), `fragment ends with a lone high surrogate: ${JSON.stringify(fragment.slice(-2))}`)
+  }
+})
+
+test('compress: oversized latin message is split only after latin sentence ends', () => {
+  const original = `BEGIN. ${'This is a complete sentence. '.repeat(80)}The value is 3.14 and stable. END.`
+  const messages = [
+    { role: 'user', content: original, tokens: 1250 },
+    { role: 'user', content: 'next question', tokens: 5 },
+    { role: 'assistant', content: 'ok', tokens: 5 },
+    { role: 'user', content: 'keep 1', tokens: 5 },
+    { role: 'assistant', content: 'keep 2', tokens: 5 },
+  ]
+  const cfg = makeCfg({
+    compress: { compressPercent: 20, targetChunkChars: 200, minChunkChars: 20, maxFoldersPerRun: 100, keepRecentMessages: 2 },
+  })
+  const plan = planCompression({ messages, usedPercent: 80, cfg, totalUsedTokens: 5000, windowTokens: 6000 })
+  assert.equal(plan.shouldCompress, true)
+  assert.ok(plan.folders.length >= 2, `expected several folders, got ${plan.folders.length}`)
+  const fragments = plan.folders.flatMap((folder) => folder.messages.map((message) => String(message.content)))
+  assert.equal(fragments.join(''), original, 'chunks concatenated must equal the original text exactly')
+  for (let index = 0; index < fragments.length - 1; index += 1) {
+    assert.match(fragments[index], /[.!?;]$/, `latin fragment ${index} does not end at a sentence boundary`)
+  }
+  // "3.14" is not a sentence end: the decimal must never be split.
+  assert.ok(fragments.some((fragment) => fragment.includes('3.14')), 'the decimal 3.14 was kept inside one fragment')
+  for (const fragment of fragments) assert.ok(!/\d\.$/.test(fragment), `fragment was cut inside a decimal: ${fragment.slice(-8)}`)
+})
+
+// ---------------------------------------------------------------------------
+// v1.2 R2 — folder titles: first user message, mid-turn inheritance,
+// duplicate numbering (titles never participate in the recall probability)
+// ---------------------------------------------------------------------------
+
+test('compress: a chunk starting mid-turn inherits the nearest preceding user message title', () => {
+  // The removed span is one user turn: a short user message followed by a long
+  // assistant reply that must be split into several chunks. Only the first chunk
+  // owns a user message; the later chunks start at an assistant fragment and must
+  // inherit the user title (they used to degrade to `助手回复。助手回复。…`).
+  const messages = [
+    { role: 'user', content: '用户第一轮：部署 docker', tokens: 100 },
+    { role: 'assistant', content: '助手回复。'.repeat(100), tokens: 1000 },
+    { role: 'user', content: '保留提问', tokens: 10 },
+    { role: 'assistant', content: '保留回复', tokens: 10 },
+  ]
+  const cfg = makeCfg({
+    compress: { compressPercent: 20, targetChunkChars: 100, minChunkChars: 1, keepRecentMessages: 2, minMessagesToCompress: 2 },
+  })
+  const plan = planCompression({ messages, usedPercent: 80, cfg, totalUsedTokens: 5000, windowTokens: 6000 })
+  assert.equal(plan.remove.length, 2)
+  assert.ok(plan.folders.length >= 2, `expected several folders, got ${plan.folders.length}`)
+  assert.ok(
+    plan.folders.some((folder) => folder.messages[0].role !== 'user'),
+    'at least one chunk must start mid-turn for this test to mean anything',
+  )
+  // Every chunk inherits the turn's user message; the assistant fragments that
+  // open the later chunks never leak into a title.
+  for (const folder of plan.folders) {
+    assert.ok(!folder.meta.title.includes('助手回复'), `assistant text leaked into the title: ${folder.meta.title}`)
+    assert.match(folder.meta.title, /^用户第一轮：部署 docker（\d+）$/)
+  }
+  // All inherited titles are identical, so R2 dedupe numbers every occurrence.
+  assert.deepEqual(
+    plan.folders.map((folder) => folder.meta.title),
+    plan.folders.map((_folder, index) => `用户第一轮：部署 docker（${index + 1}）`),
+  )
+})
+
+test('compress: duplicate titles get the folder index suffix, unique titles stay unchanged', () => {
+  // One user message per chunk (rendered `user: <text>` is exactly the chunk
+  // target), so each folder's title comes from its own first user message.
+  const cfg = makeCfg({
+    compress: { compressPercent: 80, targetChunkChars: 10, minChunkChars: 1, keepRecentMessages: 0, minMessagesToCompress: 2 },
+  })
+  const messages = [
+    { role: 'user', content: '重复标题', tokens: 100 },
+    { role: 'user', content: '重复标题', tokens: 100 },
+    { role: 'user', content: '唯一标题', tokens: 100 },
+    { role: 'user', content: '重复标题', tokens: 100 },
+    { role: 'user', content: '保留消息', tokens: 100 },
+  ]
+  const plan = planCompression({ messages, usedPercent: 95, cfg, totalUsedTokens: 500 })
+  assert.equal(plan.folders.length, 4)
+  assert.deepEqual(
+    plan.folders.map((folder) => folder.meta.title),
+    ['重复标题（1）', '重复标题（2）', '唯一标题', '重复标题（4）'],
+  )
+  // The suffix is the 1-based folder index in full-width parentheses.
+  for (let index = 0; index < plan.folders.length; index += 1) {
+    const title = plan.folders[index].meta.title
+    if (title === '唯一标题') continue
+    assert.equal(title, `重复标题（${index + 1}）`)
+  }
+})
+
+test('compress: a chunk without any user text falls back to 第N段对话', () => {
+  // Removal starts mid-turn (only assistant messages) and the archived span holds
+  // no user message at all: neither the chunk nor the preceding span can title it.
+  const cfg = makeCfg()
+  const messages = [
+    { role: 'assistant', content: '', tokens: 100 },
+    { role: 'assistant', content: '', tokens: 100 },
+    { role: 'user', content: '保留提问', tokens: 100 },
+    { role: 'assistant', content: '保留回复', tokens: 100 },
+  ]
+  const plan = planCompression({ messages, usedPercent: 80, cfg, totalUsedTokens: 400 })
+  assert.equal(plan.remove.length, 2)
+  assert.equal(plan.folders.length, 1)
+  assert.equal(plan.folders[0].meta.title, '第1段对话')
+})
+
+// ---------------------------------------------------------------------------
+// v1.2 R3 — checkpoint note API: cumulative N + parse round-trip
+// ---------------------------------------------------------------------------
+
+test('compress: buildArchiveNote totalSegments overrides N, default stays byte-identical', () => {
+  const plan = {
+    folders: [{ meta: { keywords: ['部署', 'docker'] } }, { meta: { keywords: ['端口'] } }],
+  }
+  const base = '[memory] 2 段更早的对话已归档到 memory/（关键词：部署、docker、端口）。需要时会自动回忆。'
+  assert.equal(buildArchiveNote(plan), base)
+  assert.equal(buildArchiveNote(plan, {}), base)
+  assert.equal(buildArchiveNote(plan, { totalSegments: 9 }), base.replace('2 段更早', '9 段更早'))
+  // Only a positive finite integer is accepted; anything else keeps the historical N.
+  for (const invalid of [undefined, null, 0, -3, 1.5, Number.NaN, Number.POSITIVE_INFINITY, '9']) {
+    assert.equal(buildArchiveNote(plan, { totalSegments: invalid }), base, `totalSegments=${String(invalid)} must be ignored`)
+  }
+  assert.equal(buildArchiveNote({ folders: [] }, { totalSegments: 3 }), '')
+  // No keywords -> the plain form also honours totalSegments.
+  const plain = buildArchiveNote({ folders: [{ meta: { keywords: [] } }] }, { totalSegments: 12 })
+  assert.equal(plain, '[memory] 12 段更早的对话已归档到 memory/。需要时会自动回忆。')
+})
+
+test('compress: parseArchiveNote round-trips buildArchiveNote (keyword, plain, cumulative, appendix)', () => {
+  const keywordPlan = {
+    folders: [{ meta: { keywords: ['部署', 'docker'] } }, { meta: { keywords: ['docker', '端口'] } }],
+  }
+  const keywordNote = buildArchiveNote(keywordPlan)
+  assert.deepEqual(parseArchiveNote(keywordNote), { segments: 2, keywords: ['部署', 'docker', '端口'] })
+  // Cumulative N from a merged-checkpoint run round-trips too.
+  assert.deepEqual(parseArchiveNote(buildArchiveNote(keywordPlan, { totalSegments: 12 })), {
+    segments: 12,
+    keywords: ['部署', 'docker', '端口'],
+  })
+  // Plain form (no keywords at all).
+  const plainNote = buildArchiveNote({ folders: [{ meta: { keywords: [] } }, { meta: {} }] })
+  assert.deepEqual(parseArchiveNote(plainNote), { segments: 2, keywords: [] })
+  // The note is a prefix: the pinned-context appendix follows after `\n\n`.
+  const appendix =
+    '\n\n[memory] 本次归档区间内还有 1 条非对话上下文（例如运行时上下文或插件注入的固定消息），已并入本说明以免丢失：\n运行时上下文'
+  assert.deepEqual(parseArchiveNote(`${keywordNote}${appendix}`), { segments: 2, keywords: ['部署', 'docker', '端口'] })
+  assert.deepEqual(parseArchiveNote(`${plainNote}${appendix}`), { segments: 2, keywords: [] })
+  // A note produced by a real plan parses back to the same segment count.
+  const cfg = makeCfg()
+  const plan = planCompression({ messages: makeMessages(10), usedPercent: 80, cfg, totalUsedTokens: 1000 })
+  const parsed = parseArchiveNote(buildArchiveNote(plan))
+  assert.equal(parsed.segments, plan.folders.length)
+  const expectedKeywords = plan.folders
+    .flatMap((folder) => folder.meta.keywords)
+    .filter((keyword, index, list) => list.indexOf(keyword) === index)
+    .slice(0, 5)
+  assert.deepEqual(parsed.keywords, expectedKeywords)
+})
+
+test('compress: parseArchiveNote returns null for foreign checkpoints and non-notes', () => {
+  for (const text of [
+    '',
+    '压缩摘要：前情提要',
+    '[memory] 已归档 3 段对话到 memory/',
+    '[memory] 3 段对话已归档到 memory/。需要时会自动回忆。',
+    '[memory] 3 段更早的对话已归档到 memory/（关键词：部署）。改了措辞。',
+    '前言\n[memory] 3 段更早的对话已归档到 memory/。需要时会自动回忆。',
+    '[memory] 0 段更早的对话已归档到 memory/。需要时会自动回忆。',
+    '[memory] 3 段更早的对话已归档到 memory/（关键词：）。需要时会自动回忆。',
+  ]) {
+    assert.equal(parseArchiveNote(text), null, `expected null for ${JSON.stringify(text)}`)
+  }
+  for (const value of [null, undefined, 123, {}, ['[memory] 1 段更早的对话已归档到 memory/。需要时会自动回忆。']]) {
+    assert.equal(parseArchiveNote(value), null)
+  }
 })

@@ -3,6 +3,190 @@
 All notable changes to `dsh-rofm` are documented here.
 The project follows a lightweight [SemVer](https://semver.org/) scheme.
 
+## [1.2.0] — 2026-10-28
+
+### Added（用户请求的改进）
+
+- **R1 归档与任务区块上限提高**：`compress.maxFoldersPerRun` 默认 **100 → 500**
+  （`engine/config.js` `DEFAULT_CONFIG` 与随包 `config.json` 同步；`storage.maxFolders`
+  仍是 10000）。「记忆评分任务」区块每轮最多列 **100 条待评分 + 100 条待复核**
+  （`lib/plugin.js` `TASKS_LIST_LIMIT = 100`，已导出，此前各 50 条）。一次压力事件能清掉
+  更多积压；代价是任务区块可能变得很长——**100 条待复核每条都带完整原文与上次评分理由**，
+  满额时区块可能给每轮上下文增加数万字符，提交评分后会立刻缩短。
+- **R2 文件夹标题规则**：标题优先取 chunk 内**第一条内容非空的用户消息**；chunk 从回合中间
+  开始（assistant/tool 开头）时，在本次归档的移除区间里**向前**继承最近一条有内容的用户消息
+  （不再退化成 `{"exitCode":0,...}` / `[tool-call ...` 这类重复前缀）；都没有才退回 chunk
+  首条消息，仍为空则用 `第N段对话`。标题最多 **24 个 Unicode 码点**（去重后缀可能超出）；
+  同一次归档内出现重复标题时，给**每个**重复项加全角序号 `（<folder 序号>）`（1 起），
+  唯一标题保持不变。标题只用于展示（`meta.title` / 任务区块 / 记忆查找），不参与回忆概率。
+- **R3 checkpoint 注记合并（N 累计）**：每次归档会把替换区间前方**本插件自己的**旧注记
+  `[memory] N 段更早的对话已归档到 memory/` 合并进来，surface 上只保留**一条**注记，
+  其 N 为**累计归档段数**（旧注记文本含附录被丢弃、只保留 N 累加）。
+  `buildArchiveNote(plan, { totalSegments })` 支持累计 N（不传时输出与旧版逐字节相同），
+  新增导出 `parseArchiveNote(text)`（锚定开头、兼容带/不带关键词并容忍 `\n\n` 附录）。
+  **外来 checkpoint**（别的压缩器写的）**不合并、不改写**，且阻止替换区间继续向前扩张。
+  遥测 `compress-applied` 新增 `mergedCheckpoints` / `archiveSegments`，保留
+  `pinnedShadowed` / `pinnedChars`。
+- **R4 pinned 记录策略收紧**：归档不再把**宿主每轮都会重新注入**的 pinned 内容写进注记——
+  `runtime-context` / `time-context` / `skill-catalog` / in-history `system/message`、
+  `developer/message` 副本 / 遗留 `rofm-recall` 一律静默 shadow（宿主会再注入，写进去只会
+  白占上下文），**永不变成回忆文件夹**；只有 `subagent-settled`、
+  `subagent-error-details`、`tool-jobs`、`user-approval` 这类**一次性通知**才写入注记附录，
+  且只写**本次归档事务 shadow 到**的部分；未知来源的 pinned 按“写入”处理（避免新宿主特性
+  静默丢数据）。附录固定标记改为
+  `[memory] 本次归档区间内还有 N 条非对话上下文（子代理/后台任务/审批等一次性通知，宿主不会重新注入），已并入本说明以免丢失：`。
+  说明（含附录）仍必须小于被替换内容，否则跳过本次压缩（安全优先，不丢数据）。
+- **R5 独立自检工具 `tools/selfcheck.mjs`**：零依赖、**不 import `lib/plugin.js`** 的独立
+  健康检查（自带读取器，坏掉的适配层无法掩盖自身损坏），校验：配置与 `engine/config.js`
+  可加载、引擎默认值（500 + 标题唯一性冒烟）、记忆库 index↔磁盘双向对账与 `meta.json`
+  模式、`recall-state.json` v2 快照、用 zstd 解帧重放 `surfaceOp` 得到的会话日志注记
+  （同一会话本插件注记 ≤ 1、N 为正整数、附录不得混入会被重新注入的内容、外来 checkpoint
+  只计数不报错）、可选 `--with-tests` 跑测试套件。每项 PASS / WARN / FAIL，**有 FAIL 才退出 1**；
+  旧版本合法历史数据报 WARN 不报 FAIL。支持 `--json --memory-dir --sessions-dir --session
+  --max-sessions`，并新增 npm script `selfcheck`（`npm run check` 也纳入）。
+- **评分任务区块明确要求“本轮直接提交”（用户请求）**：`记忆评分任务` 开头新增一句
+  「**这是本轮必须完成的工作：请直接调用 memory_judge 提交下面列出的条目，不要询问用户、
+  不要等待用户确认；建议一次提交本轮列出的全部条目，提交后继续当前任务。**」。
+  背景：100+100 的大列表会让模型把评分当成“需要用户批准的动作”而拖延——实测一个会话
+  21 个 turn 内 `memory_judge` 调用 **0 次**、393 条积压；而 1.0.0 时代列表只有 6 条时，
+  模型在归档后 34 秒内就自主提交。这是提示词层面的行为约束，**不新增配置项**。
+
+### Changed
+
+- **归档说明的 pinned 附录语义**（R4）：从 v1.2 的“所有区间内 pinned 上下文都并入注记”
+  收紧为“只保留一次性通知”；runtime-context 等重新注入类内容不再进注记，历史会话里由旧版
+  留下的多条注记/附录不会被自动改写（只在新归档发生时自然合并；`tools/selfcheck.mjs`
+  会把旧版本遗留的多注记/旧附录报为 WARN）。
+- **任务区块列表上限来源**（R1）：每轮列表上限由 `TASKS_LIST_LIMIT = 100` 控制，与
+  `compress.maxFoldersPerRun = 500`（单次归档量）相互独立。
+
+### Tests
+
+- 新增 `test/selfcheck.test.mjs`（13 个用例：CLI 参数、PASS/WARN/FAIL 判定、退出码、
+  `--json` 汇总等）；
+- `test/compress.test.mjs` 新增 R2 标题用例（中途开始的 chunk 继承最近用户消息、重复标题
+  `（N）` 后缀且唯一标题不变、无用户文本回退 `第N段对话`）与 `buildArchiveNote` /
+  `parseArchiveNote` 用例；
+- `test-adapter/plugin-mock.test.mjs` 新增 R3（旧注记合并为累计单条、旧附录丢弃、外来
+  checkpoint 终止合并且不改写、两次真实归档端到端只剩一条注记）与 R4（重新注入类 pinned
+  不写入、四类一次性通知写入且只来自本次事务、附录标记文本、`pinnedRecorded` 遥测）用例；
+  任务区块上限用例改为 100+100；
+- 当前基线：**引擎 188/188、适配层 113/113，`node --test` 共 302/302 通过**；
+  `node tools/selfcheck.mjs` 在本机真实数据上 **4 passed, 1 warnings, 0 failed**（WARN 为
+  旧版本遗留的多条注记，历史数据不算 FAIL）。
+
+### Docs
+
+- README：头部 v1.2 摘要、§1.1（标题规则/注记合并/ pinned 分类）、§1.2（100+100 与上下文代价）、
+  §1.6（新遥测）、§1.8（重写为注记合并 + pinned 记录策略）、§3（`maxFoldersPerRun=500`）、
+  §4 目录结构（`tools/selfcheck.mjs`）、§6 已知限制、§7（新增 selfcheck 使用说明/检查项/退出码
+  与样例输出、测试矩阵与计数）、§8 English summary；
+- `docs/SPEC.md`：v1.2.0 修订说明、§2 默认值 500、§3 `compress-applied` 遥测字段、
+  §4.2 任务区块 100+100、§5 标题规则（R2）、§5.4 `buildArchiveNote`/`parseArchiveNote`、
+  §5.5 注记合并（R3）与 pinned 记录策略（R4）、§7 公共 API、§9 报告字段、§10 测试矩阵与计数；
+- `docs/VERIFICATION.md`：新增 §17 v1.2.0 验证记录（R1–R5 + 真实运行数字），并修正
+  §13.4 的 `maxFoldersPerRun 100`、§16.3 的 50+50、pinned/I7 旧描述等过期表述；
+- `docs/PUBLISHING.md`：发布前基线更新为 302 个测试并加入 `node tools/selfcheck.mjs`。
+
+### Version
+
+- `package.json` / `engine/package.json` → **1.2.0**（新行为；`config.json` 无新增键，
+  旧配置/旧记忆文件夹/旧 recall-state/旧会话日志均向后兼容）。
+
+### 2026-10-26 / 10-27 工作批次（并入 1.2.0 正式版）
+
+#### Added（用户请求的改进）
+
+- **α 判断纳入用户喜好**：`memory_judge` 的 `TOOL_DESCRIPTION` 与 `alpha` 参数说明、
+  “记忆评分任务”区块的 α 评分口径都明确要求——用户明确表达的喜好/厌恶/习惯/长期偏好
+  （「我喜欢…」「以后都…」「不要…」）判为较高 α，闲聊/过程性日志判低。α 仍由当前会话
+  模型判断（归档本身不调用模型）。
+- **模型主动回忆工具 `memory_recall`**：模型可传关键词主动检索本会话归档；与自动回忆
+  共用同一套关键词匹配 + α 概率规则（`engine.recall`），已在回忆块中的条目作为
+  `excludeIds` 跳过、不重复注入；结果带 α/β/关键词/原文，图片以**文件路径**列出。
+  **连续未命中升级**：连续第 3 次未命中提醒“可能关键词没有选对或目标回忆 α 值太低…”；
+  模型继续换关键词则连续第 6 次未命中后**停用工具**并提示“目标回忆 α 值过低或运气不行，
+  如有需要下一轮对话再尝试。”，本回合再调用直接报错；成功回忆或下一条真实用户消息重置。
+- **图片文件夹 + 路径提示（程序完成，不依赖模型）**：新增每会话 `<memoryDir>/images/`。
+  归档时把归档区间里的图片块替换成 `[图片：（<name>）]`，把规范化图片字节按名复制进
+  images/，并在 `meta.images` 记录 `{name, placeholder, mediaType, width, height, bytes,
+  attachmentId}`；同时维护 `images/index.json` 查找表。**回忆时不再重新上传附件**，
+  而是把占位符就地展开成 `[图片：（<name>，文件：<绝对路径>）]`（文件丢失标 `（缺失）`），
+  模型用宿主 `read_image` 读取。附件服务/路径不可用时降级为占位文本并记 warning；
+  归档被拒绝/回滚时清理本次写入的图片与索引条目。没有新增配置项。
+- **评分后重写头节点**：`memory_judge` 成功改动任务列表后设置 `forceNewSeries`，下一次
+  pre-step 返回 `startsRequestSeries: true`，宿主重写系统提示词头节点而不是追加整份 in-history
+  系统提示词（否则每轮评分会多带上万字符）。
+- **任务区块上限 12+12 → 50+50**：`记忆评分任务` 每轮最多列 50 条待评分新归档 +
+  50 条待复核（此前各 12 条）。一次可提交更多，清空积压更快；代价是区块变长
+  （待复核条目含完整原文，50 条时请留意上下文占用）。
+- **归档图片查找工具 `memory_image`**：只读；按记忆关键词/标题/文件名（`query`）、
+  记忆文件夹 id（`memoryId`）或图片文件名子串（`name`）过滤，返回图片**绝对路径**、
+  是否存在、媒体类型/尺寸/字节数、所属记忆 id 与归档时间；可再用 `read_image` 查看。
+- **会话日志修复工具 `tools/repair-session-log.mjs`**：修复 v1.2 早期试验形态（回忆块写成
+  历史消息）漏写 message `id` 而损坏的日志；只补缺失的 id，默认备份，支持 `--dry-run`。
+
+#### Changed
+
+- **回忆块注入位置：保持系统提示词 section（回退 v1.2 的历史消息试验）**。回忆块仍是
+  `dsh-rofm:recall` system prompt section（order 100），注入/恢复/再归档都设置
+  `forceNewSeries`，由 `onPreStep` 返回 `startsRequestSeries: true` 让宿主重写头节点。
+  v1.2 曾把它改成“系统提示词之后的第一条历史消息（原地替换）”，现已按用户要求回退：
+  该形态会占一条 user 历史消息、在已有历史的会话上无法保证最早位置，且早期实现因漏写
+  message id 影响会话加载（修复工具见上）。
+- **句子完整性拆分（I2）**：`engine/compress.js` 的单条超长消息不再按裸字符数切片，而是只在
+  句子边界（`。！？；…`/换行；英文 `. ! ? ;` 仅在空白/结尾前）切分；跨目标的句子整体移动，
+  **单个回忆文件夹允许超过 `targetChunkChars`**；单句超长整句保留；切分文本拼接与原文完全一致、
+  不拆 UTF-16 代理对。其余分块规则（整用户回合、minChunkChars、maxFolders、tool 配对）不变。
+- **pinned 上下文不再无声消失（修复）**：压缩替换区间内夹着的非可归档 pinned 节点
+  （runtime-context 快照、后续 system 节点、其它插件的 in-history 提示等）现在会被渲染并
+  **并入 checkpoint 归档说明**（固定标记 `[memory] 本次归档区间内还有 N 条非对话上下文…已并入本说明以免丢失：`），
+  不再出现“从上下文移除但没有归档/不可回忆”的情况；这些内容不会变成回忆文件夹。
+  归档说明仍需小于被替换内容，否则跳过本次压缩记 warning（不丢数据）。
+  `compress-applied` 遥测新增 `pinnedShadowed` / `pinnedChars`。
+
+#### Fixed
+
+- **本地 fallback 渲染器与引擎渲染器一致性**：fallback 提取为导出的
+  `renderRecallBlockFallback(ordered)`；`renderRecallBlock()` 先按 createdAt 排序再试
+  `buildRecallBlock()`，仅在其抛错/返回空时走 fallback。新增回归测试断言两者输出
+  **逐字节相同**，防止再次出现“fallback 前言永远到不了注入文本”的漂移。
+- **图片元数据**：`meta.images` 为新增字段，旧文件夹无该字段时行为与之前完全一致。
+
+#### Tests
+
+- 新增 `test/images.test.mjs`（含路径展开/索引用例）、`test-adapter/recall-tool.test.mjs`
+  （图片路径过滤与渲染）、`test-adapter/image-tool.test.mjs`（25）、
+  `test-adapter/scoring-rubric.test.mjs`（3）、`test-adapter/recall-render.test.mjs`（3）、
+  `test/repair-session-log.test.mjs`（6，多帧 zstd 往返）；
+  `test-adapter/plugin-mock.test.mjs` 覆盖 I1/I2/I5/图片路径/记忆查找工具/pinned 合并；
+  注入位置与再归档相关旧断言恢复为 `startsRequestSeries: true` 语义；
+  `test-adapter/audit-tests-real-api-conformance.test.mjs` 断言 3 个工具、2 个 section、
+  pre-step 决策的 `startsRequestSeries` 行为。
+- `test/compress.test.mjs`：新增句末切分/整句保留/精确拼接/代理对/拉丁边界 5 例，
+  两个依赖旧“裸字符切片”的用例改写为带标点夹具（断言意图不变）。
+- 任务区块上限 50+50 的用例改为 64+64 个夹具、断言只列前 50 条；
+- 当前基线：**引擎 168/168、适配层 110/110，`node --test` 共 279/279 通过**。
+
+#### Docs
+
+- README：§1.1（句末切分/图片/pinned 合并）、§1.2（α 用户喜好）、§1.3（系统提示词 section +
+  `memory_recall`/`memory_image`）、§1.4（再归档/头重写）、§1.7（图片路径提示）、
+  §1.8（pinned 合并）、§6 已知限制/日志修复、§7 测试矩阵、§8 English summary、目录结构；
+- `docs/SPEC.md`：修订说明、§1/§3（图片与 `meta.images`/`images/index.json`）、§3.1（恢复语义）、
+  §4（α 用户喜好）、§4.2（`memory_judge` 逐字 description）、§4.3（`memory_recall`）、
+  §4.4（`memory_image`）、§5.4（句末拆分）、§5.5（图片路径/pinned 合并）、§5.6（再归档/头重写）、
+  §6.7（注入位置/fallback 镜像/修复工具）、§10 测试矩阵与计数；
+- `docs/VERIFICATION.md` §16 更新为最终形态，`docs/PUBLISHING.md` 基线更新；
+- 工具：`tools/recall-report.mjs` 新增 `archived images` / `pinned context merged` 两行与
+  `workStats.archivedImages/pinnedShadowed/pinnedChars`；`tools/show-recall.mjs` 显示每个 folder
+  的归档图片数（`folders[].images` / `summary.images`）。
+
+#### Version
+
+- `package.json` / `engine/package.json` → **1.2.0**（新行为；`config.json` 无新增键，
+  旧配置/旧记忆文件夹/旧 recall-state 均向后兼容）。
+
 ## [1.1.0] — 2026-10-26
 
 ### Added（记忆评分任务增强）

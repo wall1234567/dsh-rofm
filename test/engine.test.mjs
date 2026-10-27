@@ -13,6 +13,7 @@ import {
   DEFAULT_BETA,
   DEFAULT_CONFIG,
   MemoryEngine,
+  PLUGIN_ROOT,
   alphaForFolder,
   appendStats,
   atomicWriteJson,
@@ -97,6 +98,10 @@ test('config: documented defaults are present and valid', () => {
   assert.equal(cfg.compress.compressPercent, 20)
   assert.equal(cfg.compress.minChunkChars, 200)
   assert.equal(cfg.compress.targetChunkChars, 1200)
+  // v1.2 R1: one archival run may list up to 100 pending + 100 re-review folders,
+  // so the engine cap is 500 folders per run (config.json ships the same value).
+  assert.equal(cfg.compress.maxFoldersPerRun, 500)
+  assert.equal(DEFAULT_CONFIG.compress.maxFoldersPerRun, 500)
   assert.equal(cfg.importance.min, 0.01)
   assert.equal(cfg.importance.max, 1)
   assert.equal(cfg.importance.warnAbove, 0.8)
@@ -110,6 +115,22 @@ test('config: documented defaults are present and valid', () => {
   // defaults object itself is untouched by validation/merging
   assert.equal(DEFAULT_CONFIG.recall.seed, 0)
   assert.deepEqual(Object.keys(cfg.importance.weights).sort(), ['code', 'decisions', 'keywords', 'recency', 'userDensity'])
+})
+
+test('config: maxFoldersPerRun ships 500 and validation still accepts 500', () => {
+  // v1.2 R1: the engine default and the shipped config.json are both 500.
+  assert.equal(DEFAULT_CONFIG.compress.maxFoldersPerRun, 500)
+  assert.equal(loadConfig().compress.maxFoldersPerRun, 500)
+  const shipped = JSON.parse(fs.readFileSync(path.join(PLUGIN_ROOT, 'config.json'), 'utf8'))
+  assert.equal(shipped.compress.maxFoldersPerRun, 500)
+  // The documented integer >= 1 validation accepts the new cap without warnings.
+  const accepted = loadConfig(undefined, { compress: { maxFoldersPerRun: 500 } })
+  assert.deepEqual(accepted.warnings, [])
+  assert.equal(accepted.compress.maxFoldersPerRun, 500)
+  assert.equal(accepted.storage.maxFolders, 10000)
+  // The nested engine package version tracks the plugin release.
+  const enginePackage = JSON.parse(fs.readFileSync(path.join(PLUGIN_ROOT, 'engine', 'package.json'), 'utf8'))
+  assert.equal(enginePackage.version, '1.2.0')
 })
 
 test('config: config.json + overrides deep merge, unknown keys preserved', () => {

@@ -5,7 +5,8 @@
 `CHANGELOG.md`、GitHub Actions CI（`.github/workflows/ci.yml`）。
 
 > 发布前检查：`npm test`（= `node --test`）、`node test/simulate.mjs` 全部通过
-> （当前基线：引擎 119、适配层 54，共 174 个测试）；`npm pack --dry-run` 的文件清单里
+> （当前基线：引擎 188、适配层 113，共 302 个测试）；再跑一次 `node tools/selfcheck.mjs`
+> 确认本机真实数据为 0 failed（历史遗留问题只允许 WARN）；`npm pack --dry-run` 的文件清单里
 > 没有 `memory/` 运行时数据；`git status` 干净；`memory/` 里只有 `.gitkeep`。
 
 ## 1. 认证（三选一）
@@ -45,11 +46,11 @@ gh repo create dsh-rofm --public --source=. --remote=origin --push
 ## 4. 发版（Release）
 
 ```bash
-git tag -a v1.0.0 -m "v1.0.0"
-git push origin v1.0.0
+git tag -a v1.2.0 -m "v1.2.0"
+git push origin v1.2.0
 ```
 
-然后在 GitHub → Releases → Draft a new release：选 `v1.0.0` tag，
+然后在 GitHub → Releases → Draft a new release：选 `v1.2.0` tag，
 把 `CHANGELOG.md` 对应段落贴进说明；GitHub 会自动提供源码 zip/tar。
 
 ## 5. 可选：发布 npm / DSH 插件市场
@@ -70,6 +71,7 @@ git push origin v1.0.0
 - [ ] 无 token / 密码 / 私钥；
 - [ ] `LICENSE`、`README`、`CHANGELOG`、`CONTRIBUTING` 齐全；
 - [ ] CI 在 Node 20/22/24 × Linux/Windows 上全绿；
-- [ ] 版本号已在 `package.json`、`CHANGELOG.md`、git tag 三处一致；
+- [ ] `node tools/selfcheck.mjs` 在本机真实数据上 `0 failed`（历史遗留只允许 WARN）；
+- [ ] 版本号已在 `package.json`、`engine/package.json`、`CHANGELOG.md`、git tag 四处一致；
 - [ ] `memory/` 只有 `.gitkeep`，`git status` 干净；
 - [ ] `npm pack --dry-run` 预演通过，包内只有 `memory/.gitkeep`（无会话数据 / 无测试目录）。

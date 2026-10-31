@@ -49,9 +49,18 @@ after(() => {
 // CLI helpers
 // ---------------------------------------------------------------------------
 
-function runCli(args) {
+function runCli(args, envOverrides = {}) {
   return spawnSync(process.execPath, [SELFCHECK, ...args], {
     cwd: REPO_ROOT,
+    env: {
+      ...process.env,
+      // Deterministic v1.3.0 compat input: a fixture profile with no QQ plugin
+      // installed (tests that exercise compat override DSH_PROFILE_DIR).
+      DSH_PROFILE_DIR: NEUTRAL_PROFILE,
+      DSH_PROFILE: 'selfcheck-fixture',
+      DSH_HOME: NEUTRAL_DSH_HOME,
+      ...envOverrides,
+    },
     encoding: 'utf8',
     timeout: SPAWN_TIMEOUT_MS,
     maxBuffer: 32 * 1024 * 1024,
@@ -60,8 +69,8 @@ function runCli(args) {
 }
 
 /** Run with --json and return { status, json, stdout, stderr }. */
-function runJson(args) {
-  const result = runCli(['--json', ...args])
+function runJson(args, envOverrides = {}) {
+  const result = runCli(['--json', ...args], envOverrides)
   assert.equal(result.error, undefined, `selfcheck failed to spawn: ${result.error?.message}`)
   let json
   try {
@@ -86,6 +95,61 @@ function issueCodes(check) {
   const issues = Array.isArray(check.data?.issues) ? check.data.issues : []
   return issues.map((issue) => issue.code)
 }
+
+// ---------------------------------------------------------------------------
+// v1.3.0 compat fixtures
+// ---------------------------------------------------------------------------
+
+/**
+ * Every CLI spawn is pinned to a fixture profile with no QQ plugin, so the
+ * v1.3.0 compat check stays inert no matter what the machine running the tests
+ * has installed; compat tests override DSH_PROFILE_DIR explicitly.
+ */
+const NEUTRAL_PROFILE = path.join(makeTempDir(), 'profile')
+fs.mkdirSync(NEUTRAL_PROFILE, { recursive: true })
+fs.writeFileSync(path.join(NEUTRAL_PROFILE, 'package.json'), JSON.stringify({ name: 'selfcheck-neutral-profile', private: true }), 'utf8')
+const NEUTRAL_DSH_HOME = path.join(makeTempDir(), 'dsh-home')
+fs.mkdirSync(NEUTRAL_DSH_HOME, { recursive: true })
+
+/** One fixture profile with zero, one or both supported QQ plugins installed. */
+function createQqProfile({ onebot = false, derpyu = false, toolRestrict = null } = {}) {
+  const profileDir = path.join(makeTempDir(), 'profile')
+  const dependencies = {}
+  if (onebot) dependencies['dsh-onebot-qq'] = '^1.0.0'
+  if (derpyu) dependencies['qq-agent-presets'] = '^1.0.0'
+  writeJson(path.join(profileDir, 'package.json'), { name: 'selfcheck-compat-profile', private: true, dependencies })
+  if (toolRestrict !== null) {
+    const packageDir = path.join(profileDir, 'node_modules', 'qq-agent-presets')
+    fs.mkdirSync(packageDir, { recursive: true })
+    fs.writeFileSync(path.join(packageDir, 'qq-tool-restrict.mjs'), toolRestrict, 'utf8')
+  }
+  return profileDir
+}
+
+/** A `qq-tool-restrict.mjs` body whose SAFE_EXACT set lists `tools`. */
+function toolRestrictSource(tools) {
+  return `const SAFE_EXACT = new Set([\n${tools.map((name) => `  '${name}',`).join('\n')}\n])\n`
+}
+
+/** `.compat-state.json` payload as lib/compat-autopatch.js writes it (D14). */
+function compatStatePayload(filePath) {
+  return {
+    version: 1,
+    patches: [
+      {
+        target: 'qq-agent-presets',
+        filePath,
+        beforeHash: 'b'.repeat(64),
+        afterHash: 'a'.repeat(64),
+        patchedAt: '2026-01-01T00:00:00.000Z',
+        backupPath: `${filePath}.bak-rofm-20260101000000`,
+      },
+    ],
+  }
+}
+
+/** The compat-related check names, in report order. */
+const COMPAT_CHECK_NAMES = ['compat', 'compat chat keys', 'compat autopatch']
 
 // ---------------------------------------------------------------------------
 // memory-store fixtures
@@ -304,7 +368,7 @@ function writeSessionLog(sessionsDir, sessionId, events) {
 // tests
 // ---------------------------------------------------------------------------
 
-testIfZstd('selfcheck: a healthy store and recall state pass and exit 0', () => {
+test('selfcheck: a healthy store and recall state pass and exit 0', () => {
   const root = makeTempDir()
   const store = createGoodStore(root)
   const sessionsDir = createEmptySessionsDir(root)
@@ -319,7 +383,7 @@ testIfZstd('selfcheck: a healthy store and recall state pass and exit 0', () => 
   assert.equal(findCheck(json, 'session logs').status, 'WARN')
 })
 
-testIfZstd('selfcheck: corrupt index.json fails the memory store check', () => {
+test('selfcheck: corrupt index.json fails the memory store check', () => {
   const { store, sessionsDir } = corruptStoreFixture((fixture) => {
     fs.writeFileSync(path.join(fixture.storeDir, 'index.json'), '{ this is not json', 'utf8')
   })
@@ -331,7 +395,7 @@ testIfZstd('selfcheck: corrupt index.json fails the memory store check', () => {
   assert.equal(json.exitCode, 1)
 })
 
-testIfZstd('selfcheck: an out-of-range meta alpha fails the memory store check', () => {
+test('selfcheck: an out-of-range meta alpha fails the memory store check', () => {
   const { store, sessionsDir } = corruptStoreFixture((fixture) => {
     const metaPath = path.join(fixture.storeDir, fixture.meta.id, 'meta.json')
     writeJson(metaPath, { ...fixture.meta, alpha: 2.5 })
@@ -343,7 +407,7 @@ testIfZstd('selfcheck: an out-of-range meta alpha fails the memory store check',
   assert.equal(status, 1)
 })
 
-testIfZstd('selfcheck: an unsafe folder id in index.json fails the memory store check', () => {
+test('selfcheck: an unsafe folder id in index.json fails the memory store check', () => {
   const { store, sessionsDir } = corruptStoreFixture((fixture) => {
     writeJson(path.join(fixture.storeDir, 'index.json'), {
       version: 1,
@@ -359,7 +423,7 @@ testIfZstd('selfcheck: an unsafe folder id in index.json fails the memory store 
   assert.equal(status, 1)
 })
 
-testIfZstd('selfcheck: a corrupt stats.jsonl line fails the memory store check', () => {
+test('selfcheck: a corrupt stats.jsonl line fails the memory store check', () => {
   const { store, sessionsDir } = corruptStoreFixture((fixture) => {
     fs.appendFileSync(path.join(fixture.storeDir, 'stats.jsonl'), '{broken telemetry line\n', 'utf8')
   })
@@ -370,7 +434,7 @@ testIfZstd('selfcheck: a corrupt stats.jsonl line fails the memory store check',
   assert.equal(status, 1)
 })
 
-testIfZstd('selfcheck: an inconsistent recall-state snapshot fails the recall state check', () => {
+test('selfcheck: an inconsistent recall-state snapshot fails the recall state check', () => {
   const { store, sessionsDir } = corruptStoreFixture((fixture) => {
     // A v2 snapshot whose ids array and additions array disagree.
     writeJson(path.join(fixture.storeDir, 'recall-state.json'), recallStatePayload(fixture.meta, { ids: [] }))
@@ -436,7 +500,9 @@ testIfZstd('selfcheck: a foreign checkpoint is counted but does not fail', () =>
   assert.equal(status, 0)
 })
 
-testIfZstd('selfcheck: --json returns the documented machine-readable shape', () => {
+// Ungated on purpose: this fixture needs no zstd session log, so it must also
+// run on the Node 20 CI row (the machine-readable shape is cross-platform data).
+test('selfcheck: --json returns the documented machine-readable shape', () => {
   const root = makeTempDir()
   const store = createGoodStore(root)
   const sessionsDir = createEmptySessionsDir(root)
@@ -451,6 +517,11 @@ testIfZstd('selfcheck: --json returns the documented machine-readable shape', ()
   assert.equal(typeof json.sessionsDir, 'string')
   assert.equal(json.memoryDir, store.memoryDir)
   assert.equal(json.sessionsDir, sessionsDir)
+  assert.deepEqual(json.platform, {
+    os: process.platform,
+    arch: process.arch,
+    node: process.versions.node,
+  })
   assert.ok(Array.isArray(json.checks))
   assert.ok(json.checks.length >= 5, 'config, engine, memory store, recall state, session logs')
   for (const check of json.checks) {
@@ -468,17 +539,24 @@ testIfZstd('selfcheck: --json returns the documented machine-readable shape', ()
   assert.ok(stdout.trimStart().startsWith('{'), '--json prints JSON only, no human lines')
 })
 
-testIfZstd('selfcheck: human output uses check lines and the summary line', () => {
+// Ungated like the shape test above: a memory-store + empty-sessions fixture
+// needs no zstd codec, so Node 20 runs this too.
+test('selfcheck: human output uses check lines, one platform line and the summary line', () => {
   const root = makeTempDir()
   const store = createGoodStore(root)
   const sessionsDir = createEmptySessionsDir(root)
   const good = runCli(['--memory-dir', store.memoryDir, '--sessions-dir', sessionsDir])
   assert.equal(good.status, 0)
   const lines = String(good.stdout).trimEnd().split(/\r?\n/)
-  assert.ok(lines.length >= 2)
-  for (const line of lines.slice(0, -1)) {
+  assert.ok(lines.length >= 3, 'check lines + platform line + summary line')
+  // Last two lines are the platform line and the summary; everything before is
+  // one PASS/WARN/FAIL check line.
+  for (const line of lines.slice(0, -2)) {
     assert.match(line, /^\[(PASS|WARN|FAIL)\] [^—]+— .+$/, `unexpected check line: ${line}`)
   }
+  assert.match(lines.at(-2), /^platform: \S+ \S+, node \d+\.\d+\.\d+$/)
+  // The human platform line and the JSON object must agree.
+  assert.equal(lines.at(-2), `platform: ${process.platform} ${process.arch}, node ${process.versions.node}`)
   assert.match(lines.at(-1), /^selfcheck: \d+ passed, \d+ warnings, \d+ failed$/)
 
   const corrupt = corruptStoreFixture((fixture) => {
@@ -490,7 +568,7 @@ testIfZstd('selfcheck: human output uses check lines and the summary line', () =
   assert.match(String(bad.stdout), /^selfcheck: \d+ passed, \d+ warnings, [1-9]\d* failed$/m)
 })
 
-testIfZstd('selfcheck: --help exits 0 and documents the options', () => {
+test('selfcheck: --help exits 0 and documents the options', () => {
   const result = runCli(['--help'])
   assert.equal(result.status, 0)
   const stdout = String(result.stdout)
@@ -520,3 +598,138 @@ testIfZstd('selfcheck: --session limits the session-log check to one session id'
   assert.equal(check.data.notes, 1)
   assert.equal(status, 0, 'the bad session was not selected')
 })
+
+// ---------------------------------------------------------------------------
+// v1.3.0 compat checks
+// ---------------------------------------------------------------------------
+
+test('selfcheck: no compat line without a QQ plugin and without compat state (v1.2.1 parity)', () => {
+  const root = makeTempDir()
+  const store = createGoodStore(root)
+  const sessionsDir = createEmptySessionsDir(root)
+  const args = ['--memory-dir', store.memoryDir, '--sessions-dir', sessionsDir]
+
+  const human = runCli(args)
+  assert.equal(human.status, 0)
+  const output = String(human.stdout)
+  const lines = output.trimEnd().split(/\r?\n/)
+  assert.equal(lines.length, 7, `expected 5 check lines + platform line + summary, got:\n${output}`)
+  assert.ok(!output.includes('compat'), `no compat line expected, got:\n${output}`)
+  assert.match(lines.at(-2), /^platform: \S+ \S+, node \d+\.\d+\.\d+$/)
+  // config/engine/memory/recall pass, the empty fixture has no session logs (WARN).
+  assert.equal(lines.at(-1), 'selfcheck: 4 passed, 1 warnings, 0 failed')
+
+  const { json } = runJson(args)
+  assert.deepEqual(
+    json.checks.map((check) => check.name),
+    ['config', 'engine', 'memory store', 'recall state', 'session logs'],
+  )
+  assert.deepEqual(json.summary, { passed: 4, warnings: 1, failed: 0 })
+  assert.equal(json.exitCode, 0)
+})
+
+test('selfcheck: a detected onebot plugin adds the compat and chat-key PASS lines', () => {
+  const root = makeTempDir()
+  const store = createGoodStore(root)
+  const sessionsDir = createEmptySessionsDir(root)
+  const profileDir = createQqProfile({ onebot: true })
+  const args = ['--memory-dir', store.memoryDir, '--sessions-dir', sessionsDir]
+
+  const { status, json } = runJson(args, { DSH_PROFILE_DIR: profileDir })
+  assert.equal(status, 0)
+  const compat = findCheck(json, 'compat')
+  assert.equal(compat.status, 'PASS', compat.detail)
+  assert.equal(compat.detail, 'qqBots=auto; detected: dsh-onebot-qq')
+  assert.deepEqual(compat.data.detected, ['dsh-onebot-qq'])
+  assert.equal(compat.data.detection.enabled, true)
+
+  const keys = findCheck(json, 'compat chat keys')
+  assert.equal(keys.status, 'PASS', keys.detail)
+  assert.match(keys.detail, /onebot-123456-lq3z8x9a → onebot-123456/)
+  assert.equal(keys.data.mismatches.length, 0)
+  assert.equal(keys.data.samples.length, 6)
+
+  // No Derpyu plugin: no autopatch line, so exactly the two compat lines appear.
+  assert.deepEqual(
+    json.checks.filter((check) => check.name.startsWith('compat')).map((check) => check.name),
+    ['compat', 'compat chat keys'],
+  )
+  assert.equal(json.summary.failed, 0)
+  assert.equal(json.summary.passed, 6)
+
+  const human = String(runCli(args, { DSH_PROFILE_DIR: profileDir }).stdout)
+  assert.match(human, /^\[PASS\] compat — qqBots=auto; detected: dsh-onebot-qq$/m)
+  assert.match(human, /^\[PASS\] compat chat keys — /m)
+})
+
+test('selfcheck: a detected Derpyu with a patched whitelist and valid state passes', () => {
+  const root = makeTempDir()
+  const store = createGoodStore(root)
+  const sessionsDir = createEmptySessionsDir(root)
+  const profileDir = createQqProfile({
+    derpyu: true,
+    toolRestrict: toolRestrictSource(['ask_user_question', 'todo_write', 'memory_judge', 'memory_recall', 'memory_image']),
+  })
+  const targetFile = path.join(profileDir, 'node_modules', 'qq-agent-presets', 'qq-tool-restrict.mjs')
+  writeJson(path.join(store.memoryDir, '.compat-state.json'), compatStatePayload(targetFile))
+  const args = ['--memory-dir', store.memoryDir, '--sessions-dir', sessionsDir]
+
+  const { status, json } = runJson(args, { DSH_PROFILE_DIR: profileDir })
+  assert.equal(status, 0)
+  const compat = findCheck(json, 'compat')
+  assert.equal(compat.status, 'PASS', compat.detail)
+  assert.match(compat.detail, /detected: derpyu-qq-bridge/)
+  const autopatch = findCheck(json, 'compat autopatch')
+  assert.equal(autopatch.status, 'PASS', autopatch.detail)
+  assert.match(autopatch.detail, /memory_judge\/memory_recall\/memory_image present/)
+  assert.equal(autopatch.data.stateRecords, 1)
+  assert.equal(autopatch.data.patched, true)
+  // All three compat checks are present and counted, and none is a FAIL.
+  assert.deepEqual(
+    json.checks.filter((check) => check.name.startsWith('compat')).map((check) => check.name),
+    COMPAT_CHECK_NAMES,
+  )
+  assert.equal(json.summary.failed, 0)
+  assert.equal(json.summary.passed, 7)
+})
+
+test('selfcheck: a detected Derpyu with an unpatched/broken whitelist warns but never fails', () => {
+  const root = makeTempDir()
+  const store = createGoodStore(root)
+  const sessionsDir = createEmptySessionsDir(root)
+  const profileDir = createQqProfile({ derpyu: true, toolRestrict: toolRestrictSource(['ask_user_question', 'todo_write']) })
+  // A corrupt state file must still only produce WARN, never FAIL.
+  fs.writeFileSync(path.join(store.memoryDir, '.compat-state.json'), '{ broken json', 'utf8')
+  const args = ['--memory-dir', store.memoryDir, '--sessions-dir', sessionsDir]
+
+  const { status, json } = runJson(args, { DSH_PROFILE_DIR: profileDir })
+  assert.equal(status, 0, 'compat problems must never fail the self-check')
+  assert.equal(findCheck(json, 'compat').status, 'PASS')
+  const autopatch = findCheck(json, 'compat autopatch')
+  assert.equal(autopatch.status, 'WARN', autopatch.detail)
+  assert.match(autopatch.detail, /not readable\/valid JSON/)
+  assert.match(autopatch.detail, /memory_judge/)
+  assert.equal(json.summary.failed, 0)
+  assert.ok(json.checks.every((check) => check.status !== 'FAIL'))
+})
+
+test('selfcheck: a stale .compat-state.json alone surfaces WARN compat lines without a plugin', () => {
+  const root = makeTempDir()
+  const store = createGoodStore(root)
+  const sessionsDir = createEmptySessionsDir(root)
+  writeJson(path.join(store.memoryDir, '.compat-state.json'), compatStatePayload('C:/gone/qq-tool-restrict.mjs'))
+  const args = ['--memory-dir', store.memoryDir, '--sessions-dir', sessionsDir]
+
+  // Neutral fixture profile: no QQ plugin detected, only the state file remains.
+  const { status, json } = runJson(args)
+  assert.equal(status, 0)
+  const compat = findCheck(json, 'compat')
+  assert.equal(compat.status, 'WARN', compat.detail)
+  assert.match(compat.detail, /detected: none/)
+  assert.match(compat.detail, /stale state/)
+  const autopatch = findCheck(json, 'compat autopatch')
+  assert.equal(autopatch.status, 'WARN', autopatch.detail)
+  assert.match(autopatch.detail, /stale compat state/)
+  assert.equal(json.summary.failed, 0)
+})
+

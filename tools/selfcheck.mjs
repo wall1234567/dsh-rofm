@@ -6,9 +6,11 @@
  * own readers and invariants; it deliberately does not import `lib/plugin.js`, so
  * a broken adapter cannot hide its own damage. The only plugin code it reuses is
  * the zero-dependency engine surface the public API exposes (`engine/config.js`
- * defaults + `planCompression` for the smoke test) and `locateFrames` from the
+ * defaults + `planCompression` for the smoke test), `locateFrames` from the
  * session-log repair tool (frame scanning is container plumbing, not plugin
- * behavior).
+ * behavior), and the read-only v1.3.0 compat helpers (`lib/compat.js` detection /
+ * session-id parsing and `readAutopatchState` / `locateToolRestrictFile` from
+ * `lib/compat-autopatch.js`; none of them write anything).
  *
  * Checks (every one is PASS / WARN / FAIL; exit code 1 iff at least one FAIL):
  *   1. config        — engine/config.js loads, config.json is valid JSON, the
@@ -29,7 +31,14 @@
  *                      (runtime/time/skill context, in-history system copies,
  *                      recall snapshots); foreign checkpoints are counted but
  *                      never fail.
- *   6. test suite    — optional (`--with-tests`): `node --test` exits 0.
+ *   6. compat        — v1.3.0 QQ channel compatibility, reported only when the
+ *                      feature is actually relevant (a QQ plugin is detected or
+ *                      `<memoryDir>/.compat-state.json` exists): profile
+ *                      detection, session-id → stable chat-key parsing, and the
+ *                      Derpyu tool-whitelist autopatch state. These checks are
+ *                      PASS/WARN only and never FAIL; with no QQ plugin and no
+ *                      state file they add no line at all (v1.2.1 output parity).
+ *   7. test suite    — optional (`--with-tests`): `node --test` exits 0.
  *
  * Legacy data policy: historical shapes that older versions legitimately wrote
  * are reported as WARN, never FAIL. A session whose final surface still carries
@@ -48,6 +57,8 @@ import os from 'node:os'
 import path from 'node:path'
 import zlib from 'node:zlib'
 import { fileURLToPath, pathToFileURL } from 'node:url'
+
+import { invokedAsMain } from './main-module.mjs'
 
 const TOOL_FILE = fileURLToPath(import.meta.url)
 const TOOLS_DIR = path.dirname(TOOL_FILE)
@@ -81,6 +92,22 @@ const EXCLUDED_APPENDIX_MARKERS = [
 const MESSAGE_EVENT_TYPES = new Set(['user/message', 'assistant/message', 'system/message', 'developer/message', 'tool/result'])
 /** Default number of (newest) session logs inspected when `--max-sessions` is absent. */
 const DEFAULT_MAX_SESSIONS = 20
+/**
+ * v1.3.0 compat: sample session ids and the stable chat key each must map to.
+ *
+ * `onebot-123456-lq3z8x9a` carries a plausible epoch-ms base36 collision suffix
+ * (`parseInt('lq3z8x9a', 36)` is 2023-12-13), so only that suffix is stripped;
+ * `onebot-group-abc1234` merely looks like one and must stay untouched (a chat
+ * id is not a timestamp, and merging two chats would corrupt their memory).
+ */
+const COMPAT_CHAT_KEY_SAMPLES = Object.freeze([
+  ['onebot-123456', 'onebot-123456'],
+  ['onebot-123456-lq3z8x9a', 'onebot-123456'],
+  ['onebot-group-abc1234', 'onebot-group-abc1234'],
+  ['qqb-g-456-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'qqb-g-456'],
+  ['qqb-p-99-deadbeefdeadbeefdeadbeefdeadbeef', 'qqb-p-99'],
+  ['webui-session-1', 'webui-session-1'],
+])
 /** Upper bound for the optional `node --test` subprocess. */
 const TEST_SUITE_TIMEOUT_MS = 10 * 60 * 1000
 /** Hard cap on collected issue records (counts are never capped). */
@@ -106,10 +133,14 @@ Options:
 
 Checks: config, engine defaults + planCompression smoke, memory store, recall
 state, session-log checkpoint notes, and (with --with-tests) the test suite.
+When a QQ plugin is installed (or a compat autopatch state file exists) three
+PASS/WARN-only v1.3.0 compat lines are added: detection, chat keys, autopatch.
 PASS/WARN/FAIL lines are printed as:
   [PASS] <check> — <detail>
-and the last line is:
-  selfcheck: X passed, Y warnings, Z failed`
+followed by one platform line and the summary line:
+  platform: <os> <arch>, node <version>
+  selfcheck: X passed, Y warnings, Z failed
+The --json object records the same information as platform: { os, arch, node }.`
 
 class UsageError extends Error {}
 
@@ -1049,7 +1080,12 @@ async function loadFrameLocator() {
 async function decodeSessionLog(file) {
   const raw = fs.readFileSync(file)
   if (!file.endsWith('.zstd')) return raw.toString('utf8')
-  const { locateFrames } = await loadFrameLocator()
+  const { locateFrames, hasZstdSupport } = await loadFrameLocator()
+  // The tool itself is Node >= 20 but zstd session logs need node:zlib zstd
+  // (Node >= 22.15): report the actionable reason instead of a bare TypeError.
+  if (typeof hasZstdSupport === 'function' && !hasZstdSupport()) {
+    throw new Error(`node:zlib zstd support is missing on Node ${process.version} (needs >= 22.15)`)
+  }
   const frames = locateFrames(raw)
   const parts = []
   for (const frame of frames) {
@@ -1382,6 +1418,254 @@ function checkTestSuite(report) {
 }
 
 // ---------------------------------------------------------------------------
+// check 6 — v1.3.0 QQ channel compatibility (PASS/WARN only, never FAIL)
+// ---------------------------------------------------------------------------
+
+/** Dynamic import of one adapter module (`lib/compat.js` / `lib/compat-autopatch.js`). */
+async function importAdapterModule(name) {
+  return import(pathToFileURL(path.join(REPO_ROOT, 'lib', name)).href)
+}
+
+/** Human list of the QQ plugins the compat detection found. */
+function detectedCompatPlugins(detection) {
+  const names = []
+  if (detection?.onebot?.detected === true) names.push('dsh-onebot-qq')
+  if (detection?.derpyu?.detected === true) names.push('derpyu-qq-bridge')
+  return names
+}
+
+/** The adapter-only `compat` block from the plugin's config.json (never throws). */
+function readCompatBlock() {
+  const parsed = readJsonFile(path.join(REPO_ROOT, 'config.json'))
+  const raw = parsed.ok && parsed.value !== null && typeof parsed.value === 'object' ? parsed.value.compat : undefined
+  return raw !== null && typeof raw === 'object' && !Array.isArray(raw) ? raw : {}
+}
+
+/** `.compat-state.json` under the memory root (written by lib/compat-autopatch.js). */
+function compatStateFile(memoryDir) {
+  return path.join(memoryDir, '.compat-state.json')
+}
+
+/** Compat detection, never throws: `{ detection }` or `{ error }`. */
+function detectCompat(compatModule, qqBots) {
+  try {
+    if (typeof compatModule.CompatDetector === 'function') {
+      return { detection: new compatModule.CompatDetector().detect(qqBots) }
+    }
+    if (typeof compatModule.detectQqCompat === 'function') {
+      return { detection: compatModule.detectQqCompat({ qqBots }) }
+    }
+    return { error: new Error('lib/compat.js exports neither CompatDetector nor detectQqCompat') }
+  } catch (error) {
+    return { error }
+  }
+}
+
+/**
+ * Run the v1.3.0 QQ channel compatibility checks.
+ *
+ * Invisible on a normal install: when no QQ plugin is detected and
+ * `<memoryDir>/.compat-state.json` does not exist this adds no line at all, so
+ * the human/JSON output and the summary stay byte-identical to v1.2.1. Every
+ * compat finding is PASS or WARN — a detection failure, an unreadable profile, a
+ * corrupt state file or an unlocatable Derpyu target must never FAIL (they only
+ * mean the QQ channel keeps its safe fallback behaviour).
+ * @param {{memoryDir:string}} options
+ */
+async function checkCompat(report, options) {
+  const memoryDir = options.memoryDir
+  const statePath = compatStateFile(memoryDir)
+  const stateExists = isFile(statePath)
+  let compatModule
+  try {
+    compatModule = await importAdapterModule('compat.js')
+  } catch (error) {
+    addCheck(
+      report,
+      'compat',
+      'WARN',
+      `lib/compat.js cannot be loaded (${oneLine(error && error.message ? error.message : error)}); QQ compatibility status unknown`,
+      { statePath, stateExists },
+    )
+    return
+  }
+  const compatConfig = readCompatBlock()
+  const modes = Array.isArray(compatModule.QQ_BOTS_VALUES) ? compatModule.QQ_BOTS_VALUES : ['auto', 'off', 'on']
+  const qqBots = modes.includes(compatConfig.qqBots) ? compatConfig.qqBots : 'auto'
+  const data = { memoryDir, statePath, stateExists, qqBots, configuredQqBots: compatConfig.qqBots }
+  const { detection, error: detectionError } = detectCompat(compatModule, qqBots)
+  data.detection = detection === undefined
+    ? null
+    : {
+        enabled: detection.enabled === true,
+        profileDir: detection.profileDir,
+        onebot: detection.onebot?.detected === true,
+        derpyu: detection.derpyu?.detected === true,
+        reasons: Array.isArray(detection.reasons) ? detection.reasons : [],
+      }
+  // Relevance gate: with neither a QQ plugin nor lingering compat state the
+  // feature never ran, so report nothing (v1.2.1 output parity).
+  if (detectionError === undefined && detection?.enabled !== true && !stateExists) return
+
+  // --- 1. detection --------------------------------------------------------
+  const detected = detectedCompatPlugins(detection)
+  data.detected = detected
+  let compatStatus = 'PASS'
+  let compatDetail
+  if (detectionError !== undefined) {
+    compatStatus = 'WARN'
+    const message = oneLine(detectionError && detectionError.message ? detectionError.message : detectionError)
+    compatDetail = `detection failed (${message}); QQ compatibility status unknown`
+    data.error = message
+  } else if (detection.enabled === true) {
+    const detectedText = detected.length > 0 ? detected.join(', ') : 'none (no QQ plugin installed)'
+    compatDetail = `qqBots=${qqBots}; detected: ${detectedText}`
+    if (detected.length === 0) compatDetail = `${compatDetail}; enabled by compat.qqBots=on`
+    const warnings = Array.isArray(detection.warnings) ? detection.warnings : []
+    if (warnings.length > 0) {
+      compatStatus = 'WARN'
+      compatDetail = `${compatDetail}; ${oneLine(warnings[0])}`
+      data.warnings = warnings
+    }
+  } else {
+    compatStatus = 'WARN'
+    compatDetail = `qqBots=${qqBots}; detected: none (no QQ plugin installed); ${statePath} exists but compat stays off (stale state)`
+    data.staleState = true
+  }
+  addCheck(report, 'compat', compatStatus, compatDetail, data)
+
+  // --- 2. session id → stable chat key (memory folder naming) --------------
+  const keyData = { samples: [], mismatches: [] }
+  const parseSessionChatKey = typeof compatModule.parseSessionChatKey === 'function' ? compatModule.parseSessionChatKey : null
+  for (const [sessionId, expectedChatKey] of COMPAT_CHAT_KEY_SAMPLES) {
+    let parsed
+    try {
+      if (parseSessionChatKey === null) throw new Error('parseSessionChatKey is not exported')
+      parsed = parseSessionChatKey(sessionId)
+    } catch (error) {
+      keyData.mismatches.push(`${sessionId}: ${oneLine(error && error.message ? error.message : error)}`)
+      continue
+    }
+    const chatKey = typeof parsed?.chatKey === 'string' ? parsed.chatKey : ''
+    if (chatKey !== expectedChatKey) {
+      keyData.mismatches.push(`${sessionId} → ${JSON.stringify(chatKey)} (expected ${JSON.stringify(expectedChatKey)})`)
+      continue
+    }
+    keyData.samples.push({ sessionId, chatKey, mode: parsed.mode })
+  }
+  if (keyData.mismatches.length > 0) {
+    addCheck(
+      report,
+      'compat chat keys',
+      'WARN',
+      `${keyData.mismatches.length}/${COMPAT_CHAT_KEY_SAMPLES.length} sample session id(s) parse unexpectedly: ${oneLine(keyData.mismatches[0])}`,
+      keyData,
+    )
+  } else {
+    const example = COMPAT_CHAT_KEY_SAMPLES[1]
+    addCheck(
+      report,
+      'compat chat keys',
+      'PASS',
+      `${keyData.samples.length} sample session id(s) map to stable chat keys (e.g. ${example[0]} → ${example[1]})`,
+      keyData,
+    )
+  }
+
+  // --- 3. Derpyu tool-whitelist autopatch state ----------------------------
+  const derpyuDetected = detection?.derpyu?.detected === true
+  if (!derpyuDetected && !stateExists) return
+  let autopatchModule
+  try {
+    autopatchModule = await importAdapterModule('compat-autopatch.js')
+  } catch (error) {
+    addCheck(
+      report,
+      'compat autopatch',
+      'WARN',
+      `lib/compat-autopatch.js cannot be loaded (${oneLine(error && error.message ? error.message : error)}); autopatch state cannot be verified`,
+      { statePath, stateExists },
+    )
+    return
+  }
+  const toolNames = Array.isArray(autopatchModule.AUTO_PATCH_TOOL_NAMES) && autopatchModule.AUTO_PATCH_TOOL_NAMES.length > 0
+    ? autopatchModule.AUTO_PATCH_TOOL_NAMES.slice()
+    : ['memory_judge', 'memory_recall', 'memory_image']
+  let state
+  try {
+    state = autopatchModule.readAutopatchState(memoryDir)
+  } catch {
+    state = {}
+  }
+  const records = Array.isArray(state?.patches) ? state.patches : []
+  const stateValid = !stateExists || Array.isArray(state?.patches)
+  const autoPatchEnabled = compatConfig.autoPatchDerpyu !== false
+  const patchData = { statePath, stateExists, stateRecords: records.length, stateValid, autoPatchEnabled, toolNames }
+  const patchIssues = []
+  if (stateExists && !stateValid) {
+    patchIssues.push(`patch state ${statePath} is not readable/valid JSON (the autopatch record cannot be verified)`)
+  }
+
+  let autopatchStatus = 'PASS'
+  let autopatchDetail
+  if (!derpyuDetected) {
+    // The gate was reached through a leftover state file: the plugin is gone.
+    autopatchStatus = 'WARN'
+    autopatchDetail =
+      `Derpyu is not detected but ${statePath} holds ${records.length} patch record(s) ` +
+      '(stale compat state; the QQ plugin may have been uninstalled)'
+    if (patchIssues.length > 0) autopatchDetail = `${patchIssues.join('; ')}; ${autopatchDetail}`
+    patchData.staleState = true
+  } else if (!autoPatchEnabled) {
+    patchData.autoPatchDisabled = true
+    if (patchIssues.length > 0) {
+      autopatchStatus = 'WARN'
+      autopatchDetail = patchIssues.join('; ')
+    } else {
+      autopatchDetail = 'automatic whitelist patch disabled by config (compat.autoPatchDerpyu=false); Derpyu channel sessions use heuristic scoring'
+    }
+  } else {
+    let located
+    try {
+      located = autopatchModule.locateToolRestrictFile({ profileDir: detection?.profileDir })
+    } catch {
+      located = undefined
+    }
+    let text
+    if (located === undefined) {
+      patchIssues.push('qq-agent-presets/qq-tool-restrict.mjs was not found in the profile (the automatic whitelist patch cannot apply)')
+    } else {
+      patchData.targetFile = located.filePath
+      try {
+        text = fs.readFileSync(located.filePath, 'utf8')
+      } catch (error) {
+        patchIssues.push(`cannot read ${located.filePath} (${oneLine(error && error.message ? error.message : error)})`)
+      }
+    }
+    if (text !== undefined) {
+      const present = toolNames.filter((name) => text.includes(name))
+      patchData.presentToolNames = present
+      const missing = toolNames.filter((name) => !present.includes(name))
+      if (missing.length > 0) {
+        patchIssues.push(
+          `qq-tool-restrict.mjs does not list ${missing.join('/')} ` +
+          '(auto-patch not in effect; Derpyu channel sessions fall back to heuristic scoring)',
+        )
+      } else {
+        patchData.patched = true
+      }
+    }
+    if (patchIssues.length > 0) {
+      autopatchStatus = 'WARN'
+      autopatchDetail = patchIssues.join('; ')
+    } else {
+      autopatchDetail = `${toolNames.join('/')} present in qq-tool-restrict.mjs; ${records.length} patch record(s) in ${statePath}`
+    }
+  }
+  addCheck(report, 'compat autopatch', autopatchStatus, autopatchDetail, patchData)
+}
+
+// ---------------------------------------------------------------------------
 // orchestration + rendering
 // ---------------------------------------------------------------------------
 
@@ -1389,6 +1673,15 @@ function checkTestSuite(report) {
 function pluginVersion() {
   const parsed = readJsonFile(path.join(REPO_ROOT, 'package.json'))
   return parsed.ok && typeof parsed.value?.version === 'string' ? parsed.value.version : null
+}
+
+/**
+ * Runtime platform recorded in the report: a self-check output pasted into a
+ * bug report must say which OS/architecture/Node produced it (the zstd checks
+ * and the path logic are platform- and Node-version-sensitive).
+ */
+function platformInfo() {
+  return { os: process.platform, arch: process.arch, node: process.versions.node }
 }
 
 /**
@@ -1411,6 +1704,7 @@ export async function runSelfCheck(options = {}) {
     sessionId: options.sessionId ?? null,
     maxSessions: Number.isInteger(options.maxSessions) ? options.maxSessions : DEFAULT_MAX_SESSIONS,
   })
+  await checkCompat(report, { memoryDir })
   if (options.withTests === true) checkTestSuite(report)
   const summary = { passed: 0, warnings: 0, failed: 0 }
   for (const check of report.checks) {
@@ -1427,6 +1721,7 @@ export async function runSelfCheck(options = {}) {
     repoRoot: REPO_ROOT,
     memoryDir,
     sessionsDir,
+    platform: platformInfo(),
     checks: report.checks,
     summary,
     exitCode,
@@ -1437,6 +1732,8 @@ export async function runSelfCheck(options = {}) {
 /** Render the human-readable check lines. */
 function renderHuman(result) {
   const lines = result.checks.map((check) => `[${check.status}] ${check.name} — ${check.detail}`)
+  const platform = result.platform && typeof result.platform === 'object' ? result.platform : platformInfo()
+  lines.push(`platform: ${platform.os} ${platform.arch}, node ${platform.node}`)
   lines.push(`selfcheck: ${result.summary.passed} passed, ${result.summary.warnings} warnings, ${result.summary.failed} failed`)
   return lines
 }
@@ -1471,9 +1768,10 @@ export async function main(argv = process.argv.slice(2)) {
   return result.exitCode
 }
 
-const invokedDirectly =
-  process.argv[1] !== undefined &&
-  import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href
+// Symlinks and `#`/Unicode/space characters in the path are handled by
+// tools/main-module.mjs (the old pathToFileURL(path.resolve(argv[1])) compare
+// silently skipped main() when invoked through a symlink).
+const invokedDirectly = invokedAsMain(import.meta.url)
 
 if (invokedDirectly) {
   main().then(

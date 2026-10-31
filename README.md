@@ -321,6 +321,15 @@ DSH 的 compaction 替换是**按 seq 区间整段 shadow** 的：区间里可�
 - 遥测新增 `compress-applied.pinnedRecorded` / `mergedCheckpoints` / `archiveSegments`，
   保留 `pinnedShadowed` / `pinnedChars` 便于审计。
 
+### 1.9 QQ 渠道兼容（v1.3.0，详见 §3.2）
+
+v1.3.0 起，本插件只对 **`dsh-onebot-qq`** 与 **`Derpyu520/qq-bridge`** 两个 QQ 渠道插件做兼容，
+让「归档 → 评分 → 回忆」在 QQ 会话里也能闭环：会话 id 归并成稳定 chat 键（会话重建不丢记忆）、
+非主人群成员触发时按 α 门控、Derpyu 的工具白名单由 compat 模块**自动打补丁（可回滚）**、
+补丁不可用时自动降级启发式评分、宿主/preset 压缩器先压时做**被动归档兜底**、
+onebot 图片按正文里的本地路径抓取归档。**没有安装这两个插件时，插件行为与 v1.2.1 完全一致**
+（不多注册监听器、不改 system prompt、会话 id 原样使用）。
+
 ---
 
 ## 2. 安装
@@ -333,20 +342,28 @@ DSH 的 compaction 替换是**按 seq 区间整段 shadow** 的：区间里可�
 plugin_manager(action: "install_bundle", target: "<本目录绝对路径>")
 ```
 
-本机示例（路径换成你自己的插件目录即可）：
+三个平台的本机示例（路径换成你自己的插件目录即可；`target` 要写成宿主能访问到的**绝对路径**）：
 
 ```text
-plugin_manager(action: "install_bundle", target: "/path/to/dsh-rofm")
-plugin_manager(action: "install_bundle", target: "C:\\\\Users\\\\<you>\\\\plugins\\\\dsh-rofm")
+# Linux / macOS（POSIX 习惯的 ~/plugins/dsh-rofm 见下：target 不保证展开 ~，建议写展开后的绝对路径）
+plugin_manager(action: "install_bundle", target: "/home/<you>/plugins/dsh-rofm")
+plugin_manager(action: "install_bundle", target: "/Users/<you>/plugins/dsh-rofm")
+
+# Windows（普通文本里写单反斜杠；若通过 JSON 传参，反斜杠本身要写成 \\）
+plugin_manager(action: "install_bundle", target: "C:\Users\<you>\plugins\dsh-rofm")
 ```
 
-或使用 `dsh` CLI（如果可用）：
+或使用 `dsh` CLI（如果可用；路径含空格时用引号包住整段）：
 
 ```bash
-dsh plugin --profile desktop add link:<本目录绝对路径>
+dsh plugin --profile desktop add "link:/home/<you>/plugins/dsh-rofm"       # Linux
+dsh plugin --profile desktop add "link:/Users/<you>/plugins/dsh-rofm"      # macOS
+dsh plugin --profile desktop add "link:C:/Users/<you>/plugins/dsh-rofm"    # Windows
 ```
 
-本地目录安装是 **link** 形式：`memory/` 数据就写在本目录内，升级插件只需替换代码。
+本地目录安装是 **link** 形式：`memory/` 数据就写在本目录内（或 `storage.dir` 指定的位置），
+升级插件只需替换代码。三平台的路径规则、`~` 展开、macOS 大小写不敏感文件系统等细节见
+[§2.4 跨平台支持](#24-跨平台支持windows--linux--macos)。
 
 ### 2.2 从 GitHub 安装
 
@@ -361,6 +378,111 @@ git clone https://github.com/<you>/dsh-rofm.git
 安装后插件行 `dsh-rofm` 会出现在「设置 → 插件」里，标题为**记忆回忆 / Memory Recall**。
 安装即生效（HMR），无需重启；之后每个新回合都会自动工作。
 模型会在下一次请求里看到“记忆评分任务”区块，并可以调用 `memory_judge` 工具。
+
+### 2.4 跨平台支持（Windows / Linux / macOS）
+
+`dsh-rofm` 是**纯 Node.js ESM、零依赖**插件：不需要 `npm install`，所有路径都用 `node:path`
+组合（不假设 `/` 或 `\`），仓库源码由 `.gitattributes` 固定为 LF。运行要求只有 **Node.js ≥ 20**
+和可写的插件目录。
+
+**CI 验证矩阵**（[.github/workflows/ci.yml](.github/workflows/ci.yml)）：每次 push / PR 在
+3 个平台 × Node 20/22/24 上跑引擎测试、适配层测试、端到端模拟、CLI `--help` 与独立自检：
+
+| 平台 | runner | Node 20 | Node 22 | Node 24 | 平台要点 |
+| --- | --- | --- | --- | --- | --- |
+| Linux | `ubuntu-latest` | ✅ | ✅ | ✅ | 大小写敏感文件系统；普通用户权限 |
+| Windows | `windows-latest` | ✅ | ✅ | ✅ | NTFS 大小写不敏感；测试步骤用 Git Bash（`shell: bash`） |
+| macOS | `macos-latest` | ✅ | ✅ | ✅ | APFS 默认大小写不敏感；系统自带 bash 3.2 |
+
+> 本仓库开发机的**真机回归只覆盖 Windows**（结果见 [docs/VERIFICATION.md](docs/VERIFICATION.md) §19）；
+> Linux / macOS 的结论来自 CI 矩阵 + 静态审计，矩阵上任何一格变红都按平台回归处理。
+
+#### 各平台安装示例
+
+安装方式见 §2.1（`plugin_manager(action: "install_bundle", target: "<绝对路径>")`）。
+`target` 请写**展开后的绝对路径**：POSIX 习惯的 `~/plugins/dsh-rofm` 中 `~` 由 shell 展开，
+宿主不一定替你展开（用 `echo ~/plugins/dsh-rofm` 先看一眼）：
+
+```text
+# Linux
+plugin_manager(action: "install_bundle", target: "/home/<you>/plugins/dsh-rofm")
+
+# macOS
+plugin_manager(action: "install_bundle", target: "/Users/<you>/plugins/dsh-rofm")
+
+# Windows（单反斜杠；若通过 JSON 传参，反斜杠本身要写成 \\）
+plugin_manager(action: "install_bundle", target: "C:\Users\<you>\plugins\dsh-rofm")
+```
+
+#### 数据目录与路径规则
+
+- `storage.dir`（默认 `memory`）：**相对路径**相对插件目录解析；**绝对路径**原样使用；
+  **`~/`（或 `~\`）开头会展开到当前用户 home**（三个平台一致；只展开裸 `~` 与 `~/`/`~\`，
+  `~user` 这种 shell 用户名写法**不**展开），一份 `config.json` 可跨机器复用：
+  ```json
+  { "storage": { "dir": "~/dsh-rofm-memory" } }
+  ```
+  跨盘/共享数据时推荐写绝对路径：POSIX `/home/<you>/rofm-memory`、macOS `/Users/<you>/rofm-memory`、
+  Windows `C:\rofm-memory`。
+- `compat.mediaRoots`（onebot 图片白名单，**必填**）：同样支持 `~/` 展开（`~user` 不展开），其余请写**绝对路径**。
+  v1.3.0 起相对路径按进程 cwd 解析（仅为兼容旧行为保留），换 OS / 换启动目录会解析到不同位置，不建议使用。
+  ```json
+  "compat": {
+    "mediaRoots": [
+      "/home/<you>/qq-media",
+      "/Users/<you>/Pictures/QQ"
+    ]
+  }
+  ```
+  ```json
+  "compat": { "mediaRoots": ["C:/Users/<you>/Pictures/QQ"] }
+  ```
+  Windows 上 JSON 反斜杠要转义（`"C:\\Users\\<you>\\Pictures\\QQ"`），或者直接用正斜杠
+  （`C:/Users/<you>/Pictures/QQ`，Node 在 Windows 上同样接受）。
+- 媒体路径的**包含判断在 `realpath` 之后做**（符号链接/联结会被跟随），所以 macOS 的
+  `/tmp → /private/tmp` 这类链接根目录不会误拒；`mediaRoots` 里的条目本身也会先 `realpath`。
+- `memory/`（`storage.dir`）**可以是符号链接或 junction**（macOS `/var` → `/private/var`、
+  把记忆目录链到外置盘等）：归档/图片/staging 都会写穿到真实目录。写入的 JSON/JSONL 统一用
+  **LF** 换行，跨平台复制、diff、`git` 都不会因换行差异产生噪音。
+- 排障时先看插件激活日志：`dsh-rofm activated: platform=<os>/<arch> node=<version> memoryDir=<绝对目录>`
+  —— 它同时告诉你当前进程的平台和实际记忆目录。
+
+#### macOS / Linux 注意事项
+
+- **macOS 文件系统默认大小写不敏感**（APFS/HFS+）：`Memory/` 与 `memory/` 是同一个目录。
+  回忆文件夹 id 由时间戳生成、天然唯一；但**手工改名/复制记忆目录时不要只改大小写**，
+  否则 macOS 上会覆盖、Linux 上会变成两个目录。
+- 路径大小写规则与平台一致：**Linux 大小写敏感**（`mediaRoots: ["/srv/Media"]` 不会接受
+  `/srv/media/...`）；**macOS 的大小写不敏感由 `realpath` 归一化吸收**（`realpath` 返回磁盘上的
+  真实大小写，所以配置与消息里的路径大小写不一致仍能命中）；**Windows 比较时忽略大小写、
+  `\` 与 `/` 等价**。`mediaRoots` 仍建议按磁盘上的真实拼写写，换到 Linux 才不踩坑。
+- **Linux 权限**：`memory/`（或 `storage.dir`）必须对运行 DSH 的用户可读写；用 `sudo`/root
+  跑过一次后普通用户可能失去写权限（表现为归档失败 / `EACCES`），`chmod -R u+rwX <目录>`
+  或把数据目录放到用户 home 下即可。仓库文件本身不需要可执行位。
+- macOS 上非 ASCII 文件名可能以 NFD 形式落盘（中文/带重音字符的图片名）；
+  回忆块与 `memory_image` 返回的是程序读到的真实绝对路径，`read_image` 直接可用；
+  跨平台拷贝记忆目录时不要手工改名。
+
+#### 各平台跑测试 / 脚本
+
+```bash
+npm test                     # = node --test：3 平台一致，推荐（不依赖 shell 通配符）
+npm run check                # 测试 + 模拟 + selfcheck + CLI help
+node --test test/*.test.mjs         # bash / zsh / Git Bash：通配符由 shell 展开
+node --test test-adapter/*.test.mjs
+node test/simulate.mjs
+node tools/selfcheck.mjs
+node engine/cli.mjs --help
+```
+
+- **bash / zsh / Git Bash**：上面的 `*` 由 shell 展开，正常可用；zsh 在没匹配到文件时会报
+  `no matches found`，那说明 cwd 不对，先 `cd` 到仓库根目录。
+- **PowerShell / cmd**：它们**不展开 `*`**，请用 `npm test` / `npm run check`
+  （`node --test` 会自己发现 `test/**` 与 `test-adapter/**` 下的测试文件），或显式写文件名。
+- **CI 里可能出现的跳过**（不影响退出码）：无权创建符号链接的 Windows 用户下，2 个 symlink
+  用例会 `skip`（Linux/macOS 会真实执行）；2 个 `skip: !isWindows` 的 Windows 专属用例在
+  Linux/macOS 上跳过；Node 20 上 `node:zlib` 尚无 zstd 支持，相关的会话日志用例跳过。
+- Node 不在 `PATH` 时用绝对路径调用即可（Node ≥ 20）。
 
 ---
 
@@ -408,7 +530,7 @@ git clone https://github.com/<you>/dsh-rofm.git
 | `recall.triggerSourceKinds` | `["user"]` | 哪些消息来源算“用户说话”（如 `agent-message` 用于子代理/团队消息） |
 | `recall.applyToSubagents` | `false` | 是否给子代理也做回忆 |
 | `recall.applyToMainSessions` | `true` | 是否给主会话做回忆 |
-| `storage.dir` | `memory` | 回忆根目录（相对插件目录；可写绝对路径） |
+| `storage.dir` | `memory` | 回忆根目录（相对插件目录；可写绝对路径；支持 `~/`/`~\` 展开到用户 home，`~user` 不展开） |
 | `storage.perSession` | `true` | 每个会话独占 `memory/sessions/<session-id>/`；回忆不跨会话 |
 | `storage.maxFolders` | `10000` | 单个会话记忆文件夹总数安全上限；达到上限时**整次归档被拒绝**（绝不部分写入、也不替换上下文） |
 | `logging.enabled` / `verbose` | `true` / `false` | DSH 日志输出 |
@@ -504,6 +626,193 @@ node tools/show-recall.mjs --session <session-id> --json
 > 旧版(0.1.x)的全局 `memory/index.json` + `memory/mem-*/` 仍留在磁盘上（历史数据，新版本不再读取），
 > 可用 `--dir <该目录>` 查看；0.2.0 起每个会话只读自己 `memory/sessions/<id>/` 下的文件夹。
 
+## 3.2 QQ 渠道兼容（`dsh-onebot-qq` / `Derpyu520 qq-bridge`）
+
+v1.3.0 起，dsh-rofm 只对下面**两个** QQ 渠道插件做兼容（不追求兼容其它 QQ 插件）。
+`compat.qqBots` 默认 `auto`：**检测不到这两个插件时，本插件不注册任何新监听器、不改 system prompt、
+会话 id 原样使用——行为与 v1.2.1 完全一致。**
+
+| 渠道插件 | 形态 | 消息来源 | 会话 id | rofm 需要适配的点 |
+|---|---|---|---|---|
+| `dsh-onebot-qq`（npm，OneBot 11 / NapCat） | Host 插件 | `source.kind = "plugin:dsh-onebot"` | `onebot-<chatId>`；冲突/退役后追加 `-<base36 时间戳>` | 触发 kind 名字不同、群成员身份只写在正文里、图片/视频/文件以 `[图片:<路径>]` 注解投递（语音无路径）、群聊必须 @ 机器人 |
+| `Derpyu520/qq-bridge` | 独立桥接进程 + agent preset + MCP | `source.kind = "user"`（DSH `session/prompt` 的 user-rpc） | `qqb-<g\|p>-<数字id>-<32位hex>`；`/reset`、切模式会重建并换 hex | 会话 id 轮换、preset 工具白名单会拒绝 rofm 三个工具、preset 自带压缩器 |
+
+### 3.2.1 检测与开关
+
+- `compat.qqBots`：`"auto"`（默认，自动检测）/ `"off"`（强制关闭，行为等同 v1.2.1）/ `"on"`（强制启用）。
+- `auto` 读当前 profile：`DSH_PROFILE_DIR` → `$DSH_HOME/profiles/$DSH_PROFILE` → `~/.dsh/profiles/desktop`：
+  - **onebot**：profile `package.json` 依赖含 `dsh-onebot-qq`，或 `node_modules/dsh-onebot-qq` 存在，或 `cordis.patch.yml` 出现该包名；
+  - **Derpyu**：依赖/bundles 含 `qq-agent-presets` 或 `qq-mode-console`，或 patch 出现 `mcp-snowluma` / `preset-qq-chat`，或 `node_modules/qq-agent-presets` 存在。
+- 命中时插件日志打印 `dsh-rofm: compat enabled (dsh-onebot-qq)` / `(derpyu-qq-bridge)`；检测失败只 WARN，不抛错。
+- profile 文件 mtime 变化、或 `config.json` 保存后会轻量重检（自动补丁也在此时自愈重打，见 §3.2.5）。
+
+### 3.2.2 记忆目录：按 chat 键归并（会话重建不丢记忆）
+
+`storage.perSession` 语义不变，目录仍是 `memory/sessions/<chatKey>/`，但 chatKey 会去掉“会话重建后缀”：
+
+| 会话 id | chatKey |
+|---|---|
+| `onebot-123456` | `onebot-123456` |
+| `onebot-123456-m1abcd2e`（时间戳冲突后缀） | `onebot-123456` |
+| `qqb-g-987654-<32 位 hex>` | `qqb-g-987654` |
+
+→ `/reset`、切模式、preset 冲突重建出的新会话仍命中**同一份记忆目录**与 `recall-state.json`，
+回忆块在重启/重建后照常恢复。旧数据不迁移：compat 生效前这两个插件不会产生 rofm 记忆。
+
+### 3.2.3 回忆触发与群成员门控（仅 onebot）
+
+- onebot 消息的 `source.kind` 会被并入 `recall.triggerSourceKinds`（自动视为 `["user", "plugin:dsh-onebot"]`，**不需要手改配置**）；
+- onebot 群消息正文自带发送者身份：`<user_message qq="…" nickname="…">…</user_message>`，或群前缀 `[HH:MM nick(uid)]`：
+  - `compat.ownerIds`（QQ 号数组）里的发送者 = **主人**，不受门控；
+  - 其它群成员触发的回忆只召回 **α ≥ `compat.memberMinAlpha`**（默认 `0.5`；设为 `0` 关闭门控）；
+  - 私聊/无发送者标记的消息按主人处理；**Derpyu 的触发消息是桥合成唤醒，不适用门控**；
+- 门控对**自动回忆**与 `memory_recall` 工具**都生效**（同一轮内模型主动查记忆也不能绕过）；
+- 通道会话的评分口径追加一句：“涉及主人的身份、偏好、决定、承诺 → α 不低于 0.5”，保证主人信息能穿过门控。
+
+### 3.2.4 评分策略
+
+| 场景 | 评分方式 |
+|---|---|
+| onebot | **模型评分**（默认走 `memory_judge`，归档先落“待评分”） |
+| Derpyu，自动补丁生效 | **模型评分** |
+| Derpyu，补丁未生效 / 被关闭 | **启发式评分**（α 来自 `engine/importance.js`、关键词来自 `engine/tokenize.js`，落盘即 `scored:true`），只打**一条** WARN |
+| 任意通道，`compat.channelScore = "heuristic"` | 强制启发式评分 |
+
+Derpyu 的两个 preset 都挂 `qq-tool-restrict`：`tools.restrict` 隐藏危险全局工具、`tools.guard` 执行期只放行
+`mcp__snowluma__*` / `mcp__snowluma-host__*` / `mcp__web-search-safe__*` + `ask_user_question` + `todo_write`，
+所以 rofm 的 `memory_judge` / `memory_recall` / `memory_image` **可见但执行被拒** → 归档永远待评分、永不回忆。
+自动补丁就是为解决这一点（§3.2.5）；补丁不可用时启发式评分保证记忆仍可被回忆。
+
+### 3.2.5 自动补丁：Derpyu 工具白名单（可回滚）
+
+`compat.autoPatchDerpyu`（默认 `true`）让 rofm 在检测到 Derpyu 后**自动**做一件事：
+
+1. 定位 `<profile>/node_modules/qq-agent-presets/qq-tool-restrict.mjs`
+   （link 安装时写穿到用户仓库 `plugins/qq-agent-presets/qq-tool-restrict.mjs`）；
+2. 在 `const SAFE_EXACT = new Set([...])` 里插入 `memory_judge` / `memory_recall` / `memory_image`
+   （带 `// rofm-autopatch: 自动补丁注入` 行尾标记）；
+3. 写前备份 `<file>.bak-rofm-<YYYYMMDDHHmmss>`（同文件最多保留 5 份），**原子写**（tmp + rename）；
+4. 在 `memory/.compat-state.json` 记录文件路径与打补丁前后的 sha256；
+5. **幂等**：三个名字已在 → 跳过；Derpyu 更新后文件 hash 变化且名字缺失 → 在新文件上重新注入（备份同样最多 5 份）；
+6. **失败安全**：结构无法识别（不是“逐行一个字符串字面量的 Set”）、只读、定位失败 → **只 WARN，不写、不猜**，
+   并自动降级为启发式评分；
+7. `autoPatchDerpyu: false` 时**完全不碰第三方文件**（走启发式评分兜底）。
+
+只改这一个文件、只增加三个本地记忆工具名（不引入 shell/文件能力，不涉及网络）。
+
+**回滚**（任选其一）：
+
+```bash
+# 1) 用备份覆盖（备份与目标同目录，文件名带时间戳）
+cp <qq-tool-restrict.mjs>.bak-rofm-<时间戳> <qq-tool-restrict.mjs>
+# 2) 手动删掉 SAFE_EXACT 里那三行（含注入标记注释）
+# 3) 让程序下次重新评估：删掉 memory/.compat-state.json 里的对应记录
+```
+
+> 补丁写盘后**需新会话或重启 DSH** 才生效（ESM 模块缓存不会热更）。
+
+### 3.2.6 被动归档（兜底）
+
+rofm 的归档阈值 60% **先于** preset/宿主压缩器的 80%，正常路径下 rofm 先归档。若某次宿主/preset 压缩器先压了
+（或 rofm 因安全规则跳过），rofm 会监听 `session/event` 的 `compaction/summary` 兜底：
+
+- 读 `shadowedSeqs` / `shadowedRange` → `session.eventAt(seq)` 取原文 → 只保留 user/assistant 消息
+  （跳过 checkpoint / system / tool）；
+- 按该会话的评分模式归档（模型评分 → 待评分；启发式 → 已评分）到**同一 chat 记忆目录**；
+- **不修改对方的 checkpoint、不写自己的 checkpoint**；
+- per 会话水位 `memory/sessions/<chatKey>/.passive-watermark.json` 去重：同一内容不会被主动/被动两条路径重复归档；
+- 只对 QQ 通道会话启用（普通 WebUI 会话保持 v1.2.1 行为）。
+
+### 3.2.7 onebot 图片归档
+
+`dsh-onebot-qq` 0.9.6 对**通过门控**的图片会在正文里写 `[图片:<本地绝对路径>]`（视频 `[视频:<path>]`、
+文件 `[文件:<path>]`；**语音是 `[语音]` + 异步转写，不含路径，因此不参与图片归档**）。路径由插件先把图下载到
+自己的 `mediaDir`（默认 `~/.dsh/media/onebot`）再写进正文。rofm 在收到消息时：
+
+1. 从正文抽出本地图片路径（后缀白名单 `.jpg/.jpeg/.png/.gif/.webp/.bmp`）；
+2. `realpath` 必须落在 `compat.mediaRoots` 内（**必填**，空数组 = 不归档任何图片）、必须是普通文件、
+   不超过 `compat.maxImageBytes`（默认 8 MiB）；
+3. 复制到 `memory/.staging/<chatKey>-<messageId>/`（此时源文件一定还在）；
+4. 归档时移入 `memory/sessions/<chatKey>/images/`，正文里的原始路径改写成占位符 `[图片：（name）]`，并更新图片索引；
+5. 回忆时占位符渲染为绝对路径，模型可用 `read_image` 读取；归档后 staging 副本删除，
+   超时（`compat.stagingTtlMs`，默认 24h）与每 64 条消息定期清理。
+
+> 路径白名单之外的文件**一律拒绝**：群消息里的任意路径不能把本机文件拉进记忆库。
+
+> **两个前提**（2026-10-31 真机 e2e 确认）：① 群聊必须 @ 机器人——`dsh-onebot-qq` 的 `requireMention`
+> 默认 `true`，未 @ 的消息（包括单独发来的图片）在 mention 门就被丢弃，不会下载、也不会进正文；
+> ② `compat.mediaRoots` 要包含插件的 `mediaDir`（默认 `~/.dsh/media/onebot`），否则图片路径会被白名单拒绝。
+> 注意 QQ 客户端会把「@ + 文字」和「图片」拆成两条消息，只 @ 一次的图片仍然到不了 rofm；图片请走**私聊**
+> 或在同一条消息里同时带 @ 与图片。
+
+**语音归档（QQ 通道）**：`dsh-onebot-qq` 把入站语音渲染成 `[语音]` 占位，并在 STT 可用时把转写结果作为
+另一条 `（语音转写：…）` 投递。rofm 归档时把两者合成一句，保证回忆时既看得出「这是语音」也知道说了什么：
+
+| 会话里看到的 | 归档后的正文 |
+|---|---|
+| `（语音转写：帮我记一下周五开会）` | `[语音] 帮我记一下周五开会` |
+| `[语音]`（STT 关闭或失败） | `[语音]（未转写）` |
+
+前提：onebot 的 `sttEnabled` 为 `true`（默认），且本机有 `ffmpeg` + whisper（`sttEngine` 可选
+`auto`/`openai`/`whisper-cpp`/`custom`；whisper.cpp 用 `sttModel` 指到 `ggml-*.bin`）。缺少引擎时语音仍会
+归档，只是标记为 `[语音]（未转写）`。该改写只作用于 QQ 通道会话，普通 WebUI 会话的文本原样保留。
+实现见 `lib/voice-notes.js`（纯字符串变换、幂等），接线在 `lib/surface.js` 的 `buildSurfaceEntries({ voiceNotes })`。
+
+> **QQ 插件侧的两个已知前提**（2026-10-31 真机实测，rofm 不修它们，只记录）：
+> ① `dsh-onebot-qq` 的 `findCommand()` 在 Windows 上按 `PATH/<name>` 查找、**不带 `.exe`**，因此
+> `ffmpeg.exe` 永远找不到——把 `ffmpeg.exe` 复制一份、去掉扩展名放到任意 PATH 目录即可（不改插件代码）；
+> ② whisper.cpp 在 Windows 上读不了非 ASCII 路径（中文用户名会报 `error: 1 input file(s) failed`，退出码 11），
+> 而插件把转写临时 WAV 放在自己的 `mediaDir` 下——把 `mediaDir` 指到纯 ASCII 目录（如 `D:/.../media`），
+> 并让 rofm 的 `compat.mediaRoots` 也包含它，语音归档即可正常工作。
+
+### 3.2.8 通道会话的可见性
+
+- `dsh-rofm:recall` 回忆块与“记忆评分任务”都在 **system prompt** 里，**QQ 群友看不到**；
+- `memory_judge` / `memory_recall` / `memory_image` 的工具调用也不会转发到 QQ
+  （onebot 卡片只中继 `exit_plan_mode` / `ask_user_question`；Derpyu 只把工具调用写控制台日志）；
+- 通道会话的 prompt 会加一条 **QQ 通道会话规则**：禁止提及评分/打分/α/β/`memory_judge`/`memory_recall`/
+  评分任务/归档/压缩归档/写入记忆库；允许自然引用回忆到的内容（“你上次提到过…”）；
+  上下文不足时引导模型调用 `memory_recall` 检索历史。**不做逐条说漏检测**（用户判定不必要）。
+- onebot 的 `interimMessages`（工具调用前的中间文字可能被转发）建议关闭或压缩——这是 onebot 插件自己的配置项，
+  不在 rofm 里。
+
+### 3.2.9 `compat` 配置
+
+```json
+"compat": {
+  "qqBots": "auto",
+  "ownerIds": [],
+  "memberMinAlpha": 0.5,
+  "autoPatchDerpyu": true,
+  "channelScore": "model",
+  "mediaRoots": [],
+  "maxImageBytes": 8388608,
+  "stagingTtlMs": 86400000
+}
+```
+
+| 键 | 默认 | 说明 |
+|---|---|---|
+| `qqBots` | `"auto"` | `auto` / `off` / `on` |
+| `ownerIds` | `[]` | 主人 QQ 号（字符串或数字，自动转字符串）；为空时所有带标记的发送者都算非主人 |
+| `memberMinAlpha` | `0.5` | 非主人触发时的 α 下限；`0` = 关闭门控 |
+| `autoPatchDerpyu` | `true` | 自动向 Derpyu 注入工具白名单（§3.2.5）；`false` = 完全不碰第三方文件 |
+| `channelScore` | `"model"` | `model` / `heuristic` |
+| `mediaRoots` | `[]` | onebot 本地图片允许的根目录（**建议写绝对路径**，支持 `~/` 展开；空 = 不归档图片；Linux 大小写敏感、Windows 忽略大小写，见 §2.4） |
+| `maxImageBytes` | `8388608` | 单张图片大小上限（字节） |
+| `stagingTtlMs` | `86400000` | 图片暂存过期清理时间（毫秒） |
+
+### 3.2.10 已知限制
+
+- **Derpyu 图片不可归档**：正文只有 `[图片]` 标记、没有本地路径；
+- **群成员门控仅 onebot**：Derpyu 的触发消息是桥合成唤醒，没有发送者身份；
+- **reserved2 主动查记忆依赖自动补丁**：补丁未生效时 `memory_recall` 会被 guard 拒绝，
+  只能靠自动回忆（关键词素材弱）+ 启发式记忆；
+- **启发式评分质量低于模型评分**：α/关键词来自启发式，`β` 固定 0；
+- **onebot 图片归档需要配置 `compat.mediaRoots`**：出于安全默认拒绝一切图片路径；
+- **自动补丁写盘后需重启/新会话生效**，且只支持“逐行一个字符串字面量”的 `SAFE_EXACT` 结构——
+  上游结构变化时只 WARN、不猜。
+
 ## 4. 目录结构
 
 ```text
@@ -515,8 +824,14 @@ dsh-rofm/
 │   ├── recall-tool.js       # ★ memory_recall 模型工具（v1.2：模型主动按关键词回忆，含 3/6 次未命中升级）
 │   ├── image-tool.js        # ★ memory_image 模型工具（v1.2：按关键词/记忆 id/文件名找归档图片文件）
 │   ├── images.js            # 图片文件夹助手（占位符/路径展开/索引/存取，纯函数、无 DSH import）
+│   ├── compat.js            # ★ v1.3.0 QQ 渠道兼容：检测 / chat 键 / 群成员身份 / α 门控 / 评分模式（纯函数、零依赖）
+│   ├── compat-autopatch.js  # ★ v1.3.0 Derpyu 工具白名单自动补丁（幂等/备份/原子写/hash 状态/自愈/失败安全）
+│   ├── passive-archive.js   # ★ v1.3.0 被动归档：compaction/summary → 被 shadow 原文回收到 chat 记忆（水位去重）
+│   ├── heuristic-score.js   # ★ v1.3.0 启发式评分降级路径（α=engine/importance、keywords=engine/tokenize）
+│   ├── qq-media.js          # ★ v1.3.0 onebot 本地图片路径解析/realpath 白名单校验/staging 暂存与清理
 │   ├── compaction.js        # 用 DSH 官方 compaction 事务替换被归档的上下文
-│   ├── config-store.js      # config.json 热加载
+│   ├── config-store.js      # config.json 热加载（含 compat 块校验）
+│   ├── surface.js           # Session surface → 可归档 entry（v1.3.0：可追加第三方 user 消息 kind）
 │   └── message-text.js      # 消息 → 纯文本
 ├── engine/                  # ★ 独立记忆引擎：零依赖、无 DSH import、可单独运行
 │   ├── index.js             # 公共 API（含 β 常量/normalizeBeta/formatBeta/RECALL_BLOCK_PREAMBLE）
@@ -746,8 +1061,11 @@ selfcheck: 4 passed, 1 warnings, 0 failed
 > 这些 WARN 是**历史会话**里 v1.2 之前留下的多条注记（v1.2 只在新的归档发生时把它们合并，不会主动改写旧会话日志）；
 > 新会话/新归档会自然收敛到一条注记，不需要手工处理。
 
-测试覆盖（引擎 **188** 个 + 适配层 **115** 个，`node --test` 共 **304** 个；另有 1 个 `test/simulate.mjs` 计在总数里，
-引擎/适配层分项和 303 + simulate 1 = 304）：
+测试覆盖（v1.3.0 实测 `node --test` = **493 用例：491 pass + 2 skip、0 fail**；CI 在 Linux/Windows/macOS ×
+Node 20/22/24 上校验）：`test/` 覆盖引擎用例 + `simulate`（含 v1.3.0 的 compat / compat-autopatch /
+heuristic-score / passive-archive / qq-media / recall `minAlpha` 用例，以及 v1.3.0 新增的
+`test/portability.test.mjs` 跨平台用例），`test-adapter/` 覆盖 DSH 适配层（含 v1.3.0 兼容集成与
+QQ 兼容流水线）。跳过条件（本机用户权限 / Node 版本门控）见 §2.4。
 
 - `erf` 与 p(n)（p(1)=1、p(5)≈0.5502、单调递减、μ/σ 可调）；
 - **β（信赖度）**：`normalizeBeta` 夹取/四舍五入/非有限回退（不出现 `-0`）、
@@ -768,6 +1086,17 @@ selfcheck: 4 passed, 1 warnings, 0 failed
   - **R3 注记合并**：`buildArchiveNote(plan,{totalSegments})` 累计 N、`parseArchiveNote` 解析（带/不带关键词 + 允许附录）、多次归档后 surface 只剩一条本插件注记且 N 累计、旧注记附录被丢弃、外来 checkpoint 阻止向前扩张且不被改写/合并（plugin-mock 的 R3 用例与端到端两次真实归档用例）；
   - **R4 pinned 记录策略**：runtime-context / time-context / skill-catalog / in-history system 副本不再写进注记（静默 shadow），subagent-settled / subagent-error-details / tool-jobs / user-approval 只记录本次归档事务 shadow 到的，未知来源按记录处理（plugin-mock 的 R4 用例断言附录标记文本与 `pinnedRecorded` 遥测）；
   - **R5 自检工具**：`tools/selfcheck.mjs` 的 `--json`/`--memory-dir`/`--sessions-dir`/`--session`/`--max-sessions` 行为、PASS/WARN/FAIL 判定与退出码（`test/selfcheck.test.mjs`）；
+- **v1.3.0 QQ 渠道兼容**：
+  - **compat 检测与解析**：profile 三重信号、`qqBots` 三态（auto/off/on）、坏 profile/坏 JSON 不抛错、CompatDetector 按 mtime 缓存；
+    chat 键（onebot 的 base36 后缀只在合理 epoch 内才去除、Derpyu 的 32 位 hex、近似 id 不误判）；
+  - **群成员门控**：`<user_message qq="…">` / `[HH:MM nick(uid)]` / 无标记 / 受限成员解析；owner 与私聊/Derpyu 不门控；
+    非 owner 只召回 α ≥ `memberMinAlpha`，且**不能被关键词桥或 `memory_recall` 绕过**；通道会话评分口径含“主人信息 α 不低于 0.5”；
+  - **自动补丁**：mock 文件覆盖“已含→跳过 / 注入→幂等 / 结构变化→不写且字节不变 / 只读→failed / 上游更新自愈 / 备份上限 5 / 开关关闭不写 / 状态文件损坏可恢复”；
+  - **被动归档**：正常归档、重复事件 watermark 去重、缺 `shadowedSeqs`/坏 session 不抛、水位损坏恢复、评分模式两条路径、`storage.maxFolders` 拒绝、chat 键变化共用目录；
+  - **启发式评分**：确定性、关键词遵守 3~8、坏输入降级、不污染 `cfg.warnings`；
+  - **图片**：正文路径解析（win/unix/引号/多路径/中文名/非路径不误判）、realpath 白名单（越界/符号链接逃逸/目录/超大/后缀/mediaRoots 空全部拒绝）、
+    staging 重建与清理、归档后正文改写占位符 + `images/` 落盘 + 图片索引、回忆渲染绝对路径；
+  - **零回归**：`compat` 未启用时监听器仍是 3 个、plain 会话 id 原样使用、无额外 prompt 文本、`minAlpha` 缺省不改变回忆结果。
 - **未评分不可回忆**：`indexEntryFromMeta` 的 `scored` 缺省 true / `false` 保留、`rescorePending` 往返；
   `scored:false` 的 folder 即使关键词匹配也不加回、不掷骰、不占名额、不作桥；旧数据无 `scored` 仍正常回忆；
 - **适配层工具化评分**：`start()` 注册 `memory_judge`（schema/description/参数、dispose 卸载）；
@@ -901,6 +1230,26 @@ background jobs.
   and the latest cumulative `archiveSegments` (`checkpoint notes merged` line);
   `tools/show-recall.mjs` shows folders with α/β/scored/rescorePending and the v2
   snapshot summary.
+- **QQ channels (v1.3.0)**: opt-in compatibility with exactly two QQ plugins,
+  `dsh-onebot-qq` and `Derpyu520/qq-bridge` (`compat.qqBots: auto|off|on`; with
+  neither installed nothing changes — same listeners, same prompt, session ids
+  used verbatim). Session ids are folded to a stable chat key (`onebot-<id>`
+  minus a base36 collision suffix, `qqb-<g|p>-<id>` minus the 32-hex rebuild
+  suffix), so `/reset`, mode switches and preset conflicts keep the same memory
+  folder. A recall triggered by a non-owner onebot group member is gated at
+  `compat.memberMinAlpha` (default 0.5) by parsing the sender out of the message
+  text; the same floor applies to `memory_recall`. Derpyu's preset guards the
+  tool list, so an optional fail-safe auto-patch inserts the three rofm tool
+  names into `qq-tool-restrict.mjs`'s `SAFE_EXACT` (backup + atomic write +
+  sha256 state + self-heal + fully reversible); when the patch cannot be applied
+  the channel degrades to heuristic scoring with a single warning. A passive
+  archiver recovers the originals of a foreign `compaction/summary`
+  (watermark-deduplicated, never rewriting the other checkpoint), onebot local
+  image paths are staged and validated against `compat.mediaRoots` before being
+  archived into the chat image folder, and channel prompts add a rule that
+  forbids exposing the memory machinery (scoring / archiving / α / β / tool
+  names) to QQ participants while still allowing natural references to recalled
+  content.
 - **Self-check (v1.2, R5)**: `tools/selfcheck.mjs` is an independent, zero-dependency
   health check: config + engine defaults (500 cap, title-uniqueness smoke test),
   memory-store reconciliation and `meta.json` schema, recall-state v2 snapshots,
@@ -911,6 +1260,17 @@ background jobs.
   legacy data written before this release is reported as WARN. Run `npm run selfcheck` or
   `node tools/selfcheck.mjs [--json] [--memory-dir …] [--sessions-dir …]
   [--session …] [--max-sessions N] [--with-tests]`.
+
+- **Cross-platform (v1.3.0)**: Windows, Linux and macOS are all first-class.
+  CI runs the whole suite (engine + adapter + simulation + self-check) on
+  **3 OS × Node 20/22/24** (`.github/workflows/ci.yml`, tests via `shell: bash`).
+  All paths are composed with `node:path` (never string-concatenated, no assumed
+  separator); `storage.dir` and `compat.mediaRoots` accept `~/`/`~\` (home) and
+  absolute paths so one `config.json` stays portable; `test/portability.test.mjs`
+  pins case-exact imports, POSIX/Windows/macOS path rules, symlinked memory
+  dirs, spaces/CJK/`#` paths and LF-only output. The per-OS install examples,
+  path rules and the macOS case-insensitive-filesystem caveat are documented in
+  README section "跨平台支持（Windows / Linux / macOS）" (§2.4).
 
 License: MIT.
 

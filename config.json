@@ -1,9 +1,9 @@
 {
-  "_readme": "这是 dsh-rofm 的主配置文件；改完保存即可，插件会在下一次用户消息/模型步骤前按文件内容自动热加载（mtime 相同也能识别；写到一半的坏 JSON 会保留上一次可用配置）。所有 *_Percent 都是百分数。注意：importance 的 α 是回忆概率乘数，调高 importance.max 或让大量文件夹拿到 0.9+ 会让它们几乎每次都被回忆，请慎重设置高重要性。归档不调用模型：新归档先以“待评分”落盘（未评分的记忆不参与回忆），由当前会话模型结合当前语境通过 memory_judge 工具提交 α（0.01~1）、β（信赖度 -10~10，不参与回忆概率，只用于提示阅读模型该回忆的可信度）与关键词。β 范围是固定常量，不提供配置项。",
+  "_readme": "这是 dsh-rofm 的主配置文件；改完保存即可，插件会在下一次用户消息/模型步骤前按文件内容自动热加载（mtime 相同也能识别；写到一半的坏 JSON 会保留上一次可用配置）。所有 *_Percent 都是百分数。注意：importance 的 α 是回忆概率乘数，调高 importance.max 或让大量文件夹拿到 0.9+ 会让它们几乎每次都被回忆，请慎重设置高重要性。归档不调用模型：新归档先以“待评分”落盘（未评分的记忆不参与回忆），由当前会话模型结合当前语境通过 memory_judge 工具提交 α（0.01~1）、β（信赖度 -10~10，不参与回忆概率，只用于提示阅读模型该回忆的可信度）与关键词。β 范围是固定常量，不提供配置项。compat 段是 QQ 渠道兼容开关（dsh-onebot-qq / Derpyu520 qq-bridge）；qqBots=auto 时按 profile 里是否安装这两个插件自动启用，未安装时本段不产生任何行为。跨平台（v1.3.0）：storage.dir 与 compat.mediaRoots 支持 `~/`（或 `~\\`）展开到当前用户 home，Windows/Linux/macOS 通用；`~user` 不展开；其余路径仍按“绝对路径原样、相对路径相对插件目录（mediaRoots 相对当前目录）”解析。",
   "enabled": true,
   "compress": {
     "enabled": true,
-    "triggerPercent": 60,
+    "triggerPercent": 80,
     "compressPercent": 20,
     "contextWindowTokens": 0,
     "minContextTokens": 512,
@@ -53,7 +53,9 @@
     "maxRecalledBlocks": 64,
     "maxRecalledChars": 120000,
     "persistInjected": true,
-    "triggerSourceKinds": ["user"]
+    "triggerSourceKinds": [
+      "user"
+    ]
   },
   "storage": {
     "dir": "memory",
@@ -61,6 +63,22 @@
     "indexFile": "index.json",
     "statsFile": "stats.jsonl",
     "maxFolders": 10000
+  },
+  "compat": {
+    "qqBots": "auto",
+    "ownerIds": [
+      "1021831192"
+    ],
+    "memberMinAlpha": 0.5,
+    "autoPatchDerpyu": true,
+    "channelScore": "model",
+    "mediaRoots": [
+      "D:/Deepseek/qq-e2e/media",
+      "C:/Users/蒲公英/.dsh/media/onebot",
+      "C:/Users/蒲公英/Documents/Tencent Files/NapCat"
+    ],
+    "maxImageBytes": 8388608,
+    "stagingTtlMs": 86400000
   },
   "logging": {
     "enabled": true,

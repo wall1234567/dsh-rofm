@@ -9,6 +9,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { after, test } from 'node:test'
 import {
+  MemoryEngine,
   RECALL_BLOCK_PREAMBLE,
   buildRecallBlock,
   createRng,
@@ -612,4 +613,75 @@ test('recall: matchMode exact disables word-boundary substring matches', () => {
   const exactIndex = buildIndex(exactDir, exactCfg, specs)
   const exactResult = recall({ userText: 'docker-compose 部署', cfg: exactCfg, index: exactIndex, memoryDir: exactDir, rng: always(0) })
   assert.equal(exactResult.stats.matchedFolders, 0)
+})
+
+// ---------------------------------------------------------------------------
+// α floor for QQ channel recalls (v1.3.0, compat D4)
+// ---------------------------------------------------------------------------
+
+test('recall: minAlpha drops matched folders below the floor (same as unscored)', () => {
+  const memoryDir = tempDir()
+  const cfg = makeCfg()
+  const low = folderSpec({ alpha: 0.2, keywords: ['部署'] })
+  const high = folderSpec({ alpha: 0.8, keywords: ['部署'] })
+  const index = buildIndex(memoryDir, cfg, [low, high])
+
+  // No floor: both match, and with rng=0 both are added.
+  const ungated = recall({ userText: '部署', cfg, index, memoryDir, rng: always(0) })
+  assert.deepEqual(ungated.additions.map((addition) => addition.id).sort(), [low.id, high.id].sort())
+  assert.equal(ungated.stats.matchedFolders, 2)
+
+  // α floor 0.5: the low-α folder does not even count as a match.
+  const gated = recall({ userText: '部署', cfg, index, memoryDir, rng: always(0), minAlpha: 0.5 })
+  assert.deepEqual(gated.additions.map((addition) => addition.id), [high.id])
+  assert.equal(gated.stats.matchedFolders, 1)
+  assert.equal(gated.stats.attempts, 1)
+
+  // minAlpha: 0 / negative / NaN are all "no gate" (v1.2.1 path).
+  for (const minAlpha of [0, -1, Number.NaN, undefined, null, 'nope']) {
+    const result = recall({ userText: '部署', cfg, index, memoryDir, rng: always(0), minAlpha })
+    assert.equal(result.stats.matchedFolders, 2, `minAlpha=${String(minAlpha)}`)
+  }
+})
+
+test('recall: minAlpha cannot be bypassed through a keyword-bridge child', () => {
+  const memoryDir = tempDir()
+  const cfg = makeCfg()
+  // A matches the query and shares "共享词" with B; B itself never matches the
+  // query, so it is only reachable as a generation-2 child of A.
+  const a = folderSpec({ alpha: 0.9, keywords: ['部署', '共享词'] })
+  const b = folderSpec({ alpha: 0.05, keywords: ['桥接词', '共享词'] })
+  const index = buildIndex(memoryDir, cfg, [a, b])
+
+  const ungated = recall({ userText: '部署', cfg, index, memoryDir, rng: always(0) })
+  assert.deepEqual(ungated.additions.map((addition) => addition.id).sort(), [a.id, b.id].sort())
+  assert.equal(ungated.stats.byGeneration['2'], 1)
+
+  const gated = recall({ userText: '部署', cfg, index, memoryDir, rng: always(0), minAlpha: 0.5 })
+  assert.deepEqual(gated.additions.map((addition) => addition.id), [a.id])
+})
+
+test('recall: minAlpha=1 keeps only fully important folders', () => {
+  const memoryDir = tempDir()
+  const cfg = makeCfg()
+  const almost = folderSpec({ alpha: 0.99, keywords: ['部署'] })
+  const full = folderSpec({ alpha: 1, keywords: ['部署'] })
+  const index = buildIndex(memoryDir, cfg, [almost, full])
+  const result = recall({ userText: '部署', cfg, index, memoryDir, rng: always(0), minAlpha: 1 })
+  assert.deepEqual(result.additions.map((addition) => addition.id), [full.id])
+})
+
+test('MemoryEngine.recall forwards options.minAlpha to the engine path', () => {
+  const memoryDir = tempDir()
+  // probabilityScale makes the roll deterministic (every eligible folder passes).
+  const cfg = makeCfg({ storage: { dir: memoryDir }, recall: { probabilityScale: 1000 } })
+  const low = folderSpec({ alpha: 0.1, keywords: ['部署'] })
+  const index = buildIndex(memoryDir, cfg, [low])
+  assert.equal(index.folders.length, 1)
+  const engine = new MemoryEngine({ memoryDir, config: cfg })
+  engine.load()
+  const ungated = engine.recall('部署', {}, {})
+  assert.deepEqual(ungated.additions.map((addition) => addition.id), [low.id])
+  const gated = engine.recall('部署', {}, { minAlpha: 0.5 })
+  assert.deepEqual(gated.additions, [])
 })

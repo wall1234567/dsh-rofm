@@ -5,9 +5,11 @@
 `CHANGELOG.md`、GitHub Actions CI（`.github/workflows/ci.yml`）。
 
 > 发布前检查：`npm test`（= `node --test`）、`node test/simulate.mjs` 全部通过
-> （当前基线：引擎 188、适配层 115，共 304 个测试）；再跑一次 `node tools/selfcheck.mjs`
-> 确认本机真实数据为 0 failed（历史遗留问题只允许 WARN）；`npm pack --dry-run` 的文件清单里
-> 没有 `memory/` 运行时数据；`git status` 干净；`memory/` 里只有 `.gitkeep`。
+> （v1.3.0 实测 `node --test` = 493 用例 / 491 pass / 0 fail / 2 skip；CI 覆盖三 OS × Node 20/22/24）；再跑一次
+> `node tools/selfcheck.mjs` 确认本机真实数据为 0 failed（历史遗留问题只允许 WARN）；
+> `npm pack --dry-run` 的文件清单里没有 `memory/` 运行时数据；`git status` 干净；
+> `memory/` 里只有 `.gitkeep`。跨平台验证矩阵与静态审计记录见 `docs/VERIFICATION.md` §19
+> （发布前至少确认 CI 的 3 OS × 3 Node 共 9 个组合全绿）。
 
 ## 1. 认证（三选一）
 
@@ -70,7 +72,9 @@ git push origin v1.2.1
 - [ ] 无个人路径/用户名/会话 id/审计记录等隐私内容（当前文件与完整 git 历史）；
 - [ ] 无 token / 密码 / 私钥；
 - [ ] `LICENSE`、`README`、`CHANGELOG`、`CONTRIBUTING` 齐全；
-- [ ] CI 在 Node 20/22/24 × Linux/Windows 上全绿；
+- [ ] CI 在 Node 20/22/24 × Linux/Windows/macOS（3 OS × 3 Node = 9 个组合）上全绿；
+- [ ] 跨平台检查项已过：`test/portability.test.mjs` 全绿、README §2.4「跨平台支持」与
+  `docs/SPEC.md` 的 Platform and path contract 与当前代码一致（见 `docs/VERIFICATION.md` §19）；
 - [ ] `node tools/selfcheck.mjs` 在本机真实数据上 `0 failed`（历史遗留只允许 WARN）；
 - [ ] 版本号已在 `package.json`、`engine/package.json`、`CHANGELOG.md`、git tag 四处一致；
 - [ ] `memory/` 只有 `.gitkeep`，`git status` 干净；

@@ -330,6 +330,12 @@ function makeOverrides(memoryDir) {
     keywords: { min: 3, max: 8 },
     storage: { dir: memoryDir, perSession: false },
     logging: { enabled: true, verbose: true },
+    // Hermetic tests: these cases pin the v1.2.1-style listener set (3
+    // listeners). Force compat off so a developer/runner machine that *does*
+    // have a QQ bot plugin installed in its real DSH profile cannot add the
+    // optional `session/event` listener and turn this suite red. The compat
+    // behaviour itself is covered by compat-integration/compat-pipeline tests.
+    compat: { qqBots: 'off' },
   }
 }
 

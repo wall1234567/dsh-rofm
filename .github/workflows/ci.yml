@@ -16,7 +16,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        os: [ubuntu-latest, windows-latest, macos-latest]
         node: [20, 22, 24]
     steps:
       - uses: actions/checkout@v4
@@ -25,7 +25,16 @@ jobs:
         with:
           node-version: ${{ matrix.node }}
 
-      # `shell: bash` keeps the test-file glob identical on Windows runners.
+      # Print the real interpreter/OS so a red matrix cell (or a platform-
+      # specific test skip) is attributable to the runner it happened on.
+      - name: Platform info
+        shell: bash
+        run: node -p "process.platform + '/' + process.arch + ' node ' + process.version"
+
+      # `shell: bash` keeps the test-file glob identical on all three runners
+      # (Linux, macOS and Git Bash on Windows all expand `test/*.test.mjs`).
+      # The expressions used here are POSIX and stay compatible with the
+      # bash 3.2 that macOS still ships.
       - name: Engine tests (zero dependencies)
         shell: bash
         run: node --test test/*.test.mjs
@@ -43,7 +52,8 @@ jobs:
         run: node engine/cli.mjs --help
 
       # No DSH session logs on runners: the session-log check reports a WARN and
-      # the tool still exits 0 — this only proves the shipped CLI runs end to end.
+      # the tool still exits 0 — this only proves the shipped CLI runs end to end
+      # on Linux, Windows and macOS alike.
       - name: Self-check smoke test
         shell: bash
         run: node tools/selfcheck.mjs

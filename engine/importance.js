@@ -32,8 +32,20 @@ const CJK_DECISION_MARKERS = DECISION_MARKERS.filter((marker) => /[\u3400-\u4DBF
 
 const URL_RE = /https?:\/\/[^\s<>"')]+/gi
 const VERSION_RE = /\bv?\d+\.\d+(?:\.\d+)?\b/gi
-const WINDOWS_PATH_RE = /[A-Za-z]:[\\/][^\s"'`]+/g
-const UNIX_PATH_RE = /(?:^|[\s("'`])(?:\.{0,2}\/)[^\s"'`]+/g
+/**
+ * Windows absolute path (`C:\x`, `C:/x`). The lookbehind stops the regex from
+ * grabbing the `s:/…` tail of a URL scheme or the `n:/bin` tail of a POSIX
+ * PATH list (`PATH=/usr/bin:/bin`) as a drive-letter path.
+ */
+const WINDOWS_PATH_RE = /(?<![A-Za-z0-9_+.-])[A-Za-z]:[\\/][^\s"'`]+/g
+/**
+ * POSIX path evidence: absolute (`/usr/bin/node`), relative (`./src/a.js`,
+ * `../docs/spec.md`) and home-relative (`~/proj/a.js`) paths. The path must
+ * start at the beginning of the text or after whitespace/a quote/a bracket/
+ * `=`/`:` so prose such as dates (`2026/10/31`) never counts; a leading `//`
+ * is rejected so protocol-relative URLs are not counted as paths either.
+ */
+const POSIX_PATH_RE = /(?:^|[\s("'`=:;,|[{（【「『《：，；])(?:~\/|\.{0,2}\/(?!\/))[^\s"'`]+/g
 
 const clamp01 = (value) => {
   const number = Number(value)
@@ -70,7 +82,7 @@ function codeSignal(text) {
   const fences = countMatches(text, /```/g)
   const urls = countMatches(text, URL_RE)
   const versions = countMatches(text, VERSION_RE)
-  const paths = countMatches(text, WINDOWS_PATH_RE) + countMatches(text, UNIX_PATH_RE)
+  const paths = countMatches(text, WINDOWS_PATH_RE) + countMatches(text, POSIX_PATH_RE)
   return clamp01(Math.min(1, fences * 0.5 + urls * 0.3 + versions * 0.1 + paths * 0.1))
 }
 

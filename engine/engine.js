@@ -177,9 +177,11 @@ export class MemoryEngine {
    * telemetry event (`stats.jsonl`).
    * @param {string} userText
    * @param {{ chars?: number, tokens?: number, windowTokens?: number, sessionId?: string }} [context]
-   * @param {{ excludeIds?: Iterable<string> }} [options] folders already in the
-   *   injected recall block: never re-added, never counted against
-   *   `firstGenMax`, but still usable as keyword bridges for new folders.
+   * @param {{ excludeIds?: Iterable<string>, minAlpha?: number }} [options]
+   *   `excludeIds`: folders already in the injected recall block — never
+   *   re-added, never counted against `firstGenMax`, but still usable as keyword
+   *   bridges for new folders. `minAlpha`: optional α floor (v1.3.0 QQ compat),
+   *   folders below it behave exactly like unscored ones.
    */
   recall(userText, context = {}, options = {}) {
     const ctx = context && typeof context === 'object' ? context : {}
@@ -193,6 +195,8 @@ export class MemoryEngine {
       context: ctx,
       memoryDir: this.memoryDir,
       excludeIds: opts.excludeIds,
+      // v1.3.0: α floor for QQ channel recalls (non-owner group member, D4).
+      minAlpha: opts.minAlpha,
     })
     const stats = result.stats || {}
     appendStats(this.memoryDir, this.cfg, {

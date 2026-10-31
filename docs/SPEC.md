@@ -56,6 +56,18 @@ The DSH plugin (`index.js` at the repo root) is a thin adapter around it.
 > `1.2.0`; still no new configuration keys. Adapter-side details are in §4.2,
 > §5.4–§5.6 and §10.
 >
+> **Revision note (2026-10-30, v1.3.0).** QQ channel compatibility is
+> **adapter-only** (`lib/compat*.js`, `lib/passive-archive.js`,
+> `lib/heuristic-score.js`, `lib/qq-media.js`, `lib/plugin.js`); `engine/` gains
+> exactly one optional argument, the `minAlpha` α floor of `recall()` (§6), used
+> to gate recalls triggered by a non-owner onebot group member. Nothing else in
+> this contract changes: with `compat.qqBots` off (or no QQ plugin installed) the
+> engine and the adapter behave exactly like v1.2.1. The user-facing description
+> of the two supported plugins, the `compat` configuration block and the
+> fail-safe tool-whitelist patch lives in `README.md` (section "QQ 渠道兼容").
+> Both `package.json` files (`dsh-rofm` and the nested `dsh-rofm-engine`) are
+> `1.3.0`; the nested version tracks the plugin release.
+>
 > **Revision note (2026-10-28, v1.2.1).** Patch release for the high-α warning:
 > the `importance.warnAbove` warning is now actually surfaced by the adapter —
 > a host log line (`archive: alpha=… exceeds importance.warnAbove=…`) plus a
@@ -108,6 +120,9 @@ Rules:
 - All persistence must be atomic (`write tmp file → fs.renameSync`) and resilient to
   a corrupt/missing index (rebuild index by scanning `memory/*/meta.json`).
 - Times are epoch milliseconds (`Date.now()`), ISO strings for display only.
+- Platform and path rules (separators, `node:path`-only composition, case
+  sensitivity, `~` expansion, symlinks, LF) are part of the contract: see §11.
+  CI runs the full suite on Windows, Linux and macOS × Node 20/22/24.
 
 ---
 
@@ -1053,7 +1068,7 @@ same `compressPercent` share:
 
 ## 6. Recall (`recall.js`, `engine.js`)
 
-`recall({ userText, cfg, index, rng?, now?, context?, excludeIds? }) -> result`
+`recall({ userText, cfg, index, rng?, now?, context?, excludeIds?, minAlpha? }) -> result`
 
 - `index` is the loaded `memory/index.json` object.
 - `userText` is the latest user message text (may include the text of the last
@@ -1063,6 +1078,12 @@ same `compressPercent` share:
   injected recall block** (`lib/plugin.js` passes the session's `recalledIds`).
   They are never added again and never consume `attempts` or `firstGenMax`;
   they only act as transparent bridge nodes for the keyword BFS (see below).
+- `minAlpha` optional α floor in `[0, 1]` (default / invalid = `0` = no gate;
+  added in v1.3.0 for QQ channel sessions, `docs/README` "QQ 渠道兼容"). Folders
+  whose `alpha` is below the floor behave **exactly like unscored folders**: they
+  are filtered out before matching, so they never match, never roll, never
+  consume `firstGenMax` and never act as keyword bridges — a low-α folder cannot
+  be reached through a bridge node either.
 - **Unscored folders** (`folder.scored === false`, i.e. archived but not yet
   judged by the current model, §4.2) are filtered out **before matching**: they
   never match keywords, never roll, never consume `firstGenMax` and never act as
@@ -1274,7 +1295,7 @@ const engine = new MemoryEngine({ memoryDir, config, rng })
 engine.load()                      // sync; loads/rebuilds index
 engine.planCompression(messages, usedPercent)
 engine.compress(messages, usedPercent, { sessionId }) // plan + commit, returns result
-engine.recall(userText, context, { excludeIds }) // returns recall result, updates stats.jsonl
+engine.recall(userText, context, { excludeIds, minAlpha }) // returns recall result, updates stats.jsonl
 engine.report()                    // aggregate stats from stats.jsonl
 engine.setConfig(partial)          // deep merge + reload
 ```
@@ -1549,11 +1570,63 @@ Required coverage:
     - R5: `test/selfcheck.test.mjs` covers `tools/selfcheck.mjs` (CLI flags,
       PASS/WARN/FAIL classification, exit codes, JSON summary).
 
-As of the v1.2.1 revision the suites are **188/188 (engine)** and **115/115
-(adapter)**, all passing; `node --test` (no arguments) runs engine + adapter +
-simulation files together (**304 passing**). Run `node --test test/*.test.mjs`,
+As of the v1.2.1 revision the suites were **188/188 (engine)** and **115/115
+(adapter)**; the exact current counts are recorded in `docs/VERIFICATION.md` §19
+and printed by `npm test` — do not hardcode them here (they drift every release).
+Run `node --test test/*.test.mjs`,
 `node --test test-adapter/*.test.mjs`, `node test/simulate.mjs`,
 `node tools/selfcheck.mjs`, `node engine/cli.mjs --help`,
 `node tools/recall-report.mjs --help` and `node tools/repair-session-log.mjs --help`
 before reporting back. Report: files, test output summary, any deviation from this
 spec, and a 10-line usage example.
+
+## 11. Platform and path contract (v1.3.0)
+
+`dsh-rofm` supports **Windows, Linux and macOS** equally. CI (`.github/workflows/ci.yml`)
+runs the whole suite on **3 operating systems × Node 20/22/24** (`ubuntu-latest`,
+`windows-latest`, `macos-latest`; every step uses `shell: bash`, which is Git Bash on
+Windows and the system bash 3.2 on macOS). This section is the contract for
+`engine/`, `test/` and `tools/`; the user-facing guidance lives in `README.md`
+§2.4 "跨平台支持（Windows / Linux / macOS）".
+
+1. **Paths are composed with `node:path`** (`join`, `resolve`, `relative`,
+   `dirname`, `basename`, `extname`, `sep`), never by string concatenation and
+   never with a hardcoded `/` or `\`. A path string coming from config is the only
+   thing that gets parsed/re-normalised.
+2. **`file:` URLs**: always `pathToFileURL()` / `fileURLToPath()` (`node:url`);
+   never build a URL by concatenation. Paths containing `#`, `?`, `%`, spaces or
+   CJK break hand-built URLs, and symlinked entries produce a different URL for
+   the same file (`tools/main-module.mjs` is the reviewed helper for
+   "is this module the executed entry?").
+3. **Platform branches are centralised.** Runtime modules must not compare
+   `process.platform` inline except in the reviewed case-insensitivity helper
+   (`lib/compat-autopatch.js`, `win32` comparison only). Everything else takes
+   `platform` / `pathImpl` as *injectable* options defaulting to the host
+   (`lib/qq-media.js`'s `validateMediaPath`, `lib/paths.js`,
+   `tools/main-module.mjs`), so the Windows/POSIX/macOS rules can be tested on
+   any single host. `test/portability.test.mjs` enforces this statically.
+4. **Case sensitivity.** Linux is case-sensitive; Windows (NTFS) and macOS
+   (APFS/HFS+ default) are case-insensitive. Source relative imports must match
+   the on-disk case *exactly* (Linux fails otherwise; the portability test
+   verifies it even on case-insensitive hosts). Path *comparisons* fold case only
+   on Windows; on macOS `realpath` canonicalisation (the on-disk spelling)
+   absorbs the difference.
+5. **`~` expansion** is an adapter-config convenience only: a bare `~` or a
+   `~/` / `~\` prefix expands to `os.homedir()` for `storage.dir` and
+   `compat.mediaRoots`; `~user` is deliberately **not** expanded. Engine paths
+   stay plain relative/absolute.
+6. **Relative paths.** `storage.dir` resolves relative to the plugin root
+   (default `memory`); `compat.mediaRoots` keeps the pre-1.3.0 behaviour (relative
+   to the process cwd) and is documented as "use an absolute path or `~/`".
+7. **Symlinks / junctions are followed** where the OS resolves them: the memory
+   directory itself may be a link (macOS `/var` → `/private/var`, `/tmp`, an
+   external drive) and all reads/writes land in the real directory; media
+   containment compares `realpath`-resolved paths; `tools/main-module.mjs`
+   resolves the entry symlink before comparing.
+8. **Line endings.** Runtime-written files (JSON/JSONL) contain **LF only**; the
+   repository sources are pinned to LF via `.gitattributes`.
+9. **Node version gates.** Features that need a newer Node are detected at
+   runtime and their tests `skip` on older versions (e.g. `node:zlib` zstd
+   requires Node ≥ 22.15, so the session-log tests skip on Node 20).
+10. **Spaces, CJK and `#` in paths** must work everywhere (config, memory,
+    images, staging); `test/portability.test.mjs` covers the full read/write path.

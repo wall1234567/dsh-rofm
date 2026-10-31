@@ -3,6 +3,161 @@
 All notable changes to `dsh-rofm` are documented here.
 The project follows a lightweight [SemVer](https://semver.org/) scheme.
 
+## [1.3.0] — 2026-10-31
+
+本版本完成两件事：**QQ 渠道兼容**（`dsh-onebot-qq` 与 `Derpyu520/qq-bridge` 的「归档 → 评分 → 回忆」
+闭环跑通，未安装这两个插件时行为与 1.2.1 完全一致）与**跨平台兼容**（插件与独立引擎用同一套代码在
+**Windows、Linux、macOS** 上运行，CI 矩阵扩到 **三平台 × Node 20/22/24**）。跨平台部分修掉一批只会在
+POSIX 上暴露的路径/URL/启发式问题，补上「任意一台机器都能验证」的跨平台测试与平台事实注入；
+**Windows 行为不变**。
+
+### 跨平台兼容（Windows / Linux / macOS）
+
+#### Added
+
+- **`lib/paths.js`（新）**：可移植路径助手 `expandHomePath()` / `isHomeRelativePath()`——
+  `~`、`~/…`、`~\…` 在三个平台都展开到当前用户 home；`~user`（shell 用户名写法）**不**展开；
+  Windows/POSIX 分隔符都接受，因此一份 `config.json` 可跨机器复用。
+- **`storage.dir` 与 `compat.mediaRoots` 支持 `~/`**：`"dir": "~/rofm-memory"`、
+  `"mediaRoots": ["~/Pictures/QQ"]` 会在 Windows/Linux/macOS 上一致展开；相对路径仍相对插件目录
+  （`mediaRoots` 相对进程 cwd，保持既有兼容），绝对路径原样使用；非法/缺失值回退 `memory/`，
+  不会让插件启动失败。（`lib/config-store.js` 的 `resolveStorageDir()`、`lib/compat.js`）
+- **`validateMediaPath()` 可注入平台与路径规则**：新增可选 `platform`（`win32`/`linux`/`darwin`）与
+  `pathImpl`（`node:path` / `path.posix` / `path.win32`）参数，使「Windows 大小写不敏感」「POSIX 大小写敏感」
+  「macOS realpath 归一化」三种围栏规则都能在任意一台机器上单测；生产调用不传，行为与既有行为相同。
+- **`tools/main-module.mjs`（新）**：跨平台主模块检测——`isMainModule()`（纯比较，可注入平台）、
+  `canonicalScriptPath()`（realpath 解析符号链接）、`invokedAsMain()`；替代 CLI 里手拼 `file://` URL 的旧写法。
+- **`test/portability.test.mjs`（新，12 例）**：① 静态检查——全仓相对 import 必须按磁盘大小写精确解析
+  （Windows 上发现不了的 Linux 大小写崩溃）、运行时代码只用 `node:` 内置模块、禁止手拼 `file://` URL 与
+  内联 `process.platform` 分支、`package.json` 的 `main`/`exports`/`files` 大小写精确存在；
+  ② `~` 展开与 adapter 接线；③ POSIX/Windows/macOS 路径围栏模拟；④ 真实文件系统：符号链接/junction
+  记忆目录、空格/中文/`#` 路径、LF-only 写入。
+- **`test/main-module.test.mjs`（新，6 例）**：空格/`#`/`%`/`?`/中文路径匹配、注入平台的大小写折叠、
+  符号链接/junction 入口，以及「把 repair 工具复制到 `run #1 中文 目录` 后执行 `--help`」的端到端回归。
+- **`test/importance-cross-platform.test.mjs`（新，4 例）**：Windows 与 POSIX 路径的 `signals.code`
+  必须相等（同一段对话在任何 OS 上 α 一致）；日期/URL/协议相对 URL 不计为路径。
+- **插件激活日志带平台信息**：`dsh-rofm activated: platform=<os>/<arch> node=<version> memoryDir=…`。
+- **CI 三平台矩阵**：`ubuntu-latest` + `windows-latest` + `macos-latest` × Node 20/22/24（9 个组合），
+  新增 Platform info 步骤打印实际 `process.platform/arch/version`；测试步骤保留 `shell: bash`
+  （macOS 自带 bash 3.2 兼容）。
+- **文档**：README 新增 §2.4「跨平台支持（Windows / Linux / macOS）」（三 OS 安装示例、数据目录与路径规则、
+  macOS 大小写不敏感/符号链接说明、`mediaRoots` 的 POSIX 示例、排障日志）；
+  CONTRIBUTING/PUBLISHING/VERIFICATION/SPEC 同步（SPEC §11 路径与平台契约、VERIFICATION §19 跨平台验证）。
+- **QQ 语音归档（`lib/voice-notes.js`，新）**：`dsh-onebot-qq` 把入站语音渲染成 `[语音]` 占位、转写结果稍后
+  以 `（语音转写：…）` 单独投递；归档时把两者合成 `[语音] <转写文本>`，没有转写的占位记成 `[语音]（未转写）`，
+  回忆块里仍然看得出「这是一条语音」以及说了什么。只作用于 QQ 通道会话（普通 WebUI 会话文本不受影响）；
+  纯字符串变换、幂等、无标记文本原样返回。
+- **README §3.2.7 按真机 e2e 改写**：图片/视频/文件是 `[图片:<路径>]` 注解读，语音不含路径（靠 STT）；
+  补充两个前提（群聊必须 @ 机器人、`compat.mediaRoots` 必须含插件 `mediaDir`）与「QQ 会把 @ 和图片拆成两条」。
+
+#### Fixed
+
+- **`tools/repair-session-log.mjs` 主模块检测（只在 POSIX/特殊路径上坏）**：原来的
+  `new URL('file://' + path.resolve(argv[1]))` 在含 `#`/`?`/`%`/空格/非 ASCII 的路径上、以及符号链接调用
+  （macOS `/tmp`→`/private/tmp`、`link:` 安装）时会判定失败，工具静默不执行；改用
+  `invokedAsMain(import.meta.url)`，`selfcheck.mjs` 同步。
+- **`engine/importance.js` 的 POSIX 路径识别**：代码/路径密度信号原来只认 Windows 盘符路径，
+  同一段对话在 Linux/macOS 上 α 会偏低；现补充 POSIX 绝对/`./`/`../`/`~/` 路径（并让 Windows 正则避开
+  URL 尾与 `PATH=/usr/bin:/bin` 误判），三平台 α 一致。
+- **zstd 工具在旧 Node 上的裸 `TypeError`**：`repair-session-log.mjs` / `selfcheck.mjs` 现在先探测
+  `node:zlib` 的 zstd 能力，缺失时给出「需要 Node >= 22.15，或改用纯 `.jsonl`」的可执行错误
+  （`engines.node >=20` 不变）。
+- **`lib/qq-media.js` 围栏比较集中化**：`comparablePath`/`isPathInside` 改用可注入的 `pathImpl.sep` 与
+  platform 口径（macOS 仍按 realpath 归一化后的真实路径比较），生产行为不变、规则可单测。
+- **测试环境的跨平台/跨机器稳定性**：`test-adapter/plugin-mock.test.mjs` 显式 `compat.qqBots="off"`，
+  开发机真的装了 QQ bot 插件时不再误判监听器数量；文件符号链接用例在无权限环境正确 skip，
+  目录链接改用 junction 覆盖 Windows。
+
+#### Changed
+
+- **版本 1.3.0**（`package.json`、`engine/package.json`）。
+- `config.json` 的 `_readme` 补充 `~/` 展开与路径解析规则说明。
+
+#### Tests
+
+- `node --test` 共 **493** 用例（**491 pass + 2 skip**，0 fail）：`test/*.test.mjs` 361（359 pass + 2 skip，
+  后者是 Windows 上无法创建文件符号链接的既有用例）、`test-adapter/*.test.mjs` 132 全 pass、
+  `test/simulate.mjs` 计入 1；新增 portability 12 / main-module 6 / importance 跨平台 4 三组跨平台用例，
+  以及 voice-notes 11（语音标记改写 + `buildSurfaceEntries` 开关）。
+  本机（Windows 11 / Node v24.21.0）另跑 `node test/simulate.mjs`、`node tools/selfcheck.mjs`
+  （7 passed, 0 warnings, 0 failed）、`node engine/cli.mjs --help` 均通过；Linux/macOS 由 CI 矩阵兜底。
+
+
+### QQ 渠道兼容（与跨平台同版发布）
+
+让 `dsh-onebot-qq` 与 `Derpyu520/qq-bridge` 下的「归档 → 评分 → 回忆」闭环真正跑通，
+且**未安装这两个插件时行为与 1.2.1 完全一致**（`compat.qqBots` 默认 `auto`，检测不到就不注册任何新监听器、
+不改 system prompt、会话 id 原样使用）。
+
+#### Added
+
+- **`lib/compat.js`（新）**：QQ 渠道检测与解析层——profile 定位（`DSH_PROFILE_DIR` →
+  `$DSH_HOME/profiles/$DSH_PROFILE` → `~/.dsh/profiles/desktop`）、两个插件的三重检测信号、
+  `qqBots: auto|off|on` 开关、`compat` 配置块归一化、会话 id → 稳定 chat 键
+  （onebot 去 `-<base36 时间戳>` 后缀、Derpyu 去尾部 32 位 hex）、群消息发送者解析
+  （`<user_message qq="…">` / `[HH:MM nick(uid)]`）、α 门控决策、触发 kind 合并、评分模式决策；
+  全部纯函数、零依赖、不抛错，带 profile mtime 缓存。
+- **`lib/compat-autopatch.js`（新）**：Derpyu 工具白名单自动补丁——定位
+  `<profile>/node_modules/qq-agent-presets/qq-tool-restrict.mjs`，把 `memory_judge` /
+  `memory_recall` / `memory_image` 幂等插入 `SAFE_EXACT`；写前备份（最多 5 份）、原子写、
+  sha256 状态（`memory/.compat-state.json`）、上游更新后自愈重打；结构不识别/只读/定位失败只 WARN 不写。
+- **`lib/passive-archive.js`（新）**：被动归档兜底——监听 `session/event` 的 `compaction/summary`，
+  把被 shadow 的 user/assistant 原文归档进同一 chat 记忆目录（不修改对方 checkpoint、不写自己的 checkpoint），
+  per 会话水位 `memory/sessions/<chatKey>/.passive-watermark.json` 去重。
+- **`lib/heuristic-score.js`（新）**：启发式评分降级路径——α 复用 `engine/importance.js`、
+  关键词复用 `engine/tokenize.js`，归档即 `scored:true`（模型评分不可用时保证记忆仍可回忆）。
+- **`lib/qq-media.js`（新）**：onebot 本地图片路径解析/校验/暂存——从正文抽绝对路径（后缀白名单）、
+  realpath 必须落在 `compat.mediaRoots` 内、大小上限、复制到 `memory/.staging/<chatKey>-<messageId>/`、
+  归档时消费并清理。
+- **`compat` 配置块**（`config.json` + adapter 默认值/校验）：`qqBots`、`ownerIds`、`memberMinAlpha`、
+  `autoPatchDerpyu`、`channelScore`、`mediaRoots`、`maxImageBytes`、`stagingTtlMs`。
+- **引擎 `recall({ minAlpha })`**：可选的 α 下限；低于下限的记忆与未评分记忆同口径
+  （不匹配、不掷骰、不占 `firstGenMax`、不做关键词桥），用于非主人群成员的回忆门控。
+- **`surface.buildSurfaceEntries(session, measurement, { conversationSourceKinds })`**：
+  允许把第三方插件的 user 消息 kind（如 `plugin:dsh-onebot`）计为真实对话，否则这些消息会被当成
+  宿主注入的 pinned 上下文而永不归档。
+- **QQ 通道会话 prompt 规则**：禁止提及评分/打分/α/β/`memory_judge`/`memory_recall`/评分任务/归档/
+  压缩归档/写入记忆库；允许自然引用回忆内容；上下文不足时引导调用 `memory_recall`。
+- **每轮重置 `memory_recall` 未命中锁**：`agent/pre-step` 检测 `turn` 变化即 `resetAttempts()`，
+  reserved2 这类没有真人 inbox 消息的通道会话不会在 6 次未命中后永久锁死。
+- **`docs/SPEC.md`**：新增 v1.3.0 修订说明（compat 为 adapter-only，引擎仅新增 `minAlpha`）。
+
+#### Changed
+
+- **Derpyu 评分策略**：补丁生效 → 模型评分（`memory_judge`）；补丁未生效或被
+  `autoPatchDerpyu=false` 关闭 → 自动降级启发式评分并只打一条 WARN。
+  `compat.channelScore="heuristic"` 可强制启发式。
+- **两个 QQ 渠道都保持 rofm 自我压缩**：rofm 60% 先于 preset/宿主压缩器 80%，正常路径下 rofm 先归档；
+  被动归档只在对方先压时兜底。
+- **记忆目录按 chat 键归并**：`memory/sessions/<chatKey>/`，Derpyu `/reset`、切模式、
+  preset 冲突重建后仍命中同一份记忆与 `recall-state.json`；旧数据不迁移（compat 前不会产生记忆）。
+- **`memory_recall` 继承门控**：同一轮内由非主人群消息触发的 `memory_recall` 也带
+  `minAlpha = compat.memberMinAlpha`，模型无法绕过群成员门控。
+- **两个 `package.json` 版本升到 1.3.0**（嵌套 `engine/package.json` 跟随插件发布版本）。
+
+#### Fixed
+
+- **第三方插件的 user 消息被当成宿主注入上下文而永不归档**：`lib/surface.js` 原本把
+  `source.kind` 不在内置集合里的 user 消息按 pinned 处理，onebot 的
+  `plugin:dsh-onebot` 消息因此永远不会进入归档；新增
+  `buildSurfaceEntries(session, measurement, { conversationSourceKinds })` 选项让兼容层追加该 kind。
+- **`memory_recall` 可绕过群成员门控**：自动回忆按 `memberMinAlpha` 收窄后，模型仍可主动调用
+  `memory_recall` 拿到低 α 记忆；现在该工具在同一轮内继承同一个 α 下限。
+
+#### Docs
+
+- README 新增「3.2 QQ 渠道兼容」整节：检测/开关、chat 键归并、群成员门控、评分策略、
+  自动补丁与回滚、被动归档、onebot 图片归档、通道可见性、`compat` 配置表、已知限制；
+  §8 English summary 同步补英文摘要；目录结构与测试数字更新。
+
+#### Tests
+
+- 304 → **456** 用例（`node --test`，454 pass + 2 skip（Windows symlink 用例））：
+  新增 compat（28）、compat-autopatch（31）、heuristic-score（10）、passive-archive（13）、
+  qq-media（49）、recall `minAlpha`（4）、适配层 compat 集成（10）与兼容流水线（7）。
+- 零回归：`compat` 未启用时监听器仍是 3 个、prompt 文本不变、会话 id 原样使用；
+  既有契约/回归测试全部保持通过。
+
 ## [1.2.1] — 2026-10-28
 
 ### Fixed

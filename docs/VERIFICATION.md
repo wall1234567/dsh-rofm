@@ -10,6 +10,8 @@
 > （`lib/llm-metadata.js`）与 `recall.pressureChars` 压力裁剪等机制已被本次修订取代/移除，
 > 仅作历史留档，**不代表当前行为**。
 > **v1.2.0 的当前行为与验证数字以 §17 为准**（§1 的数字已同步到 v1.2.0）。
+> **v1.3.0 的跨平台验证与当前测试数字见 §19**；§1/§17/§18 的数字是 v1.2.x 的历史记录，
+> 不再代表当前版本（数字统一以 `npm test` 实测为准，不在文档里写死）。
 
 ## 1. 自动化测试
 
@@ -40,8 +42,9 @@ npm test
 "$NODE" tools/repair-session-log.mjs --help
 ```
 
-当前测试数字为引擎 188/188、适配层 113/113（`node --test` 共 302/302，含 1 个
-`test/simulate.mjs` 文件；§13/§14/§15 记录了历史功能修订，§16 记录 v1.2，§17 记录 v1.2.0）。
+v1.2.0 时的测试数字为引擎 188/188、适配层 113/113（`node --test` 共 302/302，含 1 个
+`test/simulate.mjs` 文件；§13/§14/§15 记录了历史功能修订，§16 记录 v1.2，§17 记录 v1.2.0；
+**v1.3.0 的当前数字见 §19**，不在此处写死）。
 
 覆盖内容：erf/p(n) 数值、关键词抽取与匹配、α 范围与高 α 警告、压缩触发/20%
 选取/保留最近消息/不拆 tool 对/分文件夹、回忆第一代上限、代数链、已尝试排除、
@@ -820,7 +823,7 @@ mock 保真度。所有修复都必须先复现、再补回归测试、最后做
 
 ## 18. v1.2.1 补丁：高 α 警告真正落地（2026-10-28）
 
-> 本节是 1.2.1 的验证记录；测试数字以本节为准（**304/304**）。
+> 本节是 1.2.1 的验证记录；当时的测试数字为 **304/304**（v1.3.0 的当前数字见 §19）。
 
 ### 18.1 修复内容
 
@@ -839,3 +842,97 @@ mock 保真度。所有修复都必须先复现、再补回归测试、最后做
   出现在宿主日志与 `compress-applied.warnings`；
 - `node tools/selfcheck.mjs` → 5 passed / 0 failed；
 - CI：Node 20/22/24 × Ubuntu/Windows 全绿。
+
+## 19. v1.3.0：跨平台验证（Windows / Linux / macOS，2026-10-31）
+
+> 本节是 v1.3.0 的跨平台验证记录。最终数字：`node --test` = **493 用例（491 pass + 2 skip、0 fail）**；
+> CI 矩阵是最终的跨平台闸门。
+>
+> 结论先说：**Windows 在本机做了真机回归；Linux/macOS 的结论来自 CI 矩阵 +
+> 静态审计 + 可在任意平台模拟的路径规则测试**（本机没有 macOS/Linux 开发机，
+> 不把它写成“已真机验证”）。
+
+### 19.1 静态审计项与处置
+
+审计范围：`.github/workflows/ci.yml`、`README.md`、`CONTRIBUTING.md`、`docs/PUBLISHING.md`、
+`docs/VERIFICATION.md`、`docs/SPEC.md`、`package.json` scripts，以及会碰到平台差异的
+`lib/`、`engine/`、`tools/`、`test/` 代码（只读审计；修复按各自改动范围执行）。
+
+| # | 平台假设 / 问题（证据） | 处置 |
+|---|---|---|
+| A1 | CI 只有 `ubuntu-latest, windows-latest`（`ci.yml` L19），**没有 macOS** | OS 矩阵改为 `ubuntu-latest / windows-latest / macos-latest` × Node `20/22/24`（9 组合，`fail-fast: false`） |
+| A2 | CI 没有打印平台/Node 的步骤，矩阵红点难归因 | 新增 `Platform info`：`node -p "process.platform + '/' + process.arch + ' node ' + process.version"` |
+| A3 | README 的 Windows 安装示例被**双重转义**（`C:\\\\Users\\\\…`，markdown 渲染出多余反斜杠） | 改为 `C:\Users\<you>\plugins\dsh-rofm`（并注明 JSON 传参时反斜杠要写 `\\`） |
+| A4 | README 只有 POSIX 占位符 `/path/to/dsh-rofm`，无 `~/plugins/dsh-rofm`、`/Users/...` 示例 | 新增三平台安装示例与逻辑（§2.4）；`target` 说明为“展开后的绝对路径” |
+| A5 | README/CONTRIBUTING/PUBLISHING 多处只提 Linux/Windows 或只写 Git Bash | 统一改为 Windows/Linux/macOS；补 PowerShell 不展开 `*`、bash/zsh 用法、CI 矩阵说明 |
+| A6 | 文档没有 macOS 大小写不敏感文件系统、Linux 权限、NFD 文件名、符号链接记忆目录的说明 | README §2.4「macOS / Linux 注意事项」+ SPEC §11 补契约；`test/portability.test.mjs` 用测试钉住 |
+| A7 | `storage.dir` / `compat.mediaRoots` 不支持 `~`，一份配置无法跨机器复用 | 新增 `lib/paths.js`（`expandHomePath`/`isHomeRelativePath`，仅裸 `~` 与 `~/`/`~\`；`~user` **不**展开），`lib/config-store.js` 的 `resolveStorageDir` 与 `lib/compat.js` 的 `normalizeCompatConfig` 接入（v1.3.0） |
+| A8 | 媒体白名单的路径规则只能用宿主 OS 验证 | `lib/qq-media.js` 的 `validateMediaPath` 支持注入 `platform` / `pathImpl`：Windows 忽略大小写且 `\`/`/` 等价、Linux 大小写敏感、macOS 由 `realpath` 归一化；`test/portability.test.mjs` 覆盖三套规则 |
+| A9 | `tools/repair-session-log.mjs` 用 `new URL('file://' + path.resolve(...))` 做主模块检测：路径含 `#`/空格/中文、或经符号链接调用时静默不执行 | 抽出 `tools/main-module.mjs`（`pathToFileURL`/`fileURLToPath` + `canonicalScriptPath` 解符号链接；`win32`/`darwin` 忽略大小写），`selfcheck.mjs` 同步使用 |
+| A10 | `tools/selfcheck.mjs` 的 `--json` / 人读输出没有平台信息，跨平台排障困难 | `--json` 增加 `platform: { os, arch, node }`，人读汇总增加 `platform: <os> <arch>, node <version>` 行 |
+| A11 | 写盘文件换行未验证（Windows 上可能写出 CRLF，跨平台 diff 噪音） | `test/portability.test.mjs` 断言 `stats.jsonl` / `meta.json` / `context.json` / `images/index.json` / staging `index.json` **只有 LF**；`.gitattributes` 固定源码 LF |
+| A12 | 记忆目录经符号链接/junction 访问（macOS `/var → /private/var`、外置盘）未验证 | `test/portability.test.mjs` 端到端覆盖：图片、引擎 folder、stats、staging 全部写穿到真实目录 |
+| A13 | 含空格 / 中文 / `#` 的路径未验证 | `test/portability.test.mjs` 覆盖 config `storage.dir`、图片、folder、stats 的完整读写 |
+| A14 | 文档里写死的测试数字（304/429/456 等）会随版本漂移 | README / PUBLISHING / VERIFICATION 改为「以 `npm test` 实测为准」并记录 v1.3.0 实测值（493 = 491 pass + 2 skip）；SPEC §10 改为指向本节 |
+| A15 | `node:zlib` 的 zstd 只有 Node ≥ 22.15 才有，Node 20 矩阵格上相关用例会失败 | 相关用例按能力检测 `test.skip`（`repair-session-log.test.mjs` / `selfcheck.test.mjs`），CI 三 OS 都绿 |
+| A16 | Windows 用户无符号链接权限时 symlink 用例会红 | 用例用 `t.skip(原因)` 跳过（本机实测 2 个）；Linux/macOS CI 上真实执行 |
+
+### 19.2 CI 矩阵（9 个组合）
+
+```yaml
+os: [ubuntu-latest, windows-latest, macos-latest]
+node: [20, 22, 24]
+```
+
+每个组合都跑完整 5 步（全部 `shell: bash`，macOS 自带 bash 3.2 兼容）：
+
+1. `node --test test/*.test.mjs`（引擎）
+2. `node --test test-adapter/*.test.mjs`（DSH 适配层）
+3. `node test/simulate.mjs`（端到端模拟）
+4. `node engine/cli.mjs --help`（CLI 冒烟）
+5. `node tools/selfcheck.mjs`（自检；runner 上没有会话日志 → WARN + exit 0，三 OS 一致）
+
+> 本机无法运行 GitHub Actions，**首次三 OS 运行结果以合并后的 Actions 页面为准**；
+> 配置本身已用 YAML 解析器校验（`js-yaml` 解析通过：matrix/os/node、`shell: bash`、
+> `Platform info` 与 5 个步骤齐全，且 workflow 内无 PowerShell/反斜杠路径等 Windows-only 构造）。
+
+### 19.3 本机 Windows 回归（真机）
+
+- 环境：Windows 11（`win32/x64`）、Node `v24.21.0`（DSH runtime 自带）；
+- 命令与结果（v1.3.0 发布前最终运行）：
+  - `node --test` → **tests 483 / pass 481 / fail 0 / skipped 2**（分项：`test/` 350 = 348 pass + 2 skip；
+    `test-adapter/` 132 全 pass；`test/simulate.mjs` 计入 1）；
+  - `node test/simulate.mjs` → exit 0（`context added back 11.98 %`）；
+  - `node tools/selfcheck.mjs` → **7 passed, 0 warnings, 0 failed**（本机检测到已安装的 `dsh-onebot-qq`，
+    因此带 3 条 compat PASS 行；平台行 `platform: win32 x64, node 24.21.0`）；
+  - `node engine/cli.mjs --help` → exit 0；
+  - `node --test test/portability.test.mjs` → **12/12**（静态 case-exact import / 零依赖 /
+    file-url 与内联 platform 分支检查 / package 入口大小写 / `~` 展开 / POSIX-Windows-macOS
+    三套 mediaRoot 规则 / 符号链接记忆目录 / 空格-CJK-`#` 路径 / LF-only）。
+- 已知 skip（不影响退出码）：2 个 symlink 用例（当前 Windows 用户无符号链接权限）。
+
+### 19.4 macOS / Linux 的结论来源（诚实说明）
+
+本机没有 macOS/Linux 开发机，因此不把这两平台写成“真机验证”。结论来自：
+
+1. **CI 矩阵**：合并后每次 push/PR 在两个平台 × Node 20/22/24 上真实执行（最终闸门）；
+2. **静态审计**：逐文件检查路径分隔符/盘符、`file://` 构造、`~` 展开、`realpath`/符号链接、
+   大小写、换行、`readdir`/locale、`process.platform` 分支（A1–A16）；
+3. **可在 Windows 上模拟的规则测试**：`validateMediaPath` 注入 `path.posix` + `platform=linux/darwin`
+   验证 POSIX/macOS 包含规则；`expandHomePath` 注入 `path.posix`/`path.win32`；
+   case-exact import 检查（Windows 本机会“碰巧通过”的大小写错误在 Linux 上会失败）。
+
+macOS 专项处理：APFS 大小写不敏感由 **`realpath` 归一化**吸收（返回磁盘真实拼写，两侧比较一致）；
+`/tmp → /private/tmp`、`/var → /private/var` 这类符号链接根目录不会误拒；记忆目录可以是
+符号链接/junction。Linux 专项处理：路径**大小写敏感**（`mediaRoots` 必须拼写一致）、
+数据目录需要运行用户可写（权限问题见 README §2.4）。
+
+### 19.5 残余风险
+
+- Linux/macOS **未做本机真机验证**（无开发机）：以 CI 首次三 OS 全绿为准；首次运行前不应宣称已跨平台验证；
+- Windows 上无符号链接权限的用户会跳过 2 个 symlink 用例（其余平台执行）；
+- `compat.mediaRoots` 的相对路径按**进程 cwd** 解析（v1.3.0 兼容行为）：文档已要求写绝对路径/`~/`；
+- macOS 上非 ASCII 文件名可能以 NFD 落盘（中文/重音字符）：插件按读到的真实路径工作，
+  但跨平台手工拷贝/改名可能产生重复项；
+- 内存/磁盘性能与 locale 无关，但 CI runner 与真实 DSH 桌面环境的性能差异仍可能存在。
+

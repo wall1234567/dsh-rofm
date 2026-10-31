@@ -32,6 +32,11 @@
  * Re-encoded logs keep DSH's own layout: one zstd frame with the header line,
  * then frames of event batches (checksum enabled), so the host appends to them
  * exactly as before.
+ *
+ * Node version: repairing `.jsonl.zstd` logs needs `node:zlib` zstd support
+ * (Node >= 22.15 / >= 23.8); plain `.jsonl` logs work on the package's Node >=
+ * 20 baseline. On an older Node the zstd path fails with an explicit
+ * "requires Node >= 22.15" error instead of a bare `TypeError`.
  */
 
 import fs from 'node:fs'
@@ -39,6 +44,15 @@ import os from 'node:os'
 import path from 'node:path'
 import { randomUUID } from 'node:crypto'
 import zlib from 'node:zlib'
+
+import { invokedAsMain } from './main-module.mjs'
+
+// Re-exported so callers/tests can exercise the pure main-module comparison
+// without importing the CLI helper module directly.
+export { isMainModule } from './main-module.mjs'
+
+/** First Node release with `zlib.zstdCompressSync` / `zstdDecompressSync`. */
+export const ZSTD_MIN_NODE = '22.15'
 
 const ZSTD_MAGIC = 0xfd2fb528
 /** Events per zstd frame, mirroring the host's batch-sized appends. */
@@ -58,7 +72,41 @@ Options:
 
 With no path, scans $DSH_HOME/sessions (default ~/.dsh/sessions).
 It only adds the missing message id(s) that make DSH reject a log with
-"历史加载失败"; every other byte of the events is preserved.`
+"历史加载失败"; every other byte of the events is preserved.
+
+Node: repairing \`.jsonl.zstd\` logs needs node:zlib zstd (Node >= ${ZSTD_MIN_NODE});
+plain \`.jsonl\` logs work on older Node.`
+
+/**
+ * Which of the two `node:zlib` zstd codecs this runtime provides.
+ *
+ * Pure (the zlib implementation is injectable) so the Node-version gate can be
+ * unit-tested on a machine that does have zstd; production calls use node:zlib.
+ *
+ * @param {object} [zlibImpl] defaults to `node:zlib`.
+ * @returns {{ ok: boolean, missing: string[] }}
+ */
+export function zstdCapability(zlibImpl = zlib) {
+  const names = ['zstdCompressSync', 'zstdDecompressSync']
+  const missing = names.filter((name) => typeof (zlibImpl && zlibImpl[name]) !== 'function')
+  return { ok: missing.length === 0, missing }
+}
+
+/** Whether this runtime can repair `.jsonl.zstd` logs (Node >= 22.15 / 23.8). */
+export function hasZstdSupport() {
+  return zstdCapability(zlib).ok
+}
+
+/** Throw an actionable error instead of a bare `TypeError` on old Node. */
+function assertZstdSupport(action) {
+  const capability = zstdCapability(zlib)
+  if (capability.ok) return
+  throw new Error(
+    `cannot ${action} a .jsonl.zstd log on Node ${process.version}: ` +
+      `node:zlib zstd support requires Node >= ${ZSTD_MIN_NODE} ` +
+      `(missing ${capability.missing.join(', ')}); use a newer Node, or pass a plain .jsonl log`,
+  )
+}
 
 /** Compress one JSONL chunk into a single zstd frame the host can append after. */
 function encodeFrame(text) {
@@ -133,6 +181,7 @@ export function locateFrames(buffer) {
  * @returns {string} decoded JSONL (header line first)
  */
 export function decodeJournal(buffer) {
+  assertZstdSupport('decompress')
   const parts = []
   for (const frame of locateFrames(buffer)) {
     if (frame.type !== 'zstd') continue
@@ -153,6 +202,7 @@ export function decodeJournal(buffer) {
  * @returns {Buffer} the `.jsonl.zstd` bytes
  */
 export function encodeJournal(text) {
+  assertZstdSupport('re-encode')
   const lines = text.split('\n')
   const trailing = lines.at(-1) === ''
   if (trailing) lines.pop()
@@ -364,6 +414,9 @@ function main(argv) {
   return problems > 0 ? 1 : 0
 }
 
-if (process.argv[1] !== undefined && import.meta.url === new URL(`file://${path.resolve(process.argv[1])}`).href.replace(/\\/g, '/')) {
+// Symlinks and `#`/Unicode/space characters in the path are handled by
+// tools/main-module.mjs (the old `new URL('file://' + …)` comparison silently
+// skipped main() for them).
+if (invokedAsMain(import.meta.url)) {
   process.exitCode = main(process.argv)
 }

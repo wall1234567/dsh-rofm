@@ -238,6 +238,7 @@ function toIdSet(value) {
  *   memoryDir?: string,
  *   baseDir?: string,
  *   excludeIds?: Iterable<string>,  // folders already in the recall block
+ *   minAlpha?: number,              // α floor for channel-gated recalls (0 = off)
  * }} options
  * @returns {{
  *   additions: Array<{id: string, generation: number, alpha: number, beta: number,
@@ -261,12 +262,20 @@ export function recall(options = {}) {
   const userKeywords = extractKeywords(userText, cfg, { max: 16 })
 
   const rawFolders = options.index && Array.isArray(options.index.folders) ? options.index.folders : []
+  // Optional α floor (v1.3.0, QQ compat D4): a recall triggered by a
+  // non-owner group member must not surface low-importance memories. Folders
+  // below the floor are treated exactly like unscored ones — no keyword match,
+  // no roll, no firstGenMax quota and no keyword bridge — so the gate cannot be
+  // bypassed through a bridge node either. Default 0 = no gate (v1.2.1 path).
+  const minAlpha = Number(options.minAlpha)
+  const alphaFloor = Number.isFinite(minAlpha) ? Math.min(1, Math.max(0, minAlpha)) : 0
   // Unscored folders (archived, but the model has not judged α/β/keywords yet)
   // never take part in recall: no keyword match, no roll, no firstGenMax quota
   // and no keyword bridge. Folders archived before the `scored` field existed
   // count as scored.
   const folders = rawFolders
     .filter((folder) => folder && folder.scored !== false)
+    .filter((folder) => alphaFloor <= 0 || (Number(folder.alpha) || 0) >= alphaFloor)
     .sort(compareCreatedAt)
 
   const emptyStats = () => ({

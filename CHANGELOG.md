@@ -3,6 +3,26 @@
 All notable changes to `dsh-rofm` are documented here.
 The project follows a lightweight [SemVer](https://semver.org/) scheme.
 
+## [Unreleased]
+
+### Added
+
+- **一条命令发版（`tools/release.mjs`）**：把「预检 → 测试/打包检查 → 版本号 + release commit +
+  annotated tag → 推送 GitHub → `npm publish`（内置 npm 2FA 浏览器授权流程：打印授权链接、自动开浏览器、
+  轮询确认后用一次性密码重试）→ 创建 GitHub Release（正文取自 CHANGELOG）」串成一条命令。
+  支持 `--bump patch|minor|major` / `--version x.y.z` / `--resume`（中断后只补做未完成步骤，不重复发布）
+  / `--dry-run` / `--yes` / `--skip-npm` / `--skip-github` / `--skip-push` / `--otp` / `--no-browser` 等参数；
+  跨平台（Windows/Linux/macOS）、零依赖。npm 发布是异步的（HTTP 202），脚本会轮询 registry 直到版本可见；
+  Windows schannel 的证书吊销检查会让 `git push` 偶发失败，脚本只对出错的那条命令用 `GIT_SSL_NO_VERIFY=1`
+  重试并提示改用 SSH remote；Node ≥ 24 上自动加载系统证书库，兼容 TLS 代理。
+- **`package.json` 快捷脚本**：`npm run release -- --bump patch --yes`、`npm run release:status`
+  （= `node tools/release.mjs --resume --dry-run`，查看当前版本还剩哪些发布步骤）。
+- **`test/release.test.mjs`（新，22 例）**：发版工具纯函数的单元测试——版本解析/递增/比较、CHANGELOG 段落提取、
+  GitHub remote 解析、CLI 参数校验、平台浏览器 opener、npm 2FA URL 校验、`npm pack --dry-run` 清单校验、
+  系统证书库安装、`ReleaseError` 恢复提示。
+- **文档**：`docs/PUBLISHING.md` 重写为「一条命令发版（推荐）+ 首次环境准备 + 手动发版（备选/排障）+
+  发布前自检清单」，补充 npm 2FA/EOTP、npm 异步发布、Windows schannel TLS、`--resume` 续发等排障说明。
+
 ## [1.3.0] — 2026-10-31
 
 本版本完成两件事：**QQ 渠道兼容**（`dsh-onebot-qq` 与 `Derpyu520/qq-bridge` 的「归档 → 评分 → 回忆」

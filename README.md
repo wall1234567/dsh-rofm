@@ -1004,6 +1004,10 @@ node engine/cli.mjs --help        # 独立引擎 CLI
 > 也可分别运行 `node --test test/*.test.mjs`（引擎）与
 > `node --test test-adapter/*.test.mjs`（适配层）。
 > `npm run check` = 测试 + 模拟 + selfcheck + CLI help 一条龙。
+>
+> 维护者发版见 `docs/PUBLISHING.md`：`node tools/release.mjs --bump patch --title "…" --yes`
+> 会跑完发布前检查并完成提交/tag/推送/npm 发布（含 2FA 浏览器确认）/GitHub Release；
+> 中断后用 `node tools/release.mjs --resume --yes` 续做未完成的步骤。
 
 ### 自检工具 `tools/selfcheck.mjs`（v1.2 新增）
 

@@ -9,7 +9,9 @@
     "simulate": "node test/simulate.mjs",
     "selfcheck": "node tools/selfcheck.mjs",
     "cli": "node engine/cli.mjs --help",
-    "check": "node --test && node test/simulate.mjs && node tools/selfcheck.mjs && node engine/cli.mjs --help"
+    "check": "node --test && node test/simulate.mjs && node tools/selfcheck.mjs && node engine/cli.mjs --help",
+    "release": "node tools/release.mjs",
+    "release:status": "node tools/release.mjs --resume --dry-run"
   },
   "exports": {
     ".": "./index.js",

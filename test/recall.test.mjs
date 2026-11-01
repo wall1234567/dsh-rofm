@@ -685,3 +685,168 @@ test('MemoryEngine.recall forwards options.minAlpha to the engine path', () => {
   const gated = engine.recall('部署', {}, { minAlpha: 0.5 })
   assert.deepEqual(gated.additions, [])
 })
+
+// ---------------------------------------------------------------------------
+// v1.4.0 recall options: time window, pagination, miss classification
+// ---------------------------------------------------------------------------
+
+/** Build a memory dir with one folder per createdAt; returns a loaded engine. */
+function engineWithFolders(specs, overrides = {}) {
+  const dir = tempDir()
+  for (const spec of specs) writeFolder(dir, { id: spec.id, meta: spec.meta, messages: spec.messages || [] })
+  const cfg = loadConfig(undefined, overrides)
+  // rng () => 0 makes the legacy probability path always succeed (roll 0 < α).
+  const engine = new MemoryEngine({ memoryDir: dir, config: cfg, rng: () => 0 })
+  engine.load()
+  return engine
+}
+
+function timedFolder(id, createdAt, keywords, alpha = 1) {
+  return {
+    id,
+    meta: { version: 1, id, createdAt, alpha, keywords, title: keywords.join(' '), stats: { messages: 1, chars: 50, tokens: 20 } },
+    messages: [{ role: 'user', content: `内容 ${id}` }],
+  }
+}
+
+const SH_DAY = {
+  '2026-10-30': Date.parse('2026-10-30T10:00:00+08:00'),
+  '2026-10-31': Date.parse('2026-10-31T10:00:00+08:00'),
+  '2026-11-01': Date.parse('2026-11-01T10:00:00+08:00'),
+}
+
+test('recall v1.4.0: a single-day time query returns only that day (constrain mode)', () => {
+  const engine = engineWithFolders(
+    [
+      timedFolder('mem-a', SH_DAY['2026-10-30'], ['部署']),
+      timedFolder('mem-b', SH_DAY['2026-10-31'], ['部署']),
+      timedFolder('mem-c', SH_DAY['2026-11-01'], ['部署']),
+    ],
+    { time: { mode: 'constrain', timezone: 'Asia/Shanghai' }, recall: { maxGeneration: 1 } },
+  )
+  const result = engine.recall('部署方案', {}, { timeFrom: '2026-10-31' })
+  assert.deepEqual(result.additions.map((addition) => addition.id), ['mem-b'])
+  assert.equal(result.timeWindow.level, 'day')
+  assert.equal(result.timeWindow.enforced, true)
+  assert.equal(result.timeWindow.widenedTo, null)
+  assert.equal(result.stats.timeFiltered, 2, 'the two out-of-window candidates are recorded')
+  assert.equal(result.missType, null)
+  // around the day boundaries: the window is [dayStart, dayStart+1d) local time
+  assert.equal(new Date(result.timeWindow.from).getDate(), 31)
+})
+
+test('recall v1.4.0: time.mode=index normalizes but never filters (engine default)', () => {
+  const engine = engineWithFolders(
+    [
+      timedFolder('mem-a', SH_DAY['2026-10-30'], ['部署']),
+      timedFolder('mem-b', SH_DAY['2026-10-31'], ['部署']),
+    ],
+    { time: { mode: 'index', timezone: 'Asia/Shanghai' } },
+  )
+  const result = engine.recall('部署方案', {}, { timeFrom: '2026-10-31' })
+  assert.equal(result.additions.length, 2, 'index-only mode does not constrain')
+  assert.equal(result.timeWindow.enforced, false)
+  assert.equal(result.stats.timeFiltered, 0)
+})
+
+test('recall v1.4.0: time.mode=off ignores time arguments with a warning', () => {
+  const engine = engineWithFolders([timedFolder('mem-a', SH_DAY['2026-10-30'], ['部署'])], {
+    time: { mode: 'off', timezone: 'Asia/Shanghai' },
+  })
+  const result = engine.recall('部署方案', {}, { timeFrom: '2026-10-31' })
+  assert.equal(result.additions.length, 1)
+  assert.equal(result.timeWindow, null)
+  assert.ok(result.warnings.some((warning) => /time\.mode is "off"/.test(warning)))
+})
+
+test('recall v1.4.0: no time arguments keeps the v1.3.0 behaviour exactly', () => {
+  const engine = engineWithFolders([timedFolder('mem-a', SH_DAY['2026-10-30'], ['部署'])], {
+    time: { mode: 'constrain', timezone: 'Asia/Shanghai' },
+  })
+  const result = engine.recall('部署方案', {}, {})
+  assert.equal(result.additions.length, 1)
+  assert.equal(result.timeWindow, null)
+  assert.equal(result.stats.timeFiltered, 0)
+  assert.equal(result.page.offset, 0)
+  assert.equal(result.page.hasMore, false)
+})
+
+test('recall v1.4.0: missType separates a time miss from a keyword miss', () => {
+  const engine = engineWithFolders([timedFolder('mem-a', SH_DAY['2026-10-30'], ['部署'])], {
+    time: { mode: 'constrain', timezone: 'Asia/Shanghai' },
+    recall: { seed: 7 },
+  })
+  // keyword matches but outside the requested day → a time miss (no strike)
+  const timeMiss = engine.recall('部署方案', {}, { timeFrom: '2026-11-01' })
+  assert.equal(timeMiss.additions.length, 0)
+  assert.equal(timeMiss.missType, 'time')
+  assert.ok(timeMiss.stats.timeFiltered > 0)
+  // nothing matches the keywords at all → a keyword miss (counts as a strike)
+  const keywordMiss = engine.recall('完全无关的话题', {}, { timeFrom: '2026-11-01' })
+  assert.equal(keywordMiss.additions.length, 0)
+  assert.equal(keywordMiss.missType, 'keyword')
+  // no time arguments and no keyword match → still a keyword miss
+  assert.equal(engine.recall('完全无关的话题', {}, {}).missType, 'keyword')
+})
+
+test('recall v1.4.0: timeWindowFor exposes the normalized window and id set', () => {
+  const engine = engineWithFolders(
+    [
+      timedFolder('mem-a', SH_DAY['2026-10-30'], ['部署']),
+      timedFolder('mem-b', SH_DAY['2026-10-31'], ['部署']),
+    ],
+    { time: { mode: 'constrain', timezone: 'Asia/Shanghai' } },
+  )
+  const window = engine.timeWindowFor({ timeFrom: '2026-10-31' }, SH_DAY['2026-11-01'])
+  assert.equal(window.level, 'day')
+  assert.equal(window.enforced, true)
+  assert.equal(window.hits, 1)
+  assert.deepEqual([...window.ids], ['mem-b'])
+  assert.equal(window.timezone, 'Asia/Shanghai')
+  assert.deepEqual(window.warnings, [])
+  // a month query covers both days
+  const month = engine.timeWindowFor({ timeFrom: '2026-10' }, SH_DAY['2026-11-01'])
+  assert.equal(month.level, 'month')
+  assert.equal(month.hits, 2)
+  // invalid/future input never throws
+  const future = engine.timeWindowFor({ timeFrom: '2099-01-01' }, SH_DAY['2026-11-01'])
+  assert.ok(Array.isArray(future.warnings))
+})
+
+test('recall v1.4.0: offset/limit paginate the recalled candidates', () => {
+  const specs = []
+  for (let index = 1; index <= 5; index += 1) specs.push(timedFolder(`mem-${index}`, SH_DAY['2026-10-31'] + index, ['部署']))
+  const engine = engineWithFolders(specs, { recall: { firstGenMax: 10 } })
+  const first = engine.recall('部署方案', {}, { limit: 2 })
+  assert.equal(first.additions.length, 2)
+  assert.equal(first.page.limit, 2)
+  assert.equal(first.page.total, 5)
+  assert.equal(first.page.hasMore, true)
+  const second = engine.recall('部署方案', {}, { limit: 2, offset: 2 })
+  assert.equal(second.additions.length, 2)
+  assert.equal(second.page.offset, 2)
+  const last = engine.recall('部署方案', {}, { limit: 2, offset: 4 })
+  assert.equal(last.additions.length, 1)
+  assert.equal(last.page.hasMore, false)
+  // offset beyond the result set returns nothing, never throws
+  assert.deepEqual(engine.recall('部署方案', {}, { offset: 99 }).additions, [])
+  // garbage offset/limit degrade safely
+  const garbage = engine.recall('部署方案', {}, { offset: 'x', limit: -3 })
+  assert.equal(garbage.page.offset, 0)
+  assert.equal(garbage.page.limit, 5)
+})
+
+test('recall v1.4.0: explicit mode=legacy keeps the v1.3.0 path and still honours time', () => {
+  const engine = engineWithFolders(
+    [
+      timedFolder('mem-a', SH_DAY['2026-10-30'], ['部署']),
+      timedFolder('mem-b', SH_DAY['2026-10-31'], ['部署']),
+    ],
+    { time: { mode: 'constrain', timezone: 'Asia/Shanghai' }, recall: { mode: 'legacy', maxGeneration: 1 } },
+  )
+  const result = engine.recall('部署方案', {}, { timeFrom: '2026-10-31' })
+  assert.equal(result.mode, 'legacy')
+  assert.deepEqual(result.additions.map((addition) => addition.id), ['mem-b'])
+  assert.equal(engine.recallMode({ mode: 'nonsense' }), 'legacy', 'invalid override falls back to cfg')
+  assert.equal(engine.recallMode({ mode: 'fair' }), 'fair')
+})

@@ -282,6 +282,7 @@ export function recall(options = {}) {
     userKeywords,
     matchedFolders: 0,
     excludedFolders: 0,
+    timeFiltered: 0,
     attempts: 0,
     addedFolders: 0,
     addedChars: 0,
@@ -311,7 +312,14 @@ export function recall(options = {}) {
       b.folder.alpha - a.folder.alpha ||
       compareCreatedAt(a.folder, b.folder),
   )
-  const matchedFolders = matching.length
+  // v1.4.0 time assistance: an optional time-window filter applies to the first
+  // generation only (C(Q) ∩ W). Bridge/descendant expansion is not constrained,
+  // exactly like the deterministic selector, so the two paths stay comparable.
+  const timeIds = options.timeIds instanceof Set ? options.timeIds : null
+  const beforeTimeFilter = matching.length
+  const timeAllowed = timeIds ? matching.filter((entry) => timeIds.has(entry.folder.id)) : matching
+  const matchedFolders = timeAllowed.length
+  const timeFiltered = beforeTimeFilter - matchedFolders
 
   const firstGenMax = Number.isInteger(recallCfg.firstGenMax) ? recallCfg.firstGenMax : DEFAULT_CONFIG.recall.firstGenMax
   const maxGeneration = Number.isInteger(recallCfg.maxGeneration) ? recallCfg.maxGeneration : 0
@@ -323,8 +331,8 @@ export function recall(options = {}) {
   // Already-recalled folders must not compete for the quota again (that used to
   // starve memories archived after them): they are split out of the gen-1 queue
   // and only act as keyword bridges during the BFS below.
-  const eligible = matching.filter((entry) => !excludedIds.has(entry.folder.id))
-  const excludedMatched = matching.filter((entry) => excludedIds.has(entry.folder.id))
+  const eligible = timeAllowed.filter((entry) => !excludedIds.has(entry.folder.id))
+  const excludedMatched = timeAllowed.filter((entry) => excludedIds.has(entry.folder.id))
 
   const queue = eligible.map((entry) => ({ folder: entry.folder, generation: 1 }))
   for (const entry of excludedMatched) queue.push({ folder: entry.folder, generation: 1 })
@@ -385,9 +393,57 @@ export function recall(options = {}) {
   }
 
   // --- load the actual conversation context of the recalled folders --------
+  const additions = loadRecallAdditions(added, { memoryDir, warnings })
+
+  const sorted = sortAdded(additions, recallCfg.sort || 'createdAt')
+
+  // --- aggregate stats -----------------------------------------------------
+  const stats = emptyStats()
+  let addedChars = 0
+  let addedTokens = 0
+  const byGeneration = {}
+  for (const addition of sorted) {
+    addedChars += addition.chars
+    addedTokens += addition.tokens
+    const key = String(addition.generation)
+    byGeneration[key] = (byGeneration[key] || 0) + 1
+  }
+  stats.matchedFolders = matchedFolders
+  stats.excludedFolders = excludedTraversed
+  stats.timeFiltered = timeFiltered
+  stats.attempts = attempts
+  stats.addedFolders = sorted.length
+  stats.addedChars = addedChars
+  stats.addedTokens = addedTokens
+  stats.byGeneration = byGeneration
+  stats.addedPercentOfContext = stats.contextChars > 0 ? roundNumber((addedChars / stats.contextChars) * 100) : null
+  stats.addedPercentOfWindow = stats.windowTokens > 0 ? roundNumber((addedTokens / stats.windowTokens) * 100) : null
+  stats.elapsedMs = roundNumber(nowMs() - started, 2)
+
+  return { additions: sorted, stats, warnings }
+}
+
+/**
+ * Load the conversation context of already-selected recall entries.
+ *
+ * Shared by the legacy probability path and the v1.4.0 deterministic selector:
+ * both only decide *which* folder ids to surface, the actual messages/α/β/chars
+ * bookkeeping is identical. Missing/corrupt folders are skipped with a warning
+ * (a missing folder must never break a recall round).
+ *
+ * @param {Array<{ folder: object, generation: number, alpha: number,
+ *   createdAt: number, probability?: number, roll?: number }>} added
+ * @param {{ memoryDir: string, warnings?: string[] }} options
+ * @returns {Array<object>} additions (same shape as the v1.3.0 recall additions)
+ */
+export function loadRecallAdditions(added, options = {}) {
+  const opts = options && typeof options === 'object' ? options : {}
+  const memoryDir = opts.memoryDir
+  const warnings = Array.isArray(opts.warnings) ? opts.warnings : []
   const additions = []
-  for (const entry of added) {
-    const folder = entry.folder
+  for (const entry of Array.isArray(added) ? added : []) {
+    const folder = entry && entry.folder ? entry.folder : entry
+    if (!folder || typeof folder.id !== 'string') continue
     let loaded
     try {
       loaded = readFolder(memoryDir, folder.id)
@@ -409,46 +465,25 @@ export function recall(options = {}) {
     if (!Number.isFinite(stats.chars)) chars = messages.reduce((sum, message) => sum + renderMessage(message).length, 0)
     let tokens = Number.isFinite(stats.tokens) ? stats.tokens : 0
     if (!Number.isFinite(stats.tokens)) tokens = estimateMessagesTokens(messages)
-    additions.push({
+    const addition = {
       id: folder.id,
-      generation: entry.generation,
-      alpha: entry.alpha,
+      generation: Number.isFinite(entry.generation) ? entry.generation : 1,
+      alpha: Number.isFinite(entry.alpha) ? entry.alpha : Math.min(1, Math.max(0, Number(folder.alpha) || 0)),
       beta,
-      probability: entry.probability,
-      roll: entry.roll,
-      createdAt: entry.createdAt,
+      probability: Number.isFinite(entry.probability) ? entry.probability : 1,
+      roll: Number.isFinite(entry.roll) ? entry.roll : 1,
+      createdAt: Number.isFinite(entry.createdAt) ? entry.createdAt : Number(folder.createdAt) || 0,
       meta,
       messages,
       chars,
       tokens,
-    })
+    }
+    // v1.4.0: carry the selector lane through to telemetry/rendering.
+    if (typeof entry.lane === 'string') addition.lane = entry.lane
+    if (typeof entry.folder?.title === 'string') addition.title = entry.folder.title
+    additions.push(addition)
   }
-
-  const sorted = sortAdded(additions, recallCfg.sort || 'createdAt')
-
-  // --- aggregate stats -----------------------------------------------------
-  const stats = emptyStats()
-  let addedChars = 0
-  let addedTokens = 0
-  const byGeneration = {}
-  for (const addition of sorted) {
-    addedChars += addition.chars
-    addedTokens += addition.tokens
-    const key = String(addition.generation)
-    byGeneration[key] = (byGeneration[key] || 0) + 1
-  }
-  stats.matchedFolders = matchedFolders
-  stats.excludedFolders = excludedTraversed
-  stats.attempts = attempts
-  stats.addedFolders = sorted.length
-  stats.addedChars = addedChars
-  stats.addedTokens = addedTokens
-  stats.byGeneration = byGeneration
-  stats.addedPercentOfContext = stats.contextChars > 0 ? roundNumber((addedChars / stats.contextChars) * 100) : null
-  stats.addedPercentOfWindow = stats.windowTokens > 0 ? roundNumber((addedTokens / stats.windowTokens) * 100) : null
-  stats.elapsedMs = roundNumber(nowMs() - started, 2)
-
-  return { additions: sorted, stats, warnings }
+  return additions
 }
 
 function pad2(value) {

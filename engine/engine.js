@@ -739,6 +739,14 @@ export class MemoryEngine {
     }
     const contextChars = Number.isFinite(ctx.chars) ? ctx.chars : null
     const windowTokens = Number.isFinite(ctx.windowTokens) ? ctx.windowTokens : null
+    // Lane attribution covers the injected page only: the +1 lookahead pick is a
+    // pagination probe, not part of the round's block. sum(lanesPicked) therefore
+    // always equals additions.length.
+    const lanesPicked = {}
+    for (const addition of additions) {
+      const lane = typeof addition.lane === 'string' && addition.lane ? addition.lane : 'hi'
+      lanesPicked[lane] = (lanesPicked[lane] || 0) + 1
+    }
     const stats = {
       userKeywords,
       matchedFolders: candidatesInWindow,
@@ -757,7 +765,7 @@ export class MemoryEngine {
       candidates: candidatesInWindow,
       candidatesAll,
       lowCandidates: Number(selectStats.lowCandidates) || 0,
-      lanesPicked: selectStats.lanesPicked || null,
+      lanesPicked,
       pops: Number(selectStats.pops) || 0,
       frontierHits: Number(selectStats.frontierHits) || 0,
       registerDrops: Number(selectStats.registerDrops) || 0,
@@ -780,13 +788,16 @@ export class MemoryEngine {
       stats,
       warnings,
       lanes: result.lanes,
+      // σ-ordered ids of C(Q)∩W: `engine.trimBlock` uses this set to trim
+      // "not in the current query" entries first (plan §3.2.4).
+      candidateIds: Array.isArray(result.candidateIds) ? result.candidateIds : null,
       timeWindow: { widenedTo: attempt.widenedTo ?? null, level: attempt.level ?? null },
       paginated: true,
       page: {
         offset,
         limit: take,
         returned: additions.length,
-        candidates: Number(selectStats.candidates) || 0,
+        candidates: candidatesInWindow,
         hasMore,
       },
     }

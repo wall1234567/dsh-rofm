@@ -844,7 +844,9 @@ test('recall v1.4.0: offset/limit paginate the recalled candidates', () => {
   // garbage offset/limit degrade safely
   const garbage = engine.recall('部署方案', {}, { offset: 'x', limit: -3 })
   assert.equal(garbage.page.offset, 0)
-  assert.equal(garbage.page.limit, 5)
+  // an invalid limit falls back to the per-round quota (recall.firstGenMax = 10)
+  assert.equal(garbage.page.limit, 10)
+  assert.equal(garbage.additions.length, 5, 'only the existing candidates are returned')
 })
 
 test('recall v1.4.0: explicit mode=legacy keeps the v1.3.0 path and still honours time', () => {

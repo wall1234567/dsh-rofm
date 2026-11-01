@@ -687,6 +687,19 @@ test('lane hooks: nextRecallRound, getRecallLanes, commitRecallLanes persist v3'
   assert.equal(snapshot.block, '')
 }))
 
+test('recall.persistInjected=false keeps the block in memory but writes no recall-state', withTempDir(async (dir) => {
+  const memoryDir = path.join(dir, 'memory')
+  writeFolders(memoryDir, 3)
+  const session = new FakeSession({ id: 'session-no-persist' })
+  const { ctx, capture } = makeContext(session)
+  const overrides = makeOverrides(memoryDir, { recall: { ...makeOverrides(memoryDir).recall, persistInjected: false } })
+  const plugin = new RofmPlugin(ctx, overrides)
+  plugin.start()
+  plugin.onInboxInserted({ agent: { session }, message: userMessage('u-no-persist', '确定性 继续') })
+  assert.ok(recallBlock(capture, session).includes('DETERMINISTIC-'), 'the block is still injected into the prompt')
+  assert.equal(existsSync(path.join(memoryDir, 'recall-state.json')), false, 'persistInjected=false writes no recall-state')
+}))
+
 test('a v2 file with no valid addition falls back to the v1 ids path', withTempDir(async (dir) => {
   const memoryDir = path.join(dir, 'memory')
   writeFolders(memoryDir, 2)

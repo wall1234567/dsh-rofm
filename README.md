@@ -115,7 +115,7 @@
      v1.4.0 新增 `pendingAtArchive` / `pendingCount` / `smallWindow` / `protectedTurn` / `foldersPlanned` / `foldersCommitted` /
      `rollback` / `maxFoldersCapped` / `eventTimeSourceCounts` / `scoreMode` / `archivedByVersion`，见 §1.6）；
 3. **防爆升级**：一次归档后若上下文仍 > `compress.triggerPercent`，继续普通 pass（最多 `maxExtraPasses` 次）；若 > `emergencyPercent`（默认 85%）则用 `emergencyCompressPercent`（默认 40%）大口径 pass；只剩不可移除内容且 >`hardLimitPercent`（默认 95%）时，
-   v1.4.0 起默认**硬停止**（`compress.hardLimitStop=true`）：连续两次仍降不下来就停止该会话的自动归档并 WARN 一次，而不是每个模型步骤都重试、把上下文越推越高（见 §1.1.1）；
+   v1.4.0 起默认**硬停止**（`compress.hardLimitStop=true`）：连续 **2 个压力 episode**（一次触发 + 其紧急 pass 算一个 episode）仍降不下来就停止该会话的自动归档并 WARN 一次，而不是每个模型步骤都重试、把上下文越推越高（见 §1.1.1）；
 4. 所有归档都会写一条 `compress-applied` 遥测：DSH tokenMeter 前后 tokens/百分比、pass、是否紧急、来源（`pre-step`）、文件夹的 pending 元数据。
 
 #### 1.1.1 小窗口 / 假窗口 / 硬停止 / 单步上限（v1.4.0 归档保护）
@@ -127,7 +127,7 @@
 | `compress.protectCurrentTurn` | `true` | 当前回合的 user 消息与同 turn 的 tool 配对**绝不归档**；找不到合法切点 → 拒绝本次归档 + warning（多步工具回合也不会把正在回答的问题藏起来） |
 | `compress.allowSmallWindow` | `false` | 窗口 < `compress.smallWindowTokens`（默认 20000）或 `compress.contextWindowTokens` 与宿主窗口相差超过 4× 时，**跳过自动归档**（每会话只 WARN 一次）；设为 `true` 才允许小窗口归档 |
 | `compress.smallWindowTokens` | `20000` | “小窗口”阈值（token）。小窗口里 ROFM 自己的 2 个 prompt section 就会把占用推高，归档会自我增压 |
-| `compress.hardLimitStop` | `true` | 上下文连续两次仍 > `compress.hardLimitPercent`（默认 95）→ 停止归档并 WARN；不再每个 pre-step 重试 |
+| `compress.hardLimitStop` | `true` | 上下文连续 **2 个压力 episode** 仍 > `compress.hardLimitPercent`（默认 95）→ 停止归档并 WARN；不再每个 pre-step 重试 |
 | `compress.maxFoldersPerStep` | `500` | 单个模型步骤最多归档多少个 folder；还会再按“剩余窗口可释放量”封顶（`maxFoldersPerRun` 同时生效） |
 
 补充：实测上下文 > 窗口 500%（假窗口/压测）且未显式 `allowSmallWindow=true` 时同样跳过归档并 WARN——
@@ -286,9 +286,11 @@ v1.3.0 的“8k 压测 541132 tokens / 6764% 窗口”自毁路径在 1.4.0 被�
 
    **分页**：`memory_recall` 的 `offset`/`limit` 是在候选集上做确定性分页（每页按 σ 顺序），
    返回 `page.hasMore`/`nextOffset`；自动回忆取每轮 k 条，不自动翻页。
-   **遥测**：每次召回写 `mode / candidates / lanesPicked{rareHigh,queryBoost,register,hi,lowProbe,rotation,recycle} /
-   pops / frontierHits / registerDrops / reInjections / degraded / timeFiltered / blockBefore / blockAfter /
-   offset / limit / hasMore`；`degraded=true` 时说明低α到达率已超过轮转能力。
+   **遥测**：engine 的 `recall` 事件写 `mode / candidates / lanesPicked{rareHigh,queryBoost,register,hi,
+   lowProbe,rotation,recycle} / pops / frontierHits / registerDrops / reInjections / degraded / timeFiltered /
+   offset / limit / hasMore / missType`；adapter 另写一条 **`recall-block`** 事件记录本轮 block 变化
+   `{blockBefore, blockAfter, evicted, pinnedHigh, round, lanesPicked}`；`degraded=true` 时说明低α到达率已超过轮转能力。
+   旧（≤1.3.0）遥测没有这些字段，读取方一律按“缺失”处理、不当作 0 丢失；selfcheck 只聚合 `recall` 事件。
 4. 回忆内容按**创立时间从早到晚**排序，作为一条系统提示词区块（`dsh-rofm:recall` section）注入，
    位置在**所有对话历史之前**（系统提示词就是请求上下文中最早的部分）。
    v1.2 曾把它改成“系统提示词之后的第一条历史消息”，后来按用户要求**回退**为本形态；
@@ -357,7 +359,11 @@ v1.3.0 的“8k 压测 541132 tokens / 6764% 窗口”自毁路径在 1.4.0 被�
 
 - **选择算法**：与自动回忆**同一套** FAIR-DRI 确定性选择（fair 模式）或 v1.3.0 概率路径（legacy 模式）；
   fair 模式下 α 太低不会再导致“掷骰没中”——低 α 显式引用会走 `lowProbe` 探针当轮返回，
-  其余按轮转/回收道覆盖；已经在回忆块里的条目会作为 `excludeIds` 跳过、不重复注入；
+  其余按轮转/回收道覆盖。**选路排除与自动回忆一致**（计划书 G4：`exclude = block ∪ ledger`）：
+  adapter 通过 `plugin.getRecallContext(session, cfg)` 一次给出 `{lanes, round, blockIds, ledger}`，
+  工具据此传入（不直接读插件内部状态），因此手动检索不会绕过 recycle 冷却重复注入同一记忆；
+  翻更多结果用 `offset` 分页。**纯时间浏览（browse）不读也不写 lanes/round/ledger**（它是一次查找、不是召回决策）；
+  legacy 模式完全不传这些 v1.4.0 参数（回滚兼容）；
 - **返回**：命中的记忆（α/β/关键词/原文；带图片时给出图片**文件路径**，不重新上传附件）、
   时间窗口标注（`时间范围：…（日粒度 · 已放宽到 ±1 天）`）、分页行（“还有更多：可用 offset=… 继续翻页”）、
   以及未命中的提示；`mode='browse'` 表示纯时间浏览（按事件时间升序）；
@@ -434,15 +440,19 @@ v1.3.0 的“8k 压测 541132 tokens / 6764% 窗口”自毁路径在 1.4.0 被�
   `mergedCheckpoints`（本次合并的旧注记数）与 `archiveSegments`（累计归档段数）。
   `tools/recall-report.mjs` 对应输出 `archived images`、`pinned context merged`、`checkpoint notes merged` 三行。
 - **v1.4.0 新增遥测**（字段定义见 SPEC §9）：
-  - `recall` 事件：`mode` / `candidates` / `lanesPicked{rareHigh,queryBoost,register,hi,lowProbe,rotation,recycle}` /
+  - `recall` 事件（engine）：`mode` / `candidates` / `lanesPicked{rareHigh,queryBoost,register,hi,lowProbe,rotation,recycle}` /
     `pops` / `frontierHits` / `registerDrops` / `reInjections` / `degraded` / `timeFiltered` /
     `timeWindow{from,to,level,widenedTo}` / `offset` / `limit` / `hasMore` / `missType`；
+  - **`recall-block` 事件（adapter 新增，独立于 `recall`）**：`blockBefore` / `blockAfter` / `evicted` /
+    `pinnedHigh` / `round` / `lanesPicked` —— 记录本轮注入 + 优先级裁剪对 block 的实际影响
+    （`evicted` 高α进 `highRecycle`、低α进 `recycle`，`pinnedHigh` 为被 pin 保护的高α条数）；
   - `compress-applied` 事件：`pendingAtArchive` / `pendingCount` / `smallWindow` / `protectedTurn` /
     `foldersPlanned` / `foldersCommitted` / `rollback` / `maxFoldersCapped` / `eventTimeSourceCounts` /
     `scoreMode` / `archivedByVersion`；
   - 新增 `type:'judge'` 事件：`batchSize` / `updated` / `kept` / `rejected` / `elapsedMs` /
     `uniformAlphaRate` / `keywordRepeatRate` / `reasonMissingRate`（只有计数与比率，不含正文/关键词原文）。
-  `tools/recall-report.mjs` 与 `tools/selfcheck.mjs` 会聚合 lane 分布、时间过滤、pending 时代与 guarantee 指标。
+  `tools/recall-report.mjs` 与 `tools/selfcheck.mjs` 会聚合 lane 分布、时间过滤、pending 时代与 guarantee 指标
+  （selfcheck 只读 `recall` 事件；旧遥测缺字段只 INFO）。
 
 ```bash
 node tools/recall-report.mjs           # 人类可读报告
@@ -1396,13 +1406,16 @@ node tools/repair-session-log.mjs
 
 ---
 
-## 7. 测试
+## 7. 测试与门禁
 
 ```bash
 npm test                          # = node --test：引擎 + 适配层 + 模拟测试全部运行
-node test/simulate.mjs            # 端到端模拟并打印“加回比例 / 加回字数”
+npm run verify                    # ★ v1.4.0 一键门禁（= node tools/verify-1.4.0.mjs，8 步全 PASS 才 exit 0）
+npm run check                     # = node --test + simulate + selfcheck + cli --help + memory-audit --json + time-view --help
+node test/simulate.mjs            # 端到端模拟并打印“加回比例 / 加回字数”（legacy 回归口径）
 node tools/selfcheck.mjs          # 独立自检（配置/记忆库/时代/时间索引/公平性/会话日志；有 FAIL 时退出码 1）
-node tools/recall-report.mjs      # 聚合 per-session 遥测的报告（加回比例 / 字数 / 再归档 / pending / lane）
+node tools/verify-1.4.0.mjs       # 一键门禁（见下方 8 步）
+node tools/recall-report.mjs      # 聚合 per-session 遥测的报告（加回比例 / 字数 / 再归档 / pending / lane / 时间 / 时代）
 node tools/memory-audit.mjs       # v1.4.0 数据时代审计（默认只读；--json / --apply）
 node tools/time-view.mjs --from 2026-10-31   # v1.4.0 只读时间视图（不写任何文件）
 node tools/show-recall.mjs        # 查看会话 / 记忆文件夹 / 回忆块（α、β、pending、corrupt）
@@ -1410,10 +1423,26 @@ node tools/repair-session-log.mjs --dry-run  # 检查会话日志里缺 message 
 node engine/cli.mjs --help        # 独立引擎 CLI
 ```
 
+**一键门禁 `node tools/verify-1.4.0.mjs`** 依次跑 8 步并汇总：
+
+| # | 步骤 | 内容 |
+|---|---|---|
+| 1 | unit-tests | `node --test` 全量（当前 827 tests / 825 pass / 0 fail / 2 skip；~20s） |
+| 2 | simulate | `node test/simulate.mjs`（legacy 回归；<1s） |
+| 3 | selfcheck | `node tools/selfcheck.mjs`（配置/存储/时代/时间/公平性/日志；~2s） |
+| 4 | cli-help | `node engine/cli.mjs --help` |
+| 5 | memory-audit | `node tools/memory-audit.mjs --json`（真实库只读） |
+| 6 | time-view | `node tools/time-view.mjs --help` |
+| 7 | e2e-adapter | `node --test test/e2e-adapter-simulate.test.mjs`（8 用例，~4s） |
+| 8 | e2e-real-data | `node --test test/e2e-real-data-readonly.test.mjs`（6 用例，~5–8s） |
+
+**结果：8/8 PASS**；汇总 node:test 用例为 **827 + 14 = 841 / 839 pass / 0 fail**
+（发布冻结口径为 837 / 835 / 0；差异来自收尾期新增的 adapter 用例，门禁结论同为 0 fail）。
+`npm run check` 是同一套检查的等价展开（把 e2e 换成 `npm test` 一步）。
+
 > 仓库零依赖，不需要 `npm install`；`npm test` 只是 `node --test` 的快捷方式。
 > 也可分别运行 `node --test test/*.test.mjs`（引擎）与
 > `node --test test-adapter/*.test.mjs`（适配层）。
-> `npm run check` = 测试 + 模拟 + selfcheck + CLI help 一条龙。
 >
 > 维护者发版见 `docs/PUBLISHING.md`：`node tools/release.mjs --bump patch --title "…" --yes`
 > 会跑完发布前检查并完成提交/tag/推送/npm 发布（含 2FA 浏览器确认）/GitHub Release；
@@ -1495,8 +1524,11 @@ selfcheck: 10 passed, 1 warnings, 0 failed
 > neutral profile（没有 QQ 插件）下是 **7 passed / 1 warning / 0 failed**（8 条 check 行）。
 > 两种环境**只有 compat 行不同**，非 compat 检查的名称与状态逐一相同。
 
-测试覆盖（v1.3.0 为 **493 用例：491 pass + 2 skip、0 fail**；v1.4.0 的最终用例数与分项以
-[docs/VERIFICATION.md](docs/VERIFICATION.md) §20 为准，CI 在 Linux/Windows/macOS × Node 20/22/24 上校验）：
+测试覆盖（v1.3.0 为 **493 用例：491 pass + 2 skip、0 fail**；v1.4.0 在 2026-11-01 收尾实测为
+**827 用例：825 pass + 2 skip、0 fail**（engine 613 = 611 pass + 2 skip / adapter 213 / simulate 1），
+另有 2 个 e2e 文件 8 + 6 = 14 用例全绿；一键门禁 `node tools/verify-1.4.0.mjs` = **8/8 PASS**，
+汇总 node:test 用例 **841 / 839 pass / 0 fail**。最终数字以 [docs/VERIFICATION.md](docs/VERIFICATION.md) §20
+与发布门禁输出为准；CI 在 Linux/Windows/macOS × Node 20/22/24 上校验）：
 `test/` 覆盖引擎用例 + `simulate`（含 v1.3.0 的 compat / compat-autopatch / heuristic-score /
 passive-archive / qq-media / recall `minAlpha` 用例、`test/portability.test.mjs` 跨平台用例，
 以及 v1.4.0 新增的 `recall-index` / `time-index` / `keyword-match` / `turn-protection-engine` /

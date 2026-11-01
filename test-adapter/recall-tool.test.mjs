@@ -106,7 +106,8 @@ function makeEngine(...results) {
 /**
  * Fake plugin exposing exactly the methods the tool is allowed to use.
  * `images` is either a Map (returned by every resolve call) or a function.
- * `lanes`/`round`/`laneHooks` cover the v1.4.0 fair-path plugin hooks.
+ * `lanes`/`round`/`laneHooks` cover the individual v1.4.0 fair-path hooks;
+ * `recallContext` covers the one-call `getRecallContext` hook.
  */
 function makePlugin({
   engine = makeEngine(),
@@ -117,9 +118,10 @@ function makePlugin({
   lanes = undefined,
   round = undefined,
   laneHooks = undefined,
+  recallContext = undefined,
 } = {}) {
   const plugin = {
-    calls: { currentConfig: 0, toolsSessionEnabled: 0, engineFor: 0, scopedConfig: 0, resolveImages: [], commits: [] },
+    calls: { currentConfig: 0, toolsSessionEnabled: 0, engineFor: 0, scopedConfig: 0, resolveImages: [], commits: [], contexts: [] },
     currentConfig() {
       plugin.calls.currentConfig += 1
       return cfg
@@ -141,7 +143,15 @@ function makePlugin({
     },
   }
   if (sessionState !== undefined) plugin.sessionState = () => sessionState
-  if (laneHooks !== false && (lanes !== undefined || round !== undefined)) {
+  if (recallContext !== undefined) {
+    plugin.getRecallContext = (session, config) => {
+      plugin.calls.contexts.push({ session, config })
+      return typeof recallContext === 'function' ? recallContext(session, config) : recallContext
+    }
+    plugin.commitRecallLanes = (session, config, nextLanes) => {
+      plugin.calls.commits.push({ session, config, lanes: nextLanes })
+    }
+  } else if (laneHooks !== false && (lanes !== undefined || round !== undefined)) {
     if (lanes !== undefined) plugin.getRecallLanes = () => lanes
     if (round !== undefined) plugin.nextRecallRound = () => round
     plugin.commitRecallLanes = (session, config, nextLanes) => {
@@ -837,6 +847,46 @@ test('fair path passes plugin lanes/round into engine.recall and commits the upd
   assertLosslessJson(value)
 })
 
+test('getRecallContext: lanes/round/blockIds/ledger travel together and the updated lanes are committed (G4)', async () => {
+  const lanes = { round: 3, pendingHigh: [] }
+  const returnedLanes = { round: 4, pendingHigh: [] }
+  const blockIds = new Set(['mem-in-block'])
+  const ledger = ['mem-surfaced-1', 'mem-surfaced-2']
+  const engine = makeEngine(successResult([makeAddition()], {}, { mode: 'fair', lanes: returnedLanes }))
+  const plugin = makePlugin({ engine, recallContext: { lanes, round: 4, blockIds, ledger } })
+  const tool = new MemoryRecallTool(plugin)
+
+  const value = await tool.execute({ keywords: 'docker' }, exec())
+  assert.equal(plugin.calls.contexts.length, 1, 'the one-call hook is preferred')
+  assert.equal(engine.calls[0].options.lanes, lanes)
+  assert.equal(engine.calls[0].options.round, 4)
+  assert.deepEqual(engine.calls[0].options.blockIds, blockIds, 'block ids are passed')
+  assert.deepEqual(engine.calls[0].options.ledger, ledger, 'the surfaced ledger is passed (selection excludes block ∪ ledger)')
+  assert.equal(plugin.calls.commits.length, 1)
+  assert.equal(plugin.calls.commits[0].lanes, returnedLanes)
+  assert.equal(value.mode, 'fair')
+  assertLosslessJson(value)
+})
+
+test('legacy rollback ignores getRecallContext too (nothing lane-shaped is passed)', async () => {
+  const engine = makeEngine(successResult([makeAddition()]))
+  const cfg = makeConfig({ recall: { enabled: true, mode: 'legacy' } })
+  const plugin = makePlugin({
+    engine,
+    cfg,
+    recallContext: { lanes: { round: 2 }, round: 3, blockIds: new Set(['a']), ledger: ['b'] },
+  })
+  const tool = new MemoryRecallTool(plugin)
+
+  const value = await tool.execute({ keywords: 'docker' }, exec())
+  assert.equal(value.found, 1)
+  assert.equal(plugin.calls.contexts.length, 0, 'legacy never reads the lane context')
+  for (const key of ['lanes', 'round', 'blockIds', 'ledger']) {
+    assert.equal(engine.calls[0].options[key], undefined, `legacy must not pass ${key}`)
+  }
+  assert.equal(plugin.calls.commits.length, 0)
+})
+
 test('throwing lane hooks never break the recall result', async () => {
   const engine = makeEngine(successResult([makeAddition()], {}, { mode: 'fair', lanes: { round: 2 } }))
   const plugin = makePlugin({ engine })
@@ -940,19 +990,23 @@ test('lanes are only passed together with a round (pairing rule)', async () => {
   assert.equal(plugin.calls.commits.length, 0)
 })
 
-test('browse never passes lanes/round and never commits lane state', async () => {
-  const lanes = emptyLanesForTest()
+test('browse never reads or passes lanes/round/blockIds/ledger and never commits lane state', async () => {
   const engine = makeEngine(
     successResult([makeAddition()], {}, { mode: 'fair', lanes: { round: 9 }, timeWindow: { from: 1000, to: 2000, level: 'day' } }),
   )
-  const plugin = makePlugin({ engine, lanes, round: 9 })
+  const plugin = makePlugin({
+    engine,
+    recallContext: { lanes: emptyLanesForTest(), round: 9, blockIds: new Set(['mem-x']), ledger: ['mem-y'] },
+  })
   const tool = new MemoryRecallTool(plugin)
 
   const value = await tool.execute({ timeFrom: '2026-10-31' }, exec())
   assert.equal(value.found, 1)
   assert.equal(value.mode, 'browse')
-  assert.equal(engine.calls[0].options.lanes, undefined, 'browse must not advance lanes')
-  assert.equal(engine.calls[0].options.round, undefined)
+  assert.equal(plugin.calls.contexts.length, 0, 'browse is a lookup, not a recall decision')
+  for (const key of ['lanes', 'round', 'blockIds', 'ledger']) {
+    assert.equal(engine.calls[0].options[key], undefined, `browse must not pass ${key}`)
+  }
   assert.equal(plugin.calls.commits.length, 0, 'browse must not persist lane state')
 })
 
@@ -995,8 +1049,8 @@ const REAL_DAY_31 = Date.UTC(2026, 9, 31)
 /**
  * Hermetic real-engine environment: an `engine.recall`-wired `MemoryEngine` on a
  * temp memory dir behind a fake plugin. `withLanes` also wires the v1.4.0
- * `getRecallLanes`/`nextRecallRound`/`commitRecallLanes` hooks to record what the
- * tool passes through.
+ * `getRecallContext`/`commitRecallLanes` hooks (D's one-call contract) and a
+ * mutable `ledgerBox` so a test can surface/un-surface ids.
  */
 function makeRealEnv(dir, { folders = [], recallMode = 'fair', timeMode = 'constrain', excludeIds = [], withLanes = false } = {}) {
   const memoryDir = path.join(dir, 'memory')
@@ -1029,8 +1083,9 @@ function makeRealEnv(dir, { folders = [], recallMode = 'fair', timeMode = 'const
   }
   engine.load()
   const cfg = { ...engine.config, memoryDir }
-  const laneCalls = { get: 0, round: 0, commits: [] }
+  const laneCalls = { context: 0, commits: [] }
   const laneStore = { value: emptyLanes(), round: 0 }
+  const ledgerBox = { value: [] }
   const plugin = {
     currentConfig: () => cfg,
     toolsSessionEnabled: () => true,
@@ -1040,21 +1095,23 @@ function makeRealEnv(dir, { folders = [], recallMode = 'fair', timeMode = 'const
     sessionState: () => ({ recalledIds: new Set(excludeIds) }),
   }
   if (withLanes) {
-    plugin.getRecallLanes = () => {
-      laneCalls.get += 1
-      return laneStore.value
-    }
-    plugin.nextRecallRound = () => {
-      laneCalls.round += 1
-      laneStore.round += 1
-      return laneStore.round
+    plugin.getRecallContext = () => {
+      laneCalls.context += 1
+      return {
+        lanes: laneStore.value,
+        round: laneStore.round + 1,
+        blockIds: new Set(excludeIds),
+        ledger: ledgerBox.value,
+      }
     }
     plugin.commitRecallLanes = (session, config, lanes) => {
       laneCalls.commits.push(lanes)
       laneStore.value = lanes
+      const round = Number(lanes?.round)
+      if (Number.isFinite(round) && round > 0) laneStore.round = Math.trunc(round)
     }
   }
-  return { memoryDir, engine, cfg, plugin, laneCalls, laneStore, tool: new MemoryRecallTool(plugin) }
+  return { memoryDir, engine, cfg, plugin, laneCalls, laneStore, ledgerBox, tool: new MemoryRecallTool(plugin) }
 }
 
 const MEMORY_FOLDERS = [
@@ -1143,23 +1200,57 @@ test('real engine: fair mode 3/6 strike escalation on true misses, time miss exe
   })
 })
 
-test('real engine: plugin lanes/round are passed together and the updated lanes committed', async () => {
+test('real engine: getRecallContext lanes/round are passed together and the updated lanes committed', async () => {
   await withRelMemoryDir(async (dir) => {
     const env = makeRealEnv(dir, { folders: MEMORY_FOLDERS, withLanes: true })
     const { tool, laneCalls, laneStore } = env
 
     const first = await tool.execute({ keywords: 'docker' }, exec())
     assert.equal(first.found, 3)
-    assert.equal(laneCalls.get, 1, 'lanes read once from the plugin')
-    assert.equal(laneCalls.round, 1, 'round resolved once from the plugin')
+    assert.equal(laneCalls.context, 1, 'the one-call lane context is read once')
     assert.equal(laneCalls.commits.length, 1, 'updated lanes committed back')
     assert.equal(laneStore.value.round, 1, 'the committed lane state carries the round passed to the engine')
 
     const second = await tool.execute({ keywords: 'docker' }, exec())
     assert.equal(second.found, 3)
-    assert.equal(laneCalls.round, 2)
+    assert.equal(laneCalls.context, 2)
     assert.equal(laneCalls.commits.length, 2)
     assert.equal(laneStore.value.round, 2, 'the round is monotonic and travels with the lane state')
+  })
+})
+
+test('real engine: the surfaced ledger excludes memories from manual recall (G4 block ∪ ledger)', async () => {
+  await withRelMemoryDir(async (dir) => {
+    const env = makeRealEnv(dir, { folders: MEMORY_FOLDERS, withLanes: true })
+    const { tool, ledgerBox, laneCalls } = env
+
+    // Every folder was already surfaced: a manual recall must not re-inject it
+    // before its recycle cooldown (G4). It is informational, not a strike.
+    ledgerBox.value = MEMORY_FOLDERS.map((folder) => folder.id)
+    const blocked = await tool.execute({ keywords: 'docker' }, exec())
+    assert.equal(blocked.found, 0)
+    assert.equal(blocked.misses, undefined, 'excluded-by-ledger is not a keyword miss')
+    assert.equal(laneCalls.commits.length, 1, 'the lane state is still committed for the round')
+
+    // Emptying the ledger (e.g. recycle lane / cooldown passed) makes them
+    // recallable again.
+    ledgerBox.value = []
+    const allowed = await tool.execute({ keywords: 'docker' }, exec())
+    assert.equal(allowed.found, 3)
+  })
+})
+
+test('real engine: browse reads/writes no lane state (lookup, not a recall decision)', async () => {
+  await withRelMemoryDir(async (dir) => {
+    const env = makeRealEnv(dir, { folders: MEMORY_FOLDERS, withLanes: true })
+    const { tool, laneCalls, laneStore } = env
+
+    const value = await tool.execute({ timeFrom: '2026-10-30', timeTo: '2026-10-31' }, exec())
+    assert.equal(value.found, 2)
+    assert.equal(value.mode, 'browse')
+    assert.equal(laneCalls.context, 0, 'browse never reads the lane context')
+    assert.equal(laneCalls.commits.length, 0, 'browse never commits lanes')
+    assert.equal(laneStore.value.round, 0, 'browse leaves the round untouched')
   })
 })
 

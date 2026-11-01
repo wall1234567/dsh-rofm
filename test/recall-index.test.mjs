@@ -1403,3 +1403,98 @@ test("deterministic mode leaves fairness pools untouched and reports lane 'hi'",
   assert.equal(typeof result.hasMore, 'boolean')
 })
 
+// ---------------------------------------------------------------------------
+// 21) G3 acceptance: block high-α share >= 0.85 (plan §3.2.9)
+//
+// The block is maintained exactly like the adapter does it: commit the round's
+// picks, then `trimBlock` with the round's candidate set (not-in-C∩W first,
+// α < θ_H first, α asc, injectedRound asc), evicted entries go to the recycle
+// lanes. Fresh low-α memories arrive every round. θ_H comes from
+// cfg.recall.fairness.thetaHigh (= 0.6), so "high α" here means α >= 0.6.
+// ---------------------------------------------------------------------------
+
+test('G3: block high-α (alpha >= thetaHigh 0.6) share stays >= 0.85 after warmup', () => {
+  const cfg = makeCfg()
+  const thetaHigh = cfg.recall.fairness.thetaHigh // 0.6
+  const alphaMix = [0.9, 0.7, 0.4, 0.1, 0.05]
+  const folders = []
+  for (let at = 0; at < 200; at += 1) {
+    folders.push(folder(`mix-${String(at).padStart(3, '0')}`, alphaMix[at % alphaMix.length], at + 1, ['topicword'], { chars: 100 }))
+  }
+  const lanes = emptyLanes()
+  const ledger = new Set()
+  const alphaById = new Map()
+  let block = []
+  let index = buildRecallIndex(folders, cfg)
+  const rememberAlphas = (entries) => {
+    for (const entry of entries) alphaById.set(entry.id, entry.alpha)
+  }
+  rememberAlphas(index.entries)
+  const rounds = 30
+  const warmup = 7 // rounds 1-6: block not yet saturated (8 high / 2 low picks, no eviction)
+  const shares = []
+  const highCounts = []
+  for (let round = 1; round <= rounds; round += 1) {
+    if (round > 1) {
+      // Two fresh low-α arrivals per round: they must not push high-α out of the block.
+      folders.push(folder(`arrive-${round}-0`, 0.05, 1000 + round * 2, ['topicword'], { chars: 100 }))
+      folders.push(folder(`arrive-${round}-1`, 0.05, 1000 + round * 2 + 1, ['topicword'], { chars: 100 }))
+      index = buildRecallIndex(folders, cfg)
+      rememberAlphas(index.entries)
+    }
+    const result = selectRecall(index, '请检查 topicword 的配置', {
+      cfg,
+      lanes,
+      round,
+      ledger,
+      blockIds: new Set(block.map((item) => item.id)),
+    })
+    const alphaOf = (id) => {
+      const at = index.byId.get(id)
+      return at === undefined ? alphaById.get(id) || 0 : index.entries[at].alpha
+    }
+    // Commit the picks into the block, then priority-trim it (adapter order).
+    const inBlock = new Set(block.map((item) => item.id))
+    for (const pick of result.picks) {
+      ledger.add(pick.id)
+      if (!inBlock.has(pick.id)) {
+        block.push({ id: pick.id, injectedRound: round })
+        inBlock.add(pick.id)
+      }
+    }
+    const trim = trimBlock(block, {
+      index,
+      candidates: new Set(result.candidateIds || []),
+      cfg,
+    })
+    block = trim.keep
+    for (const item of trim.evicted) {
+      if (item.high) lanes.highRecycle.push({ id: item.id, round })
+      else lanes.recycle.push({ id: item.id, eligibleRound: round + cfg.recall.fairness.recycle.cooldownRounds })
+    }
+    const highCount = block.filter((item) => alphaOf(item.id) >= thetaHigh).length
+    highCounts.push(highCount)
+    shares.push(block.length ? highCount / block.length : 0)
+    assert.ok(block.length <= cfg.recall.maxRecalledBlocks, `round ${round}: block size ${block.length}`)
+  }
+  assert.ok(block.length > 0)
+  assert.ok(shares.slice(warmup - 1).length >= 20)
+  for (let round = warmup; round <= rounds; round += 1) {
+    assert.ok(shares[round - 1] >= 0.85, `round ${round}: high-α share ${shares[round - 1].toFixed(3)} < 0.85`)
+  }
+  const measured = shares.slice(warmup - 1)
+  const meanShare = measured.reduce((sum, value) => sum + value, 0) / measured.length
+  assert.ok(meanShare >= 0.85, `mean block high-α share ${meanShare.toFixed(3)} < 0.85`)
+  // pinHigh: once the block is saturated, fresh low-α arrivals never reduce the
+  // number of high-α entries still in the block.
+  for (let round = warmup + 1; round <= rounds; round += 1) {
+    assert.ok(
+      highCounts[round - 1] >= highCounts[round - 2],
+      `round ${round}: high-α count dropped ${highCounts[round - 2]} -> ${highCounts[round - 1]}`,
+    )
+  }
+  assert.ok(highCounts[rounds - 1] >= Math.ceil(0.85 * block.length))
+  // low-α churn went through the recycle lane (never silently dropped)
+  assert.ok(lanes.recycle.length > 0)
+})
+

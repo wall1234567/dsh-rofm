@@ -300,10 +300,12 @@ try {
   const code = main(process.argv.slice(2))
   if (code !== 0) process.exitCode = code
 } catch (error) {
+  // Repository CLI convention: bad/missing arguments print usage to stderr and
+  // exit non-zero (1); `--help` alone stays on stdout with exit 0.
   if (error instanceof UsageError) {
     process.stderr.write(`time-view: ${error.message}\n\n`)
     printUsage(process.stderr)
-    process.exitCode = 2
+    process.exitCode = 1
   } else {
     process.stderr.write(`time-view: ${error && error.message ? error.message : error}\n`)
     process.exitCode = 1

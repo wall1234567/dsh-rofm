@@ -995,11 +995,16 @@ model-triggered recall — automatic recall keeps working):
 - **name**: `memory_recall`
 - **description (verbatim)**:
   > 主动回忆 dsh-rofm 更早归档的对话。当前上下文中缺少之前的细节（参数、决定、项目名、技术名、配置与结论等）时，用具体关键词检索本会话的记忆归档；匹配与自动回忆使用同一套关键词和 α 概率规则，返回命中的记忆（α 重要度、β 信赖度、关键词、原文片段，有图片时附带图片）或未命中的提示。关键词请用专有名词/技术名/项目名/参数名，空格或逗号分隔；连续多次未命中会提示停止或更换关键词，一轮内失败过多时工具会被停用，直到下一轮用户消息才恢复。
-- **parameters**: `{ keywords: string (required, 专属名词等；空格或逗号分隔),
-  limit?: integer (1~8, default 3) }`.
+- **parameters (v1.4.0 full set)**: `{ keywords?: string (required unless a time
+  argument is given), limit?: integer (1~8, default 3), offset?: integer
+  (0..10000, default 0), timeFrom?/timeTo?: 'YYYY-MM-DD'|'YYYY-MM'|'YYYY'|epoch,
+  granularity?: 'day'|'month'|'year' }` — keywords + time = time-constrained
+  keyword recall; time without keywords = time-only browse (§6.8).
 - **output schema**: `{ found: number, matchedFolders: number, attempted: number,
-  added: string[], images: [{ name, path, exists }], stopHint?: string }`; extra
-  render-only keys (`entries`, `misses`) are allowed in the stored value.
+  added: string[], images: [{ name, path, exists }], stopHint?: string,
+  page: {offset, limit, hasMore}, missType: null|'time'|'keyword',
+  timeWindow: object|null, mode: 'fair'|'deterministic'|'legacy'|'browse' }`;
+  extra render-only keys (`entries`, `misses`) are allowed in the stored value.
   `output.render` returns **one text block** (`## 主动回忆结果（关键词：…）` header,
   one `### 回忆 N · α=… · β=… · 第N代 · <local time> · 关键词：…` entry per memory
   with its `role: text` lines, a short trust note, miss/warning hints). Image
@@ -1008,25 +1013,37 @@ model-triggered recall — automatic recall keeps working):
   “图片文件（用 read_image 读取…）” list names every file — **no image blocks
   and no attachment re-upload** (v1.2.x). `timeoutMs: 10000`,
   `isConcurrencySafe: () => false`.
-- **execute behaviour**: validates a non-empty `keywords` string and an active
+- **execute behaviour**: validates `keywords` or time arguments and an active
   session; `toolsSessionEnabled`/engine gates behave exactly like `memory_judge`
-  (disabled session → throws). It runs `engine.recall(keywords, stats,
-  { excludeIds: state.recalledIds })` — the same keyword matching and
-  `α × generation probability` math as automatic recall — so a folder whose α is
-  too low, or whose probability roll fails, is not returned here either (that is
-  the memory contract, not a bug). Folders already present in the injected block
-  are passed as `excludeIds`: they do not consume the quota and are not
-  re-injected. The result is limited to `limit` entries and does **not** touch
-  the injected recall block (the tool result itself carries the text and image
-  file paths).
+  (disabled session → throws).
+  - **fair/deterministic**: the tool asks the plugin for one deterministic
+    selection context — `plugin.getRecallContext(session, cfg)` →
+    `{ lanes, round, blockIds, ledger }` — and calls `engine.recall(..., {
+    lanes, round, blockIds, ledger, offset, limit, timeFrom, timeTo,
+    granularity })`. Plan §3.2.1 **G4 requires `exclude = block ∪ ledger`** for
+    every selection, so a manual search must not bypass the recycle cooldown and
+    re-inject a just-trimmed memory; the legitimate ways to surface an evicted
+    memory again are the `recycle` cooldown and `offset` pagination. The returned
+    `lanes` are committed back through `plugin.commitRecallLanes()` (the tool
+    never reads plugin internals directly). `browse` (time-only) is a lookup, not
+    a recall decision: it **does not read or write** lanes/round/ledger.
+  - **legacy**: none of the v1.4.0 selection context is passed (`mode='legacy'`
+    keeps the exact v1.3.0 probability behaviour; already-injected ids are the
+    only exclusion, as before).
+  - The result never touches the injected recall block (the tool result itself
+    carries the text and image file paths); it is limited to `limit` entries and
+    reports `page.hasMore` for `offset` continuation.
 - **consecutive-miss escalation** (per session state inside the tool, reset by the
-  plugin on every real user message via `resetAttempts(session)`):
-  - a call that recalls nothing is a **miss** — whether no keyword matched or
-    matches existed but every α roll failed (the miss hint distinguishes them);
-  - at the **3rd consecutive miss** the result carries
-    `可能关键词没有选对或目标回忆 α 值太低。建议停止继续尝试，或改用更具体的关键词再试一次。`;
-  - if the model does not stop and keeps calling, at the **6th consecutive miss**
-    the tool is disabled for the rest of the turn and the result carries
+  plugin on every real user message via `resetAttempts(session)`; contract §11.11):
+  - fair/deterministic keep the 3/6 state machine, but **only a true miss**
+    (keyword candidate set = 0) counts as a strike; `missType='time'` never counts
+    a strike in any mode; legacy keeps its v1.3.0 semantics unchanged;
+  - at the **3rd consecutive strike** the result carries
+    `可能关键词没有选对或目标回忆 α 值太低。建议停止继续尝试，或改用更具体的关键词再试一次。`
+    plus (v1.4.0) the "ask the user for the expected time range
+    (timeFrom/timeTo, minimum 3 consecutive days)" hint;
+  - if the model does not stop and keeps calling, at the **6th consecutive
+    strike** the tool is disabled for the rest of the turn and the result carries
     `目标回忆 α 值过低或运气不行，如有需要下一轮对话再尝试。`; every further
     call that turn throws
     `memory_recall 本轮已停用：目标回忆 α 值过低或运气不行，如有需要下一轮对话再尝试。`
@@ -1811,9 +1828,15 @@ lanesFingerprint(cfg) -> string      // 'cfg1|' + stable hand-written serializat
   duplicates only).
 - **Ledger**: monotonic ever-surfaced id set; the adapter persists it in v3 and
   trims it at `fairness.ledger.maxEntries` with the documented overflow policy.
-  `memory_recall` (manual tool) deliberately **does not pass the ledger** — it
-  only excludes the current block, so a model-triggered search may re-surface a
-  memory that was trimmed out of the block (contract §11.10).
+  **`memory_recall` uses the same exclusion set as automatic recall**
+  (plan §3.2.1 G4: `exclude = block ∪ ledger`): the tool obtains
+  `{lanes, round, blockIds, ledger}` from `plugin.getRecallContext(session, cfg)`
+  and passes them to `engine.recall()`, so a manual search cannot bypass the
+  recycle cooldown by re-injecting a just-trimmed memory. The legitimate
+  re-surface paths are the `recycle` cooldown and `offset` pagination. Time-only
+  **browse** is a lookup, not a recall decision: it neither reads nor writes
+  lanes/round/ledger. `legacy` mode passes none of the v1.4.0 context (exact
+  v1.3.0 rollback).
 
 ### 6.4 Block management — priority trim (`trimBlock`, replaces v1.3.0 createdAt FIFO)
 
@@ -2216,7 +2239,7 @@ compression/recall. The engine writes `recall` / `compress`; the adapter writes
 (older 1.3.0 events simply omit them — readers must treat them as absent, not
 as zero-loss):
 
-**`type:'recall'`** (new keys on top of the v1.3.0 event):
+**`type:'recall'`** (engine; new keys on top of the v1.3.0 event):
 
 ```json
 {
@@ -2230,8 +2253,6 @@ as zero-loss):
   "registerDrops": 0,
   "reInjections": 1,
   "degraded": false,
-  "blockBefore": 5,
-  "blockAfter": 9,
   "timeWindow": { "from": 1761177600000, "to": 1761264000000, "level": "day", "widenedTo": null },
   "timeFiltered": 3,
   "offset": 0,
@@ -2249,8 +2270,6 @@ as zero-loss):
 - `pops` / `frontierHits` / `registerDrops` / `reInjections` / `degraded` are the
   selector counters of §6.2; `degraded=true` means the low-α rotation bound is
   not promised.
-- `blockBefore` / `blockAfter` = block entry count before/after this round's
-  injection + trim.
 - `timeWindow` = `{from, to, level, widenedTo}` or `null` when no time input was
   given; `missType` ∈ `null | 'time' | 'keyword'`.
 - `offset` / `limit` / `hasMore` mirror the pagination page.
@@ -2258,6 +2277,36 @@ as zero-loss):
   `matchedFolders`, `excludedFolders`, `attempts`, `addedFolders`,
   `addedChars`, `addedTokens`, `addedPercentOfContext`, `addedPercentOfWindow`,
   `byGeneration`, `added[]`) remain; `added[]` gains `lane` and keeps `beta`.
+- **The engine `recall` event has no block-level fields.** Block changes are a
+  separate adapter event (`recall-block`, below); `tools/selfcheck.mjs` and
+  `tools/recall-report.mjs` aggregate only `recall` (and report block stats from
+  `recall-block` when present).
+
+**`type:'recall-block'`** (new adapter event, v1.4.0): one event whenever a recall
+round actually changes the injected block (new additions and/or priority trim):
+
+```json
+{
+  "type": "recall-block",
+  "sessionId": "…",
+  "round": 7,
+  "blockBefore": 5,
+  "blockAfter": 9,
+  "evicted": [{ "id": "mem-…", "alpha": 0.12, "high": false }],
+  "pinnedHigh": 4,
+  "lanesPicked": { "rareHigh": 2, "queryBoost": 0, "register": 1, "hi": 4,
+                   "lowProbe": 0, "rotation": 2, "recycle": 1 }
+}
+```
+
+- `blockBefore` / `blockAfter` = block entry counts before/after this round;
+  `evicted` = entries evicted by the priority trim (§6.4, `high` marks a pinned
+  high-α entry — high-α entries are only evicted when no low-α entry remains);
+  `pinnedHigh` = number of high-α entries protected by the pin;
+  `round` = deterministic recall round; `lanesPicked` mirrors the selector stats
+  so block churn can be attributed to lanes.
+- Separate event (instead of extending `recall`) keeps the engine event stable
+  and lets the older recall reading path work unchanged.
 
 **`type:'compress'`** (new keys; also mirrored on `compress-applied`):
 

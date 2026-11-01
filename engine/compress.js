@@ -55,6 +55,7 @@ import {
   indexEntryFromMeta,
   loadIndex,
   readFolder,
+  readIndex,
   removeFolder,
   scanFolderMetas,
   writeFolder,
@@ -491,6 +492,7 @@ export function planCompression(options = {}) {
   plan.smallWindow = false
   plan.maxFoldersCapped = false
   plan.hardLimit = false
+  plan.trickleArchive = false
   plan.allowSmallWindow = options.allowSmallWindow === true || compressCfg.allowSmallWindow === true
   plan.pendingAtArchive = finiteNumberOrNull(options.pendingCount)
   plan.pendingCount = plan.pendingAtArchive
@@ -812,6 +814,13 @@ export function planCompression(options = {}) {
   }
   plan.eventTimeSourceCounts = eventTimeSourceCounts
 
+  // O1: "trickle" archive — the release cap trimmed the span to what the window
+  // barely needs AND it still produced a single folder (a long session archiving
+  // one tiny slice every pre-turn). Telemetry only: archiving behaviour is
+  // unchanged; the adapter can surface one INFO/WARN from this flag instead of
+  // leaving it at debug level.
+  plan.trickleArchive = plan.releaseCapped === true && folderPlans.length === 1
+
   plan.shouldCompress = folderPlans.length > 0
   plan.reason = plan.shouldCompress ? 'ok' : 'nothing-to-remove'
   plan.folders = folderPlans
@@ -878,11 +887,32 @@ function folderIdempotencyKey(meta, messages, options) {
   return `${prefix}${sessionId}|${turn}|${seqStart}|${seqEnd}|${hashFolderContent(messages)}`
 }
 
-/** Scan `memory/<id>/meta.json` for idempotency keys written by earlier commits.
- * The index deliberately does not carry the key (it is not a recall field), so
- * this reads the metas; it only runs when the caller opted in. */
-function collectFolderIdempotencyKeys(memoryDir) {
+/** Collect the idempotency keys of already committed folders **from the index**
+ * (P2/D2): `indexEntryFromMeta` copies `meta.idempotencyKey`, so one in-memory
+ * pass over `index.folders` is enough — the previous implementation scanned and
+ * parsed every `memory/<id>/meta.json` on every commit (O(N) disk reads: ~140ms
+ * for the real a46 library, ~0.5s at storage.maxFolders=10000).
+ *
+ * The caller already loaded the index, so this performs no extra file read. Only
+ * when the index itself is unavailable (missing/corrupt and not rebuildable) does
+ * it fall back to `readIndex` and finally to scanning folder metas (with a
+ * warning) — correctness over speed for that broken-store case. */
+function collectFolderIdempotencyKeys(index, memoryDir, cfg, warnings) {
   const keys = new Map()
+  const collect = (folders) => {
+    for (const folder of folders) {
+      const key = folder && typeof folder.idempotencyKey === 'string' ? folder.idempotencyKey : ''
+      if (key && typeof folder.id === 'string') keys.set(key, folder.id)
+    }
+    return keys
+  }
+  const loadedFolders = index && Array.isArray(index.folders) ? index.folders : null
+  if (loadedFolders) return collect(loadedFolders)
+  const reread = readIndex(memoryDir, cfg)
+  if (reread && Array.isArray(reread.folders)) return collect(reread.folders)
+  if (Array.isArray(warnings)) {
+    warnings.push('commit: index.json is unavailable; idempotency keys were recovered by scanning folder metas (slow path)')
+  }
   let metas = []
   try {
     metas = scanFolderMetas(memoryDir)
@@ -891,7 +921,7 @@ function collectFolderIdempotencyKeys(memoryDir) {
   }
   for (const meta of metas) {
     const key = meta && typeof meta.idempotencyKey === 'string' ? meta.idempotencyKey : ''
-    if (key) keys.set(key, meta.id)
+    if (key && typeof meta.id === 'string') keys.set(key, meta.id)
   }
   return keys
 }
@@ -985,7 +1015,9 @@ export function commitCompression(plan, options = {}) {
   }
   const written = []
   let skipped = 0
-  const existingKeys = idempotencyEnabled(options) ? collectFolderIdempotencyKeys(memoryDir) : new Map()
+  // P2/D2: collect keys from the index already loaded above (no meta scan, no
+  // second index read); only a broken index falls back to the slow path.
+  const existingKeys = idempotencyEnabled(options) ? collectFolderIdempotencyKeys(index, memoryDir, cfg, warnings) : new Map()
   const journalPath = beginCommitJournal(memoryDir, commitJournalId(options), {
     sessionId: options.sessionId !== undefined ? options.sessionId : null,
     turn: finiteNumberOrNull(options.turn),
@@ -1086,6 +1118,10 @@ export function commitCompression(plan, options = {}) {
         foldersPlanned: folderPlans.length,
         foldersCommitted: written.length,
         foldersSkipped: skipped,
+        foldersArchived: written.length,
+        // P1-6/O1: release cap + trickle (1-folder) archive observability.
+        releaseCapped: planObject.releaseCapped === true,
+        trickleArchive: planObject.trickleArchive === true,
         rollback: false,
         maxFoldersCapped: planObject.maxFoldersCapped === true,
         eventTimeSourceCounts: planObject.eventTimeSourceCounts && typeof planObject.eventTimeSourceCounts === 'object'

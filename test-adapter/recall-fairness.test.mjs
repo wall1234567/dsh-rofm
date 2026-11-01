@@ -535,6 +535,34 @@ test('fair recall persists recall-state v3 with lanes/round/ledger/counters', wi
   assert.equal(typeof snapshot.degraded, 'boolean')
 }))
 
+test('ledger cap: overflow evicts the least recently surfaced ids and WARNs once (G3)', withTempDir(async (dir) => {
+  const memoryDir = path.join(dir, 'memory')
+  mkdirSync(memoryDir, { recursive: true })
+  const base = Date.now() - 3600_000
+  for (let index = 0; index < 4; index += 1) {
+    writeFolder(memoryDir, `mem-ledger-${index}`, { alpha: 0.5, keywords: ['账本'], createdAt: base + index, text: `LEDGER-${index}` })
+  }
+  const session = new FakeSession({ id: 'session-ledger-cap' })
+  const { ctx, capture } = makeContext(session)
+  const overrides = makeOverrides(memoryDir, {
+    recall: { ...makeOverrides(memoryDir).recall, fairness: { ledger: { maxEntries: 2, overflow: 'evict-lowest-alpha-last-seen' } } },
+  })
+  const plugin = new RofmPlugin(ctx, overrides)
+  plugin.start()
+  for (let round = 1; round <= 3; round += 1) {
+    plugin.onInboxInserted({ agent: { session }, message: userMessage(`u-ledger-${round}`, `账本 ${round} 继续`) })
+  }
+  const state = plugin.sessionState(session)
+  assert.ok(state.ledger.length <= 2, `ledger capped at 2 entries (got ${state.ledger.length})`)
+  assert.equal(
+    capture.logs.filter(([, message]) => message.includes('recall ledger overflow')).length,
+    1,
+    'the overflow is announced once, not per round',
+  )
+  const snapshot = JSON.parse(readFileSync(path.join(memoryDir, 'recall-state.json'), 'utf8'))
+  assert.ok(snapshot.ledger.length <= 2, 'the persisted ledger is capped too')
+}))
+
 // ---------------------------------------------------------------------------
 // restart determinism: 60 rounds with and without a plugin restart at round 20
 // ---------------------------------------------------------------------------

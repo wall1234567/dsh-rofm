@@ -132,6 +132,12 @@ function copyOptionalIndexFields(target, source) {
   if (ARCHIVE_SOURCES.includes(source.archivedFrom)) target.archivedFrom = source.archivedFrom
   if (EVENT_TIME_SOURCES.includes(source.eventTimeSource)) target.eventTimeSource = source.eventTimeSource
   if (typeof source.archivedByVersion === 'string' && source.archivedByVersion) target.archivedByVersion = source.archivedByVersion
+  // v1.4.0 commit idempotency key. Kept in the index so a retried commit can
+  // detect an already-written folder by reading index.json once, instead of
+  // scanning every <folder>/meta.json (O(N) disk reads per archive).
+  if (typeof source.idempotencyKey === 'string' && source.idempotencyKey && source.idempotencyKey.length <= 400) {
+    target.idempotencyKey = source.idempotencyKey
+  }
   if (Number.isFinite(source.eventStart)) target.eventStart = source.eventStart
   if (Number.isFinite(source.eventEnd)) target.eventEnd = source.eventEnd
   if (Number.isFinite(source.pendingSince)) target.pendingSince = source.pendingSince

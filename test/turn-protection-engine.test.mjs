@@ -12,7 +12,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { after, test } from 'node:test'
 import { commitCompression, eventTimeRangeOf, planCompression } from '../engine/compress.js'
-import { loadConfig, loadIndex, memoryPaths, readFolder, readStats } from '../engine/index.js'
+import { formatFolderId, loadConfig, loadIndex, memoryPaths, readFolder, readStats, writeIndex } from '../engine/index.js'
 
 const tempDirs = []
 function tempDir() {

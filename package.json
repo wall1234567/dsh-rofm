@@ -9,7 +9,8 @@
     "simulate": "node test/simulate.mjs",
     "selfcheck": "node tools/selfcheck.mjs",
     "cli": "node engine/cli.mjs --help",
-    "check": "node --test && node test/simulate.mjs && node tools/selfcheck.mjs && node engine/cli.mjs --help",
+    "check": "node --test && node test/simulate.mjs && node tools/selfcheck.mjs && node engine/cli.mjs --help && node tools/memory-audit.mjs --json && node tools/time-view.mjs --help",
+    "verify": "node tools/verify-1.4.0.mjs",
     "release": "node tools/release.mjs",
     "release:status": "node tools/release.mjs --resume --dry-run"
   },

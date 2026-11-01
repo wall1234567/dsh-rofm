@@ -12,6 +12,8 @@
 > **v1.2.0 的当前行为与验证数字以 §17 为准**（§1 的数字已同步到 v1.2.0）。
 > **v1.3.0 的跨平台验证与当前测试数字见 §19**；§1/§17/§18 的数字是 v1.2.x 的历史记录，
 > 不再代表当前版本（数字统一以 `npm test` 实测为准，不在文档里写死）。
+> **v1.4.0 的验证记录见 §20**：确定性召回/公平性、时间辅助、小窗口、数据时代、兼容与性能；
+> 该节数字为 2026-11-01 23:10 本机实测（并行收尾期可能漂移，最终门禁数字由 Lead 冻结）。
 
 ## 1. 自动化测试
 
@@ -935,4 +937,198 @@ macOS 专项处理：APFS 大小写不敏感由 **`realpath` 归一化**吸收�
 - macOS 上非 ASCII 文件名可能以 NFD 落盘（中文/重音字符）：插件按读到的真实路径工作，
   但跨平台手工拷贝/改名可能产生重复项；
 - 内存/磁盘性能与 locale 无关，但 CI runner 与真实 DSH 桌面环境的性能差异仍可能存在。
+
+## 20. v1.4.0 验证记录（2026-11-01）
+
+> **口径说明**：本节数字是 **2026-11-01 23:10（+08）本机实测**（Windows 11、Node v24.21.0、DSH 自带运行时）。
+> v1.4.0 仍在并行收尾（A/D/E 的最后测试会继续增加用例数），**最终门禁数字由 Lead 在发布前冻结**；
+> 若本节与最终 `npm test` 输出不一致，以最终运行输出为准（骨架与结论不变）。所有对真实 `memory/` 的操作
+> **只读**，写盘测试全部使用 `os.tmpdir()` 临时目录。
+>
+> 环境：`win32/x64`、`node v24.21.0`、仓库 `<home>\Desktop\dsh-rofm`；
+> 真实库 21 个 store / 3742 folders（legacy 593、synthetic 2780、current 369）。
+
+### 20.1 门禁命令与实测结果
+
+| 命令 | 结果 |
+|---|---|
+| `node --test`（全量） | **823 tests / 821 pass / 0 fail / 2 skip**（2 skip = 当前 Windows 用户无文件符号链接权限） |
+| `node --test test/*.test.mjs`（引擎） | 613 tests / 611 pass / 0 fail / 2 skip |
+| `node --test test-adapter/*.test.mjs`（适配层） | 209 tests / 209 pass / 0 fail |
+| `node test/simulate.mjs` | exit 0（`context added back 11.98 %`；legacy 路径，v1.3.0 回归口径） |
+| `node tools/selfcheck.mjs` | exit 0：检测到 QQ 插件 **10 passed / 1 warning / 0 failed**（11 条 check）；neutral profile **7 / 1 / 0**（8 条）；两种环境只有 compat 行不同 |
+| `node engine/cli.mjs --help` | exit 0 |
+| `node tools/memory-audit.mjs --json` | exit 0（真实库只读；四套口径见 §20.5） |
+| `node tools/time-view.mjs --help` | exit 0（只读时间视图） |
+| `node --test test/release.test.mjs test/config-consistency.test.mjs` | 30 / 30 pass（release 段存在性 + 配置/版本一致性） |
+
+v1.4.0 新增/扩展测试文件（当前用例数，`node --test <file>` 实测）：
+
+| 文件 | 用例 | 覆盖 |
+|---|---|---|
+| `test/recall-index.test.mjs` | 43 | σ、8 lane、寄存器 TTL、回收冷却、block 优先级裁剪/高α pin、G1–G5 属性、确定性重放、分页、重启续跑、序列化、性能 |
+| `test/time-index.test.mjs` | 64 | 时区/DST/闰年、日/月/年边界、跨日重叠、非法/未来/反向、最小 3 天/最大 366 天、阶梯、browse、旧数据回退、oracle fuzz、性能 |
+| `test/keyword-match.test.mjs` | 13 | 双向匹配无回归、phrase/title、可选扩展、确定性 |
+| `test/turn-protection-engine.test.mjs` | 18 | 当前回合保护/无切点拒绝、小窗口/窗口冲突、hard-limit、folder 上限、事件时间、commit 回滚/journal/幂等 |
+| `test/memory-audit.test.mjs` | 20 | 时代边界、四套口径、只读默认、`--apply` 作用域、真实库只读复现 |
+| `test/config-consistency.test.mjs` | 8 | `DEFAULT_CONFIG` == 随包 config == 文档关键值；两个 package 版本 == 1.4.0；CHANGELOG 段存在 |
+| `test-e2e`（`test/e2e-adapter-simulate.test.mjs`、`test/e2e-real-data-readonly.test.mjs`） | 14 | 720 消息长会话归档→评分→召回、重启恢复、v3 持久化、8k/16k 窗口、真实库三工具一致与零写入、旧 recall-state 可读 |
+
+### 20.2 公平性验证（G1/G2/G3/G4/G5）
+
+- **确定性重放**：`determinism: 100 replays are identical; selection calls neither Math.random nor Date.now`
+  通过——100 次重放 pick 序列完全一致；源码级断言 `engine/recall-index.js` 不含 `Math.random`，
+  `Date.now` 仅出现在缓存时间戳（`cache bookkeeping`）。
+- **高α首轮必现**：`G1: rare-word high-α target is surfaced in the same round (>=20 seeds, 100%)` 通过——
+  ≥20 个随机种子全部当轮命中；`G1: ordinary-word high-α target delay <= ceil(rank_H / k_H)` 通过；
+  adapter 级 `G1: high-α memory is injected in the first fair round in every trial` 通过。
+- **低α显式引用**：`G2: explicit reference of a low-α unique word surfaces in the same round (100% over seeds)` 通过；
+  `G2: low-α rotation covers L=100 candidates within ceil(L/r)=50 rounds` 通过；
+  `G2: a_low >= r marks degraded (sticky) and warns` 通过（配额不足可观测，不丢记忆）。
+- **不丢弃 / 不重复 / 不饥饿**：
+  `G3: ledger never loses ids over 1000 rounds and picks never collide`、
+  `G3: block trim evicts low α first (60 low + 10 high, trim 4 => 4 low)`、
+  `G4: 300 rounds, consecutive injections of the same id are >= cooldown apart`、
+  `G5: 3 higher-α arrivals per round do not delay a rare high-α target`、
+  `queryBoost`/`recycle`/`register 2-round TTL` 用例全部通过。
+- **重启续跑**：`restart: serialized lanes + rebuilt index reproduce 60/60 picks` 通过；
+  adapter 级 `60 rounds of picks are identical across a plugin restart (recall-state v3 round-trip)` 通过。
+- **block 高α占比**：v1.4.0 优先级裁剪保证“block 里同时有低α时绝不裁高α”（`G3` 用例断言），
+  设计阶段仿真（`<workspace>\output\rofm-recall-fairness\fairness-results.json`，非本轮重跑）给出的
+  FAIR-DRI block 高α占比为 **86–97%**，v1.3.0 legacy 约 **22%**；同一仿真里高α“被查询到即首轮可见”
+  FAIR-DRI **100%/100%**、legacy **13%/29%**、纯 DRI+sticky ledger **18–43%**（说明 sticky ledger
+  单独使用会把“block 被裁”变成永久遗忘，这正是 1.4.0 必须配查询重入/寄存器的原因）。
+- **遥测**：`fair recall writes lane telemetry and the adapter recall-block event` 通过（`lanesPicked`
+  七道齐全、`degraded`/`registerDrops` 可见）；`regression BUG-4: sum(lanesPicked) === picks.length` 通过。
+
+### 20.3 时间辅助验证
+
+- **63+ 用例全过**：`test/time-index.test.mjs` **64/64 pass**，覆盖：
+  `zonedDayStart: Asia/Shanghai midnights are 16:00Z`、`dayKey: the Shanghai day flips exactly at 16:00Z`；
+  DST `America/New_York` 春前/秋后日长 23h/25h、`addZonedDays` 跨 DST 保持 wall-clock；
+  闰年 `February 29 2028` 存在且跨过；`queryTimeIndex: interval-overlap boundaries are half-open`；
+  反向窗口/非法输入/未来钳制/最小 3 天/最大 366 天/阶梯 rung 全部包含 L0；
+  `normalizeTimeQuery: repeats deterministically with an explicit fake clock`（确定性）。
+- **旧数据回退**：`folderTimeRange: folders without event time fall back to [createdAt, createdAt+1)`、
+  `buildTimeIndex: legacy entries without event fields keep archivedAt ranges`、
+  `integration: real-shaped legacy folders (no event time) are fully queryable` 通过。
+  真实库 3742 个 folder **0 个有 event 字段**（计划书 §9.1：历史 0/4825 消息带 time），全部回退归档时间，
+  `tools/selfcheck.mjs` 的 `time index` 检查 PASS（6 store / 3742 folders / 50 条交叉核对、
+  `constrain` 过滤与朴素区间一致、`off/index` 永不改变召回）。
+- **时间索引纯内存**：无任何日期目录、无第二个落盘索引；`engine.load()`/查询只从 `index.folders` 派生。
+- **真实数据 0 event 字段**：见上；新归档才有 `messages` 事件时间（`test/turn-protection-engine.test.mjs`
+  的 `event time: folder meta carries eventStart/eventEnd/eventTimeSource` 通过）。
+- **边界口径**：`time.mode='off'` 忽略时间参数 + warning；`'index'` 归一化但不过滤（`enforced=false`）；
+  `'constrain'` 过滤；显式双端点 = 硬窗口不放宽、单日/月/年 = 软窗口走阶梯
+  （`normalizeTimeQuery`/`timeFallbackLadder` 用例与 `time.mode=constrain: direct hit, ladder widening and
+  missType="time"` adapter 用例通过）。
+
+### 20.4 小窗口 / 硬停止 / 回合保护验证
+
+- **8k/16k 不自毁**：`test/e2e-adapter-simulate.test.mjs` 的两条用例通过——
+  `8k window: default (allowSmallWindow=false) refuses automatic archiving and builds no backlog`、
+  `16k window: default refuses archiving, opt-in archives (guard is the gate, not the trigger)`；
+  引擎侧 `small-window sanity: 8k window is refused by default, allowed with the explicit opt-in, 20k is the
+  boundary` 通过；`a contextWindowTokens that disagrees with the host window by 4x counts as a conflict`、
+  `a measurement above 500% of the window (fake meter) is refused unless allowSmallWindow` 通过。
+- **hardLimit 硬停止**：`hardLimitPercent becomes a hard stop after consecutive failed compressions` 通过；
+  `hardLimitStop=false keeps the v1.3.0 diagnostics (WARN once, no stop)` 通过。
+- **当前回合保护**：`turn protection: without protectSeq the same shape would archive the current question
+  (the guard matters)`、`no legal cut point before the current turn → refuse, warn, write no folder`、
+  `fail-safe: no legal user boundary at all → refuse instead of an arbitrary cut` 通过
+  （P0-3 的“随便切一刀”已删除）。
+- **commit 事务/回滚/幂等**：`commit transaction: a failure on the 2nd folder rolls back every folder,
+  keeps the index byte-identical and drops the journal`、`the journal is removed after a successful commit`、
+  `commit idempotency: the same (sessionId,turn,seqStart,seqEnd,contentHash) never duplicates folders, even
+  with a new now` 通过（journal 只清理 `.commit-*.json`，绝不删 folder）。
+- **单步上限/事件时间**：folder cap 与 `eventTimeRangeOf` 用例通过（`maxFoldersCapped` 可观测）。
+
+### 20.5 数据时代 / 遗留数据验证（口径 A–D）
+
+`node tools/memory-audit.mjs --json`（真实库只读，2026-11-01 23:10）实测：
+
+```json
+{ "totals": { "folders": 3742, "scored": 973, "pending": 2769, "pendingPercent": 74, "currentPendingPercent": 0.54 },
+  "buckets": {
+    "legacy":    { "folders": 593,  "scored": 6,   "pending": 587 },
+    "synthetic": { "folders": 2780, "scored": 600, "pending": 2180 },
+    "current":   { "folders": 369,  "scored": 367, "pending": 2 } },
+  "calibers": {
+    "A": { "folders": 3742, "pending": 2769, "pendingPercent": 74 },
+    "B": { "folders": 3149, "pending": 2182, "pendingPercent": 69.29 },
+    "C": { "folders": 369,  "pending": 2,    "pendingPercent": 0.54 },
+    "D": { "folders": 359,  "pending": 0,    "pendingPercent": 0,
+           "sessions": ["session-b5eeee7e-009b-4f60-b4ff-0e7c5ac1617f"] } } }
+```
+
+- **口径 A 全库存量 = 2769/3742 = 74.0%**（只描述历史现状，不是当前机制质量）；
+- **口径 B 排除 pre-1.2.0 遗留 = 2182/3149 = 69.3%**；
+- **口径 C 当前真实待评分 = 2/369 = 0.54%**（scored 367/369 = 99.46%；2 条来自 QQ 通道 qqb-g）；
+- **口径 D 1.3.0 后正常会话 = b5eeee7e 0/359 = 0%**；
+- `legacy 587 + synthetic 2180` **只标记、不回补**（`--apply` 只写 `pendingEra`）。
+
+测试证据：
+- `test/memory-audit.test.mjs` 20/20 pass，含 `era: the documented boundaries and thresholds are exact`、
+  `auditMemory buckets by folder era and reproduces calibers A-D`、`default run writes nothing (mtime+bytes unchanged)`、
+  `--apply only adds pendingEra to index.json (meta/scored/createdAt untouched)`、
+  `real memory/ is only read and reproduces the documented data-era split`；
+- `test/e2e-real-data-readonly.test.mjs`：`memory-audit --json reports the documented era buckets on the real store`、
+  `selfcheck --json agrees with memory-audit and reports 0 failed checks`、
+  `recall-report --json agrees with both tools (74.00% all-stock / 0.54% current / 0/359 normal)`、
+  `running memory-audit / selfcheck / recall-report never modifies real memory/sessions` 全部通过；
+- `tools/selfcheck.mjs` 的 `pending era` 检查 PASS，输出
+  `legacy pending 587 + synthetic pending 2180 (pre-1.4.0 residue, not re-judged); current pending 2/369 = 0.54%`；
+- `test-adapter/scoring-pressure.test.mjs`：任务区块只列 current、synthetic/legacy 不进列表、
+  预算与背压/heuristic 兜底用例全部通过。
+
+### 20.6 兼容与回滚验证
+
+- **旧数据可读**：`test/engine.test.mjs` 与 store/index 往返用例通过——旧 `index.json`
+  （version 1 无新字段）读→写→读不丢字段（新字段有值才写、旧条目缺省按默认推断）；
+  旧 `recall-state.json` v2/v1 读路径由 adapter 用例覆盖：
+  `a v2 recall-state migrates to v3 without losing the restored block`、
+  `a v2 file with no valid addition falls back to the v1 ids path`、
+  `the 1.3.0 recall-state.json snapshot is still restorable through the v2 read path`、
+  `malformed v3 fields degrade individually (no throw, block kept)`、
+  `a changed configFingerprint resets the lane cursors but keeps block and ledger`；
+- **旧 config 缺新键**：`loadConfig()` 对缺键全部走默认（`test/engine.test.mjs` 兼容用例；
+  `test/config-consistency.test.mjs` 断言随包配置加载 `warnings: []`）；
+- **legacy 一键回滚**：`legacy mode is a byte-compatible rollback: no lanes/round passed, engine mode legacy`
+  通过；`node test/simulate.mjs`（legacy 引擎路径）exit 0；
+- **`time.mode='off'` 零行为**：`queryTimeIndex: time.mode off/index leaves recall unconstrained`、
+  `timeFallbackLadder: mode off/index returns only the original window` 通过；
+- **性能/跨平台**：v1.3.0 的 portability / compat 测试保持全绿（本机 613 引擎 + 209 适配层用例含既有全部回归）。
+
+### 20.7 性能实测（本轮，真实数据/合成数据）
+
+| 项目 | 实测 | 门槛 |
+|---|---|---|
+| `buildTimeIndex` 真实 2780 folders（session-a46df597，冷构建：新进程 + 读配置/索引 + 首次建索引，含 `Intl` 预热） | **6.49–9.58 ms**（3 次新进程实测，Lead 记录约 5.8ms 量级） | 设计 1.5–2.8ms@2780 是**热构建**口径 |
+| `buildTimeIndex` 真实 2780 folders（同进程热构建 best of 5） | **1.88 ms** | 设计 1.5–2.8ms@2780；N=10⁴ 目标 ≤20ms |
+| `buildTimeIndex` 合成 N=10⁴（测试） | 47.0 ms（放宽预算 200ms） | 目标 <60ms，CI 放宽 200ms |
+| 3 日查询（N=10⁴，测试） | 0.013 ms/次 | 目标 <5ms，CI 放宽 50ms |
+| `buildRecallIndex` 真实 2780 folders | **2.21 ms**（best of 5） | 目标 N=10⁴ <60ms（CI 放宽 200ms） |
+| `selectRecall` 真实 2780 folders（3 查询 × 20 轮） | 最差 **2.79 ms** | 目标 N=10⁴ 单次 <5ms（CI 放宽 50ms） |
+| `buildRecallIndex` 合成 N=10⁴（测试） | 32.2 ms（worstSelect 0.3ms / pops 25） | 放宽预算 200ms / 50ms |
+| v1.3.0 legacy `recall` 1000 folders（既有测试） | 冷启动 <50ms / 热路径 <20ms | 保持 |
+
+> 真实数据测量命令（只读）：`readIndex('memory/sessions/session-a46df597-…')` +
+> `buildTimeIndex()` / `buildRecallIndex()` / `selectRecall()` 各跑 5 次取最优；
+> 见 `<workspace>\output` 会话记录或按 README §7 的只读命令复现。
+
+### 20.8 残余风险与未覆盖项（诚实说明）
+
+- **QQ 真机通道本轮未重新端到端复测**：1.4.0 的 compat 用例与 v1.3.0 保持一致且全绿，但
+  onebot / Derpyu 的真机回合（含群成员门控 + 图片归档）沿用 v1.3.0 的验证结论（§19）；
+- **e2e 长会话是 fake host 模拟**（`test/e2e-adapter-simulate.test.mjs`，720 消息上跑真实 adapter 路径），
+  不是真人 700 turn 会话；真实宿主时序差异仍可能暴露未模拟的边界；
+- **公平性仿真的 legacy/DRI 对比数字来自设计阶段工件**（`<workspace>\output\rofm-recall-fairness`），
+  不是 1.4.0 发布前在本机重跑的；本机验证的是公平性**性质**（G1–G5 用例）与遥测；
+- **时间数据**：旧库 0 个 event 字段，1.4.0 之前的历史记忆按“归档时刻”近似事件时间；
+  新归档开始才有真实事件区间（本机现有会话尚未产生 1.4.0 归档样本）；
+- **CLI 没有 turn 语义**：`engine/cli.mjs` 不暴露 `protectSeq`（文档已写明）；
+  `compress --allow-small-window` 只是逐 plan 覆盖，不改变产品默认；
+- **Linux/macOS**：仍以 CI 三平台矩阵为准（本机无真机，同 §19.4）；
+- **并行收尾期的数字**：本节用例数为 2026-11-01 23:10 实测；发布门禁以 Lead 冻结的最终
+  `node --test` 输出为准（0 fail 不变）。
 

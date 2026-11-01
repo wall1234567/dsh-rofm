@@ -1278,3 +1278,32 @@ test('era: summarizeEras reproduces the documented 74.0% / 0.54% buckets', () =>
   assert.equal(Math.round(((all.pending.legacy + all.pending.current + all.pending.synthetic) / all.total) * 1000) / 10, 74)
   assert.equal(all.scored.legacy + all.scored.synthetic + all.scored.current, 973)
 })
+
+test('store: v1.4.0 commit idempotency key round-trips through the index', () => {
+  const cfg = loadConfig()
+  const dir = tempDir()
+  ensureMemoryDir(dir)
+  const id = formatFolderId(1700000000000, 9)
+  // A key written into meta.json is copied to the index entry (v1.4.0 P1-4):
+  // a retried commit can then detect the visited folder with a single index read
+  // instead of scanning every <folder>/meta.json.
+  const entry = indexEntryFromMeta({
+    id,
+    createdAt: 5,
+    alpha: 0.4,
+    idempotencyKey: 'sess-1:7:10:20:abc123',
+  })
+  assert.equal(entry.idempotencyKey, 'sess-1:7:10:20:abc123')
+  writeIndex(dir, cfg, { version: 1, nextCounter: 2, folders: [entry] })
+  assert.equal(readIndex(dir, cfg).folders[0].idempotencyKey, 'sess-1:7:10:20:abc123')
+  writeFolder(dir, { id, meta: { createdAt: 5, alpha: 0.4, idempotencyKey: 'sess-1:7:10:20:abc123' }, messages: [] })
+  fs.rmSync(path.join(dir, 'index.json'), { force: true })
+  assert.equal(loadIndex(dir, cfg).folders[0].idempotencyKey, 'sess-1:7:10:20:abc123')
+  // garbage / oversized keys are dropped instead of poisoning the index
+  assert.equal('idempotencyKey' in indexEntryFromMeta({ id, alpha: 0.5, idempotencyKey: 42 }), false)
+  assert.equal('idempotencyKey' in indexEntryFromMeta({ id, alpha: 0.5, idempotencyKey: '' }), false)
+  assert.equal('idempotencyKey' in indexEntryFromMeta({ id, alpha: 0.5, idempotencyKey: 'x'.repeat(401) }), false)
+  // old index entries without the field stay untouched (v1.3.0 shape)
+  const plain = indexEntryFromMeta({ id, createdAt: 1, alpha: 0.5 })
+  assert.equal('idempotencyKey' in plain, false)
+})

@@ -3,7 +3,7 @@
   "enabled": true,
   "compress": {
     "enabled": true,
-    "triggerPercent": 80,
+    "triggerPercent": 60,
     "compressPercent": 20,
     "contextWindowTokens": 0,
     "minContextTokens": 512,

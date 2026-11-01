@@ -99,6 +99,22 @@ export const DEFAULT_CONFIG = {
     // back to the previous boundary (remove less), so one archival cannot
     // accidentally delete half of the context.
     maxBoundaryOvershoot: 1.25,
+    // --- v1.4.0 robustness (docs/SPEC.md §5) ---
+    // Never remove the current turn's user message (or its tool pairs): a
+    // mid-turn archival that hides the question being answered is a P0 defect.
+    // When no legal cut point exists the archival is refused instead.
+    protectCurrentTurn: true,
+    // Refuse automatic archiving on a tiny context window unless the operator
+    // explicitly opts in (`allowSmallWindow: true`); small windows self-amplify.
+    allowSmallWindow: false,
+    // A window below this token count counts as "small" (v1.4.0 sanity check).
+    smallWindowTokens: 20000,
+    // Reaching compress.hardLimitPercent (adapter) stops archiving instead of
+    // retrying every model step (the retry loop used to grow the context).
+    hardLimitStop: true,
+    // Safety cap for one archival step (folders); combined with the amount the
+    // remaining window can actually release.
+    maxFoldersPerStep: 500,
   },
   importance: {
     min: 0.01, // α lower bound
@@ -122,13 +138,95 @@ export const DEFAULT_CONFIG = {
   },
   recall: {
     enabled: true,
-    firstGenMax: 10, // gen-1 folders added back (successes), <= 10
+    // v1.4.0 recall selector (docs/SPEC.md §6):
+    //   'fair'          — FAIR-DRI: rare-term lane + high-α σ lane + register +
+    //                     low-α probe/rotation + recycle (deterministic, default)
+    //   'deterministic' — plain DRI + sticky ledger + priority block trim
+    //                     (research / rollback control, no fair lanes)
+    //   'legacy'        — v1.3.0 probability path (random rolls), kept for rollback
+    mode: 'fair',
+    firstGenMax: 10, // k: quota of folders added back per round (v1.3.0 value)
+    hops: 0, // optional generation expansion rounds (0 = first generation only)
+    maxRecalledBlocks: 64, // hard cap of the injected recall block
+    maxRecalledChars: 120000, // hard cap of the injected recall block (chars)
+    // The injected block is also capped at this share of the context window.
+    maxWindowPercent: 10,
+    // Optional α floor applied at query time (compat.memberMinAlpha overrides it
+    // for QQ channel sessions). 0 = no gate.
+    minAlpha: 0,
+    persistInjected: true,
+    sort: 'createdAt', // rendering order only (createdAt | alpha | generation)
+    // --- legacy probability path only (mode === 'legacy') ------------------
     mu: 5, // p(n) = (1-erf((n-μ)/(σ√2))) / (1-erf((1-μ)/(σ√2)))
     sigma: 3,
     maxGeneration: 0, // 0 = unlimited
     probabilityScale: 1, // multiplier applied to every probability
     seed: 0, // 0 = non-deterministic; >0 = seeded PRNG (tests)
-    sort: 'createdAt', // order of recalled context in the prompt
+    // --- fairness lanes (mode === 'fair', docs/SPEC.md §6.2) ----------------
+    fairness: {
+      // α at or above this is "high importance" (protected by the high lanes).
+      thetaHigh: 0.6,
+      // Share of k reserved for the low-α rotation lane: r = round(k*ratio).
+      exploreRatio: 0.2,
+      // Slots of the rare-term probe lane (an explicitly referenced low-α
+      // folder is injected in the same round).
+      specificProbeSlots: 1,
+      // "Rare" keyword: posting length <= τ with τ = max(minPosting, ceil(ratio*N)).
+      rareTerm: { ratio: 0.002, minPosting: 8, scanCap: 512 },
+      // Deferred high-α register: lookahead × k_H candidates are remembered,
+      // capped at capFactor × k_H, delivered within ttlRounds rounds.
+      register: { lookahead: 3, capFactor: 8, ttlRounds: 2 },
+      // Re-inject a high-α folder that was trimmed out of the block when the
+      // current query matches it again.
+      queryBoost: true,
+      // Cooldown before a trimmed/expired folder may be injected again.
+      recycle: { enabled: true, cooldownRounds: 15, maxPerRound: 1 },
+      // Ever-surfaced ledger (monotonic; only overflow evicts, lowest α first).
+      ledger: { maxEntries: 10000, overflow: 'evict-lowest-alpha-last-seen' },
+      // Priority block trim (replaces the v1.3.0 createdAt/FIFO trim).
+      blockTrim: { policy: 'priority', protectCurrentQuery: true, pinHigh: true },
+      // Per-round character budget for one recall round.
+      roundBudget: { maxChars: 20000 },
+    },
+  },
+  // v1.4.0 time assistance (docs/SPEC.md §6.8). The index is strictly in-memory
+  // (derived from index.folders, never written back); `createdAt` stays the
+  // archival time, event times live in optional eventStart/eventEnd fields.
+  time: {
+    // 'off' = no event-time collection, no index, memory_recall ignores time args
+    // 'index' = build the in-memory index but never constrain (engine default)
+    // 'constrain' = full time-constrained recall (packaged config default)
+    mode: 'index',
+    // IANA zone used for day/month/year boundaries; '' = host local time.
+    timezone: '',
+    minRangeDays: 3, // a shorter explicit range is widened to this many days
+    maxRangeDays: 366, // a longer range is truncated
+    centerDayPriority: true, // a single-day query prefers the centre day (L0) first
+    fallback: ['day3', 'month', 'year', 'all'], // widening ladder
+    fallbackMinResults: 1, // widen while the filtered candidate set is smaller
+    windowScanMax: 4096, // max buckets scanned for one query
+    askUserHint: true, // tell the model it may ask the user for a time
+    judgeEventTime: false, // 1.4.0: the scoring model cannot override event time
+  },
+  // v1.4.0 scoring pipeline (docs/SPEC.md §4).
+  scoring: {
+    includeLegacy: false, // pre-1.2.0 / synthetic pending never enters the task list
+    maxPending: 200, // backpressure threshold before an archive
+    // 'never' | 'onPressure' | 'always' — heuristic scoring fallback policy.
+    fallback: 'onPressure',
+    // Rounds a scored-by-model promise may stay pending before the heuristic
+    // fallback kicks in (plain sessions vs channel sessions).
+    autoHeuristicAfterRounds: { plain: 4, channel: 2 },
+    taskBudgetPercent: 15, // the memory task block is <= this share of the window
+    taskMaxTokens: 12000, // ... and <= this many tokens
+    order: 'newest', // 'newest' | 'mixed' | 'oldest' (pending task ordering)
+    warnUniformAlpha: true, // warn on uniform α/β batches (quality telemetry)
+    maxItemsPerJudge: 100, // memory_judge updates batch cap
+  },
+  // v1.4.0 keyword matching (docs/SPEC.md §6.6); both default off (no regression).
+  match: {
+    expandLatinCase: false, // also match differently-cased Latin words
+    cjkBigram: false, // also match CJK bigrams of multi-char keywords
   },
   storage: {
     dir: 'memory', // relative to the plugin root
@@ -207,6 +305,56 @@ function stringArrayField(warnings, label, value, fallback) {
 }
 
 /**
+ * Array of strings restricted to `allowed`; unknown entries are dropped (with a
+ * warning) so a hand-edited config cannot silently disable the whole feature.
+ */
+function enumArrayField(warnings, label, value, allowed, fallback) {
+  if (!Array.isArray(value) || !value.every((v) => typeof v === 'string')) {
+    return replaceValue(warnings, label, value, fallback, `array of ${allowed.map((v) => fmt(v)).join('|')}`)
+  }
+  const kept = []
+  for (const item of value) {
+    if (allowed.includes(item)) {
+      if (!kept.includes(item)) kept.push(item)
+    } else {
+      warnings.push(`${label}: unknown value ${fmt(item)} ignored (allowed: ${allowed.join(', ')})`)
+    }
+  }
+  return kept.length > 0 ? kept : fallback.slice()
+}
+
+/**
+ * An IANA time zone name (or '' = host local). Validated through Intl instead of
+ * a hard-coded list so every zone the runtime knows about is accepted.
+ */
+function timezoneField(warnings, label, value, fallback) {
+  if (typeof value !== 'string') return replaceValue(warnings, label, value, fallback, "IANA time zone name or ''")
+  const zone = value.trim()
+  if (zone === '') return ''
+  try {
+    // Throws RangeError for an unknown zone.
+    new Intl.DateTimeFormat('en-US', { timeZone: zone })
+    return zone
+  } catch {
+    return replaceValue(warnings, label, value, fallback, "a valid IANA time zone name or ''")
+  }
+}
+
+/** Validate one flat object of numeric knobs (helper for v1.4.0 sub-blocks). */
+function numberBlock(warnings, label, value, defaults, specs) {
+  const source = isPlainObject(value) ? value : null
+  if (!source) {
+    warnings.push(`${label}: expected an object; using defaults`)
+    return cloneConfig(defaults)
+  }
+  const out = { ...source }
+  for (const [key, spec] of Object.entries(specs)) {
+    out[key] = numberField(warnings, `${label}.${key}`, source[key], defaults[key], spec)
+  }
+  return out
+}
+
+/**
  * Assign an own data property. A plain `target[key] = value` for a JSON key
  * named `__proto__` would invoke Object.prototype's setter and replace the
  * object prototype instead of storing the key (prototype pollution); unknown
@@ -269,7 +417,7 @@ export function mergeConfig(base, patch) {
 export function validateConfig(input) {
   const warnings = []
   const cfg = deepMerge(cloneConfig(DEFAULT_CONFIG), isPlainObject(input) ? input : {})
-  for (const group of ['compress', 'importance', 'keywords', 'recall', 'storage', 'external', 'debug']) {
+  for (const group of ['compress', 'importance', 'keywords', 'recall', 'time', 'scoring', 'match', 'storage', 'external', 'debug']) {
     if (!isPlainObject(cfg[group])) {
       warnings.push(`${group}: expected an object; using defaults`)
       cfg[group] = cloneConfig(DEFAULT_CONFIG[group])
@@ -298,6 +446,12 @@ export function validateConfig(input) {
   c.maxFoldersPerRun = numberField(warnings, 'compress.maxFoldersPerRun', c.maxFoldersPerRun, DEFAULT_CONFIG.compress.maxFoldersPerRun, { min: 1, integer: true })
   c.keepRecentMessages = numberField(warnings, 'compress.keepRecentMessages', c.keepRecentMessages, DEFAULT_CONFIG.compress.keepRecentMessages, { min: 0, integer: true })
   c.maxBoundaryOvershoot = numberField(warnings, 'compress.maxBoundaryOvershoot', c.maxBoundaryOvershoot, DEFAULT_CONFIG.compress.maxBoundaryOvershoot, { min: 1, max: 10 })
+  // v1.4.0 robustness knobs.
+  c.protectCurrentTurn = booleanField(warnings, 'compress.protectCurrentTurn', c.protectCurrentTurn, DEFAULT_CONFIG.compress.protectCurrentTurn)
+  c.allowSmallWindow = booleanField(warnings, 'compress.allowSmallWindow', c.allowSmallWindow, DEFAULT_CONFIG.compress.allowSmallWindow)
+  c.smallWindowTokens = numberField(warnings, 'compress.smallWindowTokens', c.smallWindowTokens, DEFAULT_CONFIG.compress.smallWindowTokens, { min: 0, integer: true })
+  c.hardLimitStop = booleanField(warnings, 'compress.hardLimitStop', c.hardLimitStop, DEFAULT_CONFIG.compress.hardLimitStop)
+  c.maxFoldersPerStep = numberField(warnings, 'compress.maxFoldersPerStep', c.maxFoldersPerStep, DEFAULT_CONFIG.compress.maxFoldersPerStep, { min: 1, integer: true })
 
   // --- importance ---------------------------------------------------------
   imp.min = numberField(warnings, 'importance.min', imp.min, DEFAULT_CONFIG.importance.min, { min: 0.01, max: 1 })
@@ -342,6 +496,101 @@ export function validateConfig(input) {
   rec.probabilityScale = numberField(warnings, 'recall.probabilityScale', rec.probabilityScale, DEFAULT_CONFIG.recall.probabilityScale, { min: 0 })
   rec.seed = numberField(warnings, 'recall.seed', rec.seed, DEFAULT_CONFIG.recall.seed, { min: 0, max: MAX_UINT32, integer: true })
   rec.sort = enumField(warnings, 'recall.sort', rec.sort, ['createdAt', 'alpha', 'generation'], DEFAULT_CONFIG.recall.sort)
+  // --- recall v1.4.0 ------------------------------------------------------
+  rec.mode = enumField(warnings, 'recall.mode', rec.mode, ['fair', 'deterministic', 'legacy'], DEFAULT_CONFIG.recall.mode)
+  rec.hops = numberField(warnings, 'recall.hops', rec.hops, DEFAULT_CONFIG.recall.hops, { min: 0, max: 8, integer: true })
+  rec.maxRecalledBlocks = numberField(warnings, 'recall.maxRecalledBlocks', rec.maxRecalledBlocks, DEFAULT_CONFIG.recall.maxRecalledBlocks, { min: 0, integer: true })
+  rec.maxRecalledChars = numberField(warnings, 'recall.maxRecalledChars', rec.maxRecalledChars, DEFAULT_CONFIG.recall.maxRecalledChars, { min: 0, integer: true })
+  rec.maxWindowPercent = percentField(warnings, 'recall.maxWindowPercent', rec.maxWindowPercent, DEFAULT_CONFIG.recall.maxWindowPercent)
+  rec.minAlpha = numberField(warnings, 'recall.minAlpha', rec.minAlpha, DEFAULT_CONFIG.recall.minAlpha, { min: 0, max: 1 })
+  rec.persistInjected = booleanField(warnings, 'recall.persistInjected', rec.persistInjected, DEFAULT_CONFIG.recall.persistInjected)
+  const fair = rec.fairness
+  const fairDefaults = DEFAULT_CONFIG.recall.fairness
+  if (!isPlainObject(fair)) {
+    warnings.push('recall.fairness: expected an object; using defaults')
+    rec.fairness = cloneConfig(fairDefaults)
+  } else {
+    fair.thetaHigh = numberField(warnings, 'recall.fairness.thetaHigh', fair.thetaHigh, fairDefaults.thetaHigh, { min: 0, max: 1 })
+    fair.exploreRatio = numberField(warnings, 'recall.fairness.exploreRatio', fair.exploreRatio, fairDefaults.exploreRatio, { min: 0, max: 1 })
+    fair.specificProbeSlots = numberField(warnings, 'recall.fairness.specificProbeSlots', fair.specificProbeSlots, fairDefaults.specificProbeSlots, { min: 0, max: 8, integer: true })
+    fair.rareTerm = numberBlock(warnings, 'recall.fairness.rareTerm', fair.rareTerm, fairDefaults.rareTerm, {
+      ratio: { gt: 0, max: 1 },
+      minPosting: { min: 1, integer: true },
+      scanCap: { min: 1, integer: true },
+    })
+    fair.register = numberBlock(warnings, 'recall.fairness.register', fair.register, fairDefaults.register, {
+      lookahead: { min: 1, integer: true },
+      capFactor: { min: 1, integer: true },
+      ttlRounds: { min: 1, integer: true },
+    })
+    fair.queryBoost = booleanField(warnings, 'recall.fairness.queryBoost', fair.queryBoost, fairDefaults.queryBoost)
+    if (!isPlainObject(fair.recycle)) {
+      warnings.push('recall.fairness.recycle: expected an object; using defaults')
+      fair.recycle = cloneConfig(fairDefaults.recycle)
+    } else {
+      fair.recycle.enabled = booleanField(warnings, 'recall.fairness.recycle.enabled', fair.recycle.enabled, fairDefaults.recycle.enabled)
+      fair.recycle.cooldownRounds = numberField(warnings, 'recall.fairness.recycle.cooldownRounds', fair.recycle.cooldownRounds, fairDefaults.recycle.cooldownRounds, { min: 0, max: 100000, integer: true })
+      fair.recycle.maxPerRound = numberField(warnings, 'recall.fairness.recycle.maxPerRound', fair.recycle.maxPerRound, fairDefaults.recycle.maxPerRound, { min: 0, max: 8, integer: true })
+    }
+    if (!isPlainObject(fair.ledger)) {
+      warnings.push('recall.fairness.ledger: expected an object; using defaults')
+      fair.ledger = cloneConfig(fairDefaults.ledger)
+    } else {
+      fair.ledger.maxEntries = numberField(warnings, 'recall.fairness.ledger.maxEntries', fair.ledger.maxEntries, fairDefaults.ledger.maxEntries, { min: 1, integer: true })
+      fair.ledger.overflow = enumField(warnings, 'recall.fairness.ledger.overflow', fair.ledger.overflow, ['evict-lowest-alpha-last-seen'], fairDefaults.ledger.overflow)
+    }
+    if (!isPlainObject(fair.blockTrim)) {
+      warnings.push('recall.fairness.blockTrim: expected an object; using defaults')
+      fair.blockTrim = cloneConfig(fairDefaults.blockTrim)
+    } else {
+      fair.blockTrim.policy = enumField(warnings, 'recall.fairness.blockTrim.policy', fair.blockTrim.policy, ['priority', 'fifo'], fairDefaults.blockTrim.policy)
+      fair.blockTrim.protectCurrentQuery = booleanField(warnings, 'recall.fairness.blockTrim.protectCurrentQuery', fair.blockTrim.protectCurrentQuery, fairDefaults.blockTrim.protectCurrentQuery)
+      fair.blockTrim.pinHigh = booleanField(warnings, 'recall.fairness.blockTrim.pinHigh', fair.blockTrim.pinHigh, fairDefaults.blockTrim.pinHigh)
+    }
+    fair.roundBudget = numberBlock(warnings, 'recall.fairness.roundBudget', fair.roundBudget, fairDefaults.roundBudget, {
+      maxChars: { min: 0, integer: true },
+    })
+  }
+
+  // --- time (v1.4.0) ------------------------------------------------------
+  const tm = cfg.time
+  const tmDefaults = DEFAULT_CONFIG.time
+  tm.mode = enumField(warnings, 'time.mode', tm.mode, ['off', 'index', 'constrain'], tmDefaults.mode)
+  tm.timezone = timezoneField(warnings, 'time.timezone', tm.timezone, tmDefaults.timezone)
+  tm.minRangeDays = numberField(warnings, 'time.minRangeDays', tm.minRangeDays, tmDefaults.minRangeDays, { min: 1, integer: true })
+  tm.maxRangeDays = numberField(warnings, 'time.maxRangeDays', tm.maxRangeDays, tmDefaults.maxRangeDays, { min: 1, integer: true })
+  if (tm.maxRangeDays < tm.minRangeDays) {
+    warnings.push(`time.maxRangeDays: must be >= time.minRangeDays (${tm.minRangeDays}); raised to ${tm.minRangeDays}`)
+    tm.maxRangeDays = tm.minRangeDays
+  }
+  tm.centerDayPriority = booleanField(warnings, 'time.centerDayPriority', tm.centerDayPriority, tmDefaults.centerDayPriority)
+  tm.fallback = enumArrayField(warnings, 'time.fallback', tm.fallback, ['day3', 'month', 'year', 'all'], tmDefaults.fallback)
+  tm.fallbackMinResults = numberField(warnings, 'time.fallbackMinResults', tm.fallbackMinResults, tmDefaults.fallbackMinResults, { min: 0, integer: true })
+  tm.windowScanMax = numberField(warnings, 'time.windowScanMax', tm.windowScanMax, tmDefaults.windowScanMax, { min: 1, integer: true })
+  tm.askUserHint = booleanField(warnings, 'time.askUserHint', tm.askUserHint, tmDefaults.askUserHint)
+  tm.judgeEventTime = booleanField(warnings, 'time.judgeEventTime', tm.judgeEventTime, tmDefaults.judgeEventTime)
+
+  // --- scoring (v1.4.0) ---------------------------------------------------
+  const sc = cfg.scoring
+  const scDefaults = DEFAULT_CONFIG.scoring
+  sc.includeLegacy = booleanField(warnings, 'scoring.includeLegacy', sc.includeLegacy, scDefaults.includeLegacy)
+  sc.maxPending = numberField(warnings, 'scoring.maxPending', sc.maxPending, scDefaults.maxPending, { min: 0, integer: true })
+  sc.fallback = enumField(warnings, 'scoring.fallback', sc.fallback, ['never', 'onPressure', 'always'], scDefaults.fallback)
+  sc.autoHeuristicAfterRounds = numberBlock(warnings, 'scoring.autoHeuristicAfterRounds', sc.autoHeuristicAfterRounds, scDefaults.autoHeuristicAfterRounds, {
+    plain: { min: 0, integer: true },
+    channel: { min: 0, integer: true },
+  })
+  sc.taskBudgetPercent = percentField(warnings, 'scoring.taskBudgetPercent', sc.taskBudgetPercent, scDefaults.taskBudgetPercent)
+  sc.taskMaxTokens = numberField(warnings, 'scoring.taskMaxTokens', sc.taskMaxTokens, scDefaults.taskMaxTokens, { min: 0, integer: true })
+  sc.order = enumField(warnings, 'scoring.order', sc.order, ['newest', 'mixed', 'oldest'], scDefaults.order)
+  sc.warnUniformAlpha = booleanField(warnings, 'scoring.warnUniformAlpha', sc.warnUniformAlpha, scDefaults.warnUniformAlpha)
+  sc.maxItemsPerJudge = numberField(warnings, 'scoring.maxItemsPerJudge', sc.maxItemsPerJudge, scDefaults.maxItemsPerJudge, { min: 1, max: 1000, integer: true })
+
+  // --- match (v1.4.0) -----------------------------------------------------
+  const mt = cfg.match
+  const mtDefaults = DEFAULT_CONFIG.match
+  mt.expandLatinCase = booleanField(warnings, 'match.expandLatinCase', mt.expandLatinCase, mtDefaults.expandLatinCase)
+  mt.cjkBigram = booleanField(warnings, 'match.cjkBigram', mt.cjkBigram, mtDefaults.cjkBigram)
 
   // --- storage ------------------------------------------------------------
   st.dir = nonEmptyStringField(warnings, 'storage.dir', st.dir, DEFAULT_CONFIG.storage.dir)

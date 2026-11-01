@@ -47,6 +47,15 @@ import {
   folderExists,
   indexEntryFromMeta,
   planCompression,
+  // v1.4.0
+  PENDING_ERAS,
+  SCORE_MODES,
+  ARCHIVE_SOURCES,
+  EVENT_TIME_SOURCES,
+  beginCommitJournal,
+  cleanupCommitJournals,
+  finishCommitJournal,
+  removeFolder,
 } from '../engine/index.js'
 
 const tempDirs = []
@@ -834,4 +843,312 @@ test('store: index drops "." / ".." / path-like folder ids that can never be loa
     ['ok-id'],
     'on-disk index never advertises unsafe ids',
   )
+})
+
+// ---------------------------------------------------------------------------
+// config: v1.4.0 schema
+// ---------------------------------------------------------------------------
+
+test('config: v1.4.0 defaults — recall fair lanes, time, scoring, match, compress guard', () => {
+  const cfg = loadConfig()
+  // deterministic recall is the default; legacy stays a rollback switch
+  assert.equal(cfg.recall.mode, 'fair')
+  assert.equal(cfg.recall.fairness.thetaHigh, 0.6)
+  assert.equal(cfg.recall.fairness.exploreRatio, 0.2)
+  assert.equal(cfg.recall.fairness.specificProbeSlots, 1)
+  assert.equal(cfg.recall.fairness.rareTerm.minPosting, 8)
+  assert.equal(cfg.recall.fairness.register.ttlRounds, 2)
+  assert.equal(cfg.recall.fairness.recycle.cooldownRounds, 15)
+  assert.equal(cfg.recall.fairness.blockTrim.policy, 'priority')
+  assert.equal(cfg.recall.fairness.roundBudget.maxChars, 20000)
+  assert.equal(cfg.recall.maxWindowPercent, 10)
+  assert.equal(cfg.recall.minAlpha, 0)
+  assert.equal(cfg.recall.hops, 0)
+  // probability knobs are still documented (legacy mode only)
+  assert.equal(cfg.recall.mu, 5)
+  assert.equal(cfg.recall.seed, 0)
+  // time: engine default is index-only, packaged config turns constrain on
+  assert.equal(cfg.time.mode, 'index')
+  assert.equal(cfg.time.timezone, '')
+  assert.equal(cfg.time.minRangeDays, 3)
+  assert.equal(cfg.time.maxRangeDays, 366)
+  assert.equal(cfg.time.centerDayPriority, true)
+  assert.deepEqual(cfg.time.fallback, ['day3', 'month', 'year', 'all'])
+  assert.equal(cfg.time.judgeEventTime, false)
+  // scoring pipeline
+  assert.equal(cfg.scoring.includeLegacy, false)
+  assert.equal(cfg.scoring.maxPending, 200)
+  assert.equal(cfg.scoring.fallback, 'onPressure')
+  assert.deepEqual(cfg.scoring.autoHeuristicAfterRounds, { plain: 4, channel: 2 })
+  assert.equal(cfg.scoring.taskBudgetPercent, 15)
+  assert.equal(cfg.scoring.taskMaxTokens, 12000)
+  assert.equal(cfg.scoring.order, 'newest')
+  assert.equal(cfg.scoring.maxItemsPerJudge, 100)
+  // keyword matching switches default off (no regression)
+  assert.deepEqual(cfg.match, { expandLatinCase: false, cjkBigram: false })
+  // archival guards
+  assert.equal(cfg.compress.protectCurrentTurn, true)
+  assert.equal(cfg.compress.allowSmallWindow, false)
+  assert.equal(cfg.compress.smallWindowTokens, 20000)
+  assert.equal(cfg.compress.hardLimitStop, true)
+  assert.equal(cfg.compress.maxFoldersPerStep, 500)
+  // Q1: triggerPercent is 60 everywhere
+  assert.equal(cfg.compress.triggerPercent, 60)
+  assert.equal(DEFAULT_CONFIG.compress.triggerPercent, 60)
+})
+
+test('config: a 1.3.0 config file (no v1.4.0 keys) loads with zero warnings', () => {
+  // Backward compatibility: an old config.json must not be "upgraded" loudly.
+  const legacyConfig = {
+    enabled: true,
+    compress: { enabled: true, triggerPercent: 80, compressPercent: 20 },
+    importance: { min: 0.01, max: 1, warnAbove: 0.8 },
+    keywords: { min: 3, max: 8, extraStopwords: [], matchMode: 'contains' },
+    recall: {
+      enabled: true,
+      firstGenMax: 10,
+      mu: 5,
+      sigma: 3,
+      maxGeneration: 0,
+      probabilityScale: 1,
+      seed: 0,
+      sort: 'createdAt',
+      maxRecalledBlocks: 64,
+      maxRecalledChars: 120000,
+      persistInjected: true,
+      triggerSourceKinds: ['user'],
+    },
+    storage: { dir: 'memory', perSession: true, indexFile: 'index.json', statsFile: 'stats.jsonl', maxFolders: 10000 },
+    compat: { qqBots: 'auto' },
+    logging: { enabled: true, verbose: false },
+    test: { dryRun: false },
+  }
+  const dir = tempDir()
+  const configPath = path.join(dir, 'config.json')
+  fs.writeFileSync(configPath, JSON.stringify(legacyConfig))
+  const cfg = loadConfig(configPath)
+  assert.deepEqual(cfg.warnings, [], 'no warning for an old config file')
+  assert.equal(cfg.compress.triggerPercent, 80, 'an explicit old value is preserved')
+  assert.equal(cfg.recall.mode, 'fair', 'new key falls back to the v1.4.0 default')
+  assert.equal(cfg.time.mode, 'index')
+  assert.equal(cfg.scoring.order, 'newest')
+  // adapter-only keys are preserved by the engine merge
+  assert.deepEqual(cfg.recall.triggerSourceKinds, ['user'])
+  assert.equal(cfg.storage.perSession, true)
+})
+
+test('config: v1.4.0 invalid values are replaced with warnings (never throw)', () => {
+  const cfg = loadConfig(undefined, {
+    recall: {
+      mode: 'nope',
+      hops: -1,
+      maxWindowPercent: 0,
+      minAlpha: 2,
+      fairness: {
+        thetaHigh: 5,
+        exploreRatio: -1,
+        specificProbeSlots: 'x',
+        rareTerm: { ratio: -1, minPosting: 0, scanCap: 0 },
+        register: { lookahead: 0, capFactor: 0, ttlRounds: 0 },
+        queryBoost: 'yes',
+        recycle: { enabled: 'no', cooldownRounds: -5, maxPerRound: 99 },
+        ledger: { maxEntries: 0, overflow: 'nope' },
+        blockTrim: { policy: 'magic', protectCurrentQuery: 'no', pinHigh: 1 },
+        roundBudget: { maxChars: -1 },
+      },
+    },
+    time: { mode: 'always', timezone: 'Not/AZone', minRangeDays: 0, maxRangeDays: 0, fallback: ['day3', 'bogus'], windowScanMax: 0 },
+    scoring: { includeLegacy: 'no', maxPending: -1, fallback: 'sometimes', autoHeuristicAfterRounds: { plain: -1, channel: 'x' }, taskBudgetPercent: 0, order: 'random', maxItemsPerJudge: 0 },
+    match: { expandLatinCase: 'no', cjkBigram: 1 },
+    compress: { protectCurrentTurn: 'no', allowSmallWindow: 'no', smallWindowTokens: -1, hardLimitStop: 'no', maxFoldersPerStep: 0 },
+  })
+  assert.ok(cfg.warnings.length >= 25, `expected many warnings, got ${cfg.warnings.length}`)
+  assert.equal(cfg.recall.mode, 'fair')
+  assert.equal(cfg.recall.hops, 0)
+  assert.equal(cfg.recall.maxWindowPercent, 10)
+  assert.equal(cfg.recall.minAlpha, 0)
+  assert.equal(cfg.recall.fairness.thetaHigh, 0.6)
+  assert.equal(cfg.recall.fairness.exploreRatio, 0.2)
+  assert.equal(cfg.recall.fairness.specificProbeSlots, 1)
+  assert.deepEqual(cfg.recall.fairness.rareTerm, { ratio: 0.002, minPosting: 8, scanCap: 512 })
+  assert.deepEqual(cfg.recall.fairness.register, { lookahead: 3, capFactor: 8, ttlRounds: 2 })
+  assert.equal(cfg.recall.fairness.queryBoost, true)
+  assert.deepEqual(cfg.recall.fairness.recycle, { enabled: true, cooldownRounds: 15, maxPerRound: 1 })
+  assert.deepEqual(cfg.recall.fairness.ledger, { maxEntries: 10000, overflow: 'evict-lowest-alpha-last-seen' })
+  assert.equal(cfg.recall.fairness.blockTrim.policy, 'priority')
+  assert.equal(cfg.recall.fairness.roundBudget.maxChars, 20000)
+  assert.equal(cfg.time.mode, 'index')
+  assert.equal(cfg.time.timezone, '')
+  assert.equal(cfg.time.minRangeDays, 3, 'invalid minRangeDays falls back to the default 3')
+  assert.equal(cfg.time.maxRangeDays, 366, 'invalid maxRangeDays falls back to the default 366')
+  assert.deepEqual(cfg.time.fallback, ['day3'], 'unknown fallback entries are dropped, known ones kept')
+  assert.equal(cfg.time.windowScanMax, 4096)
+  // maxRangeDays is raised to minRangeDays when a hand-edited config inverts them
+  const inverted = loadConfig(undefined, { time: { minRangeDays: 5, maxRangeDays: 2 } })
+  assert.equal(inverted.time.minRangeDays, 5)
+  assert.equal(inverted.time.maxRangeDays, 5)
+  assert.ok(inverted.warnings.some((warning) => warning.includes('time.maxRangeDays')), 'inverted range warns')
+  assert.equal(cfg.scoring.includeLegacy, false)
+  assert.equal(cfg.scoring.maxPending, 200)
+  assert.equal(cfg.scoring.fallback, 'onPressure')
+  assert.deepEqual(cfg.scoring.autoHeuristicAfterRounds, { plain: 4, channel: 2 })
+  assert.equal(cfg.scoring.taskBudgetPercent, 15)
+  assert.equal(cfg.scoring.order, 'newest')
+  assert.equal(cfg.scoring.maxItemsPerJudge, 100)
+  assert.equal(cfg.match.expandLatinCase, false)
+  assert.equal(cfg.match.cjkBigram, false)
+  assert.equal(cfg.compress.protectCurrentTurn, true)
+  assert.equal(cfg.compress.allowSmallWindow, false)
+  assert.equal(cfg.compress.smallWindowTokens, 20000)
+  assert.equal(cfg.compress.hardLimitStop, true)
+  assert.equal(cfg.compress.maxFoldersPerStep, 500)
+  // invalid sub-objects fall back whole
+  const broken = validateConfig({ recall: { fairness: 'nope' }, time: { fallback: 'nope' }, scoring: { autoHeuristicAfterRounds: 'nope' } })
+  assert.equal(broken.recall.fairness.thetaHigh, 0.6)
+  assert.deepEqual(broken.time.fallback, ['day3', 'month', 'year', 'all'])
+  assert.deepEqual(broken.scoring.autoHeuristicAfterRounds, { plain: 4, channel: 2 })
+})
+
+
+test('config: valid IANA time zones are accepted, host-local empty string stays', () => {
+  const tokyo = loadConfig(undefined, { time: { timezone: 'Asia/Tokyo' } })
+  assert.deepEqual(tokyo.warnings, [])
+  assert.equal(tokyo.time.timezone, 'Asia/Tokyo')
+  const local = loadConfig(undefined, { time: { timezone: '  ' } })
+  assert.deepEqual(local.warnings, [])
+  assert.equal(local.time.timezone, '')
+  const utc = loadConfig(undefined, { time: { timezone: 'UTC' } })
+  assert.equal(utc.time.timezone, 'UTC')
+})
+
+// ---------------------------------------------------------------------------
+// store: v1.4.0 optional index fields + commit helpers
+// ---------------------------------------------------------------------------
+
+test('store: v1.4.0 optional index fields are copied explicitly and only when valid', () => {
+  assert.deepEqual(PENDING_ERAS, ['legacy', 'current', 'synthetic'])
+  assert.deepEqual(SCORE_MODES, ['model', 'heuristic'])
+  assert.deepEqual(ARCHIVE_SOURCES, ['adapter', 'passive'])
+  assert.deepEqual(EVENT_TIME_SOURCES, ['messages', 'judge', 'archive'])
+  const full = indexEntryFromMeta({
+    id: 'mem-20260101T000000Z-0001',
+    createdAt: 5,
+    alpha: 0.4,
+    keywords: ['部署'],
+    pendingEra: 'legacy',
+    scoreMode: 'model',
+    archivedFrom: 'passive',
+    archivedByVersion: '1.4.0',
+    eventStart: 1000,
+    eventEnd: 2000,
+    eventTimeSource: 'messages',
+    pendingSince: 900,
+  })
+  assert.equal(full.pendingEra, 'legacy')
+  assert.equal(full.scoreMode, 'model')
+  assert.equal(full.archivedFrom, 'passive')
+  assert.equal(full.archivedByVersion, '1.4.0')
+  assert.equal(full.eventStart, 1000)
+  assert.equal(full.eventEnd, 2000)
+  assert.equal(full.eventTimeSource, 'messages')
+  assert.equal(full.pendingSince, 900)
+  // invalid values are dropped instead of poisoning the index
+  const invalid = indexEntryFromMeta({
+    id: 'mem-20260101T000000Z-0002',
+    createdAt: 5,
+    pendingEra: 'future',
+    scoreMode: 'guess',
+    archivedFrom: 'robot',
+    eventTimeSource: 'guess',
+    eventStart: 'yesterday',
+    eventEnd: NaN,
+    pendingSince: Infinity,
+    archivedByVersion: '',
+  })
+  for (const field of ['pendingEra', 'scoreMode', 'archivedFrom', 'eventTimeSource', 'eventStart', 'eventEnd', 'pendingSince', 'archivedByVersion']) {
+    assert.equal(field in invalid, false, `${field} must not be invented`)
+  }
+  // old folders (no fields) produce exactly the v1.3.0 entry shape
+  const plain = indexEntryFromMeta({ id: 'mem-20260101T000000Z-0003', createdAt: 1, alpha: 0.5 })
+  assert.deepEqual(Object.keys(plain).sort(), ['alpha', 'beta', 'chars', 'createdAt', 'id', 'keywords', 'messageCount', 'rescorePending', 'scored', 'title', 'tokens'])
+})
+
+test('store: v1.4.0 optional index fields survive writeIndex/readIndex round-trip', () => {
+  const cfg = loadConfig()
+  const dir = tempDir()
+  ensureMemoryDir(dir)
+  const id = formatFolderId(1700000000000, 1)
+  const written = writeIndex(dir, cfg, {
+    version: 1,
+    nextCounter: 2,
+    folders: [{
+      id,
+      createdAt: 5,
+      alpha: 0.4,
+      keywords: ['部署'],
+      pendingEra: 'synthetic',
+      scoreMode: 'heuristic',
+      archivedFrom: 'adapter',
+      archivedByVersion: '1.4.0',
+      eventStart: 1000,
+      eventEnd: 2000,
+      eventTimeSource: 'messages',
+      pendingSince: 900,
+    }],
+  })
+  const saved = written.folders[0]
+  assert.equal(saved.pendingEra, 'synthetic')
+  assert.equal(saved.eventTimeSource, 'messages')
+  assert.equal(saved.pendingSince, 900)
+  const read = readIndex(dir, cfg).folders[0]
+  assert.equal(read.pendingEra, 'synthetic')
+  assert.equal(read.scoreMode, 'heuristic')
+  assert.equal(read.archivedFrom, 'adapter')
+  assert.equal(read.archivedByVersion, '1.4.0')
+  assert.equal(read.eventStart, 1000)
+  assert.equal(read.eventEnd, 2000)
+  assert.equal(read.eventTimeSource, 'messages')
+  assert.equal(read.pendingSince, 900)
+  // a rebuild from meta.json keeps them too (meta is allowed to carry them)
+  writeFolder(dir, { id, meta: { createdAt: 5, alpha: 0.4, pendingEra: 'legacy', eventStart: 42, eventEnd: 43 }, messages: [{ role: 'user', content: 'x' }] })
+  fs.rmSync(path.join(dir, 'index.json'), { force: true })
+  const rebuilt = loadIndex(dir, cfg).folders[0]
+  assert.equal(rebuilt.pendingEra, 'legacy')
+  assert.equal(rebuilt.eventStart, 42)
+  assert.equal(rebuilt.eventEnd, 43)
+})
+
+test('store: commit journal helpers and removeFolder are safe with bad ids and stale files', () => {
+  const dir = tempDir()
+  ensureMemoryDir(dir)
+  const id = formatFolderId(1700000000000, 7)
+  writeFolder(dir, { id, meta: { createdAt: 1 }, messages: [{ role: 'user', content: 'x' }] })
+  assert.equal(folderExists(dir, id), true)
+  // journal life cycle
+  const journal = beginCommitJournal(dir, id, { sessionId: 's', folders: 1 })
+  assert.equal(typeof journal, 'string')
+  assert.equal(fs.existsSync(journal), true)
+  assert.equal(finishCommitJournal(journal), true)
+  assert.equal(fs.existsSync(journal), false)
+  // a missing/garbage journal path is ignored
+  assert.equal(finishCommitJournal(null), false)
+  assert.equal(finishCommitJournal(''), false)
+  // unsafe ids never touch the filesystem
+  assert.equal(beginCommitJournal(dir, '..', {}), null)
+  assert.equal(removeFolder(dir, '..'), false)
+  // stale journal cleanup: a small maxAge keeps the fresh one, a future clock removes it
+  const fresh = beginCommitJournal(dir, id, {})
+  assert.deepEqual(cleanupCommitJournals(dir, { maxAgeMs: 60_000 }), [])
+  assert.equal(fs.existsSync(fresh), true)
+  const removed = cleanupCommitJournals(dir, { maxAgeMs: 0, now: Date.now() + 60_000 })
+  assert.deepEqual(removed, [fresh])
+  assert.equal(fs.existsSync(fresh), false)
+  // removeFolder deletes the folder but never escapes the memory dir
+  assert.equal(removeFolder(dir, id), true)
+  assert.equal(folderExists(dir, id), false)
+  // cleanup never deletes memory folders
+  writeFolder(dir, { id, meta: { createdAt: 1 }, messages: [] })
+  beginCommitJournal(dir, id, {})
+  cleanupCommitJournals(dir, { maxAgeMs: 0, now: Date.now() + 60_000 })
+  assert.equal(folderExists(dir, id), true)
 })

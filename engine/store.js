@@ -107,6 +107,37 @@ function numberOr(value, fallback) {
   return typeof value === 'number' && Number.isFinite(value) ? value : fallback
 }
 
+// ---------------------------------------------------------------------------
+// v1.4.0 optional index fields (docs/SPEC.md §3.2)
+//
+// Every field below is optional and is only written when the source actually
+// carries a valid value, so an old index (version 1, no extra fields) round-trips
+// byte-compatible. `indexEntryFromMeta` copies them *explicitly*: a silent drop
+// here would make the era bucket / event-time window lossy after one reload.
+// ---------------------------------------------------------------------------
+
+/** Allowed values of `pendingEra` (pre-1.2.0 legacy / synthetic pressure test / current). */
+export const PENDING_ERAS = Object.freeze(['legacy', 'current', 'synthetic'])
+/** Allowed values of `scoreMode`. */
+export const SCORE_MODES = Object.freeze(['model', 'heuristic'])
+/** Allowed values of `archivedFrom`. */
+export const ARCHIVE_SOURCES = Object.freeze(['adapter', 'passive'])
+/** Allowed values of `eventTimeSource`. */
+export const EVENT_TIME_SOURCES = Object.freeze(['messages', 'judge', 'archive'])
+
+/** Copy the optional v1.4.0 fields when valid; never invent a value. */
+function copyOptionalIndexFields(target, source) {
+  if (PENDING_ERAS.includes(source.pendingEra)) target.pendingEra = source.pendingEra
+  if (SCORE_MODES.includes(source.scoreMode)) target.scoreMode = source.scoreMode
+  if (ARCHIVE_SOURCES.includes(source.archivedFrom)) target.archivedFrom = source.archivedFrom
+  if (EVENT_TIME_SOURCES.includes(source.eventTimeSource)) target.eventTimeSource = source.eventTimeSource
+  if (typeof source.archivedByVersion === 'string' && source.archivedByVersion) target.archivedByVersion = source.archivedByVersion
+  if (Number.isFinite(source.eventStart)) target.eventStart = source.eventStart
+  if (Number.isFinite(source.eventEnd)) target.eventEnd = source.eventEnd
+  if (Number.isFinite(source.pendingSince)) target.pendingSince = source.pendingSince
+  return target
+}
+
 /**
  * Build one index folder entry from a `meta.json` object (or normalize an
  * already built index entry; `writeIndex` re-normalizes entries).
@@ -114,7 +145,7 @@ function numberOr(value, fallback) {
 export function indexEntryFromMeta(meta) {
   const source = meta && typeof meta === 'object' ? meta : {}
   const stats = source.stats && typeof source.stats === 'object' ? source.stats : null
-  return {
+  const entry = {
     id: source.id,
     createdAt: numberOr(source.createdAt, 0),
     alpha: numberOr(source.alpha, 0.01),
@@ -130,6 +161,7 @@ export function indexEntryFromMeta(meta) {
     messageCount: stats ? numberOr(stats.messages, 0) : numberOr(source.messageCount, 0),
     title: typeof source.title === 'string' ? source.title : '',
   }
+  return copyOptionalIndexFields(entry, source)
 }
 
 /** Normalize/repair a raw parsed index object. */
@@ -325,11 +357,97 @@ export function writeFolder(memoryDir, folder) {
   return { id, dir, meta, context, messages }
 }
 
+// ---------------------------------------------------------------------------
+// v1.4.0 commit transaction helpers (docs/SPEC.md §5.4)
+//
+// `commitCompression` writes folders first and `index.json` last. If anything
+// throws in between, the caller rolls back the folders it already wrote through
+// `removeFolder`. A journal file (`.commit-<id>.json`) records the intent so a
+// crashed process leaves a trace instead of silent orphans; `cleanupCommitJournals`
+// drops stale journals on load (it never deletes memory folders — that is the
+// in-process rollback's job, and deleting here could destroy committed data).
+// ---------------------------------------------------------------------------
+
+/** Remove one folder directory (best effort; returns whether it is gone). */
+export function removeFolder(memoryDir, id) {
+  let dir
+  try {
+    dir = folderDir(memoryDir, id)
+  } catch {
+    return false
+  }
+  try {
+    fs.rmSync(dir, { recursive: true, force: true })
+    return true
+  } catch {
+    return false
+  }
+}
+
+/** Start a commit journal; returns its path (or null when it could not be written). */
+export function beginCommitJournal(memoryDir, id, payload) {
+  try {
+    const journalId = assertSafeId(id)
+    ensureMemoryDir(memoryDir)
+    const file = path.join(memoryDir, `.commit-${journalId}.json`)
+    atomicWriteJson(file, {
+      id: journalId,
+      startedAt: Date.now(),
+      ...(payload && typeof payload === 'object' ? payload : {}),
+    })
+    return file
+  } catch {
+    return null
+  }
+}
+
+/** Finish (delete) a commit journal; best effort, never throws. */
+export function finishCommitJournal(journalPath) {
+  if (typeof journalPath !== 'string' || !journalPath) return false
+  try {
+    fs.unlinkSync(journalPath)
+    return true
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Drop stale commit journals (older than `maxAgeMs`) from the memory directory.
+ * Returns the removed journal paths. Never touches memory folders.
+ */
+export function cleanupCommitJournals(memoryDir, options = {}) {
+  const opts = options && typeof options === 'object' ? options : {}
+  const maxAgeMs = Number.isFinite(opts.maxAgeMs) ? Math.max(0, opts.maxAgeMs) : 10 * 60 * 1000
+  const now = Number.isFinite(opts.now) ? opts.now : Date.now()
+  const removed = []
+  let dirents = []
+  try {
+    dirents = fs.readdirSync(memoryDir, { withFileTypes: true })
+  } catch {
+    return removed
+  }
+  for (const dirent of dirents) {
+    if (!dirent.isFile()) continue
+    const name = dirent.name
+    if (!name.startsWith('.commit-') || !name.endsWith('.json')) continue
+    const file = path.join(memoryDir, name)
+    try {
+      const stat = fs.statSync(file)
+      if (now - stat.mtimeMs < maxAgeMs) continue
+      fs.unlinkSync(file)
+      removed.push(file)
+    } catch {
+      /* best effort */
+    }
+  }
+  return removed
+}
+
 /**
  * Allocate the next unique folder id and advance `index.nextCounter` in place.
  * Collisions with folders already on disk are skipped.
- */
-export function allocateFolderId(memoryDir, cfg, index, now) {
+ */export function allocateFolderId(memoryDir, cfg, index, now) {
   const safeIndex = index && typeof index === 'object' ? index : { folders: [], nextCounter: 1 }
   let counter = Number.isInteger(safeIndex.nextCounter) && safeIndex.nextCounter >= 1
     ? safeIndex.nextCounter

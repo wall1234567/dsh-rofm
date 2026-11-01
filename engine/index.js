@@ -80,6 +80,15 @@ export {
   atomicWriteJson,
   indexEntryFromMeta,
   scanFolderMetas,
+  // v1.4.0: optional index fields + commit transaction helpers
+  PENDING_ERAS,
+  SCORE_MODES,
+  ARCHIVE_SOURCES,
+  EVENT_TIME_SOURCES,
+  removeFolder,
+  beginCommitJournal,
+  finishCommitJournal,
+  cleanupCommitJournals,
 } from './store.js'
 
 // report math (extra convenience exports, used by tools/recall-report.mjs)

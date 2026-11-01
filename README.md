@@ -1427,7 +1427,7 @@ node engine/cli.mjs --help        # 独立引擎 CLI
 
 | # | 步骤 | 内容 |
 |---|---|---|
-| 1 | unit-tests | `node --test` 全量（当前 827 tests / 825 pass / 0 fail / 2 skip；~20s） |
+| 1 | unit-tests | `node --test` 全量（当前 836 tests / 834 pass / 0 fail / 2 skip；~20s） |
 | 2 | simulate | `node test/simulate.mjs`（legacy 回归；<1s） |
 | 3 | selfcheck | `node tools/selfcheck.mjs`（配置/存储/时代/时间/公平性/日志；~2s） |
 | 4 | cli-help | `node engine/cli.mjs --help` |
@@ -1436,8 +1436,8 @@ node engine/cli.mjs --help        # 独立引擎 CLI
 | 7 | e2e-adapter | `node --test test/e2e-adapter-simulate.test.mjs`（8 用例，~4s） |
 | 8 | e2e-real-data | `node --test test/e2e-real-data-readonly.test.mjs`（6 用例，~5–8s） |
 
-**结果：8/8 PASS**；汇总 node:test 用例 = `node --test` 827 + e2e 14 = **841+ / 839+ pass / 0 fail**
-（发布冻结口径 837 / 835 / 0；收尾期实测 841–845，差异来自并行收尾新增的 adapter 用例，门禁结论同为 0 fail）。
+**结果：8/8 PASS**；汇总 node:test 用例 = `node --test` 836 + e2e 14 = **850 / 848 pass / 0 fail**
+（2 skip 为 Node zstd 平台条件跳过，非缺陷）。
 `npm run check` 是同一套检查的等价展开（把 e2e 换成 `npm test` 一步）。
 
 > 仓库零依赖，不需要 `npm install`；`npm test` 只是 `node --test` 的快捷方式。
@@ -1525,10 +1525,10 @@ selfcheck: 10 passed, 1 warnings, 0 failed
 > neutral profile（没有 QQ 插件）下是 **7 passed / 1 warning / 0 failed**（8 条 check 行）。
 > 两种环境**只有 compat 行不同**，非 compat 检查的名称与状态逐一相同。
 
-测试覆盖（v1.3.0 为 **493 用例：491 pass + 2 skip、0 fail**；v1.4.0 发布冻结口径为 **827 用例：825 pass + 2 skip、0 fail**
-（收尾期工作树实测 831 / 829 / 0 / 2；engine 613 / adapter 213+ / simulate 1），
+测试覆盖（v1.3.0 为 **493 用例：491 pass + 2 skip、0 fail**；v1.4.0 为 **836 用例：834 pass + 2 skip、0 fail**
+（engine 层 622 用例含 2 skip / adapter 层 213 / simulate 1），
 另有 2 个 e2e 文件 8 + 6 = 14 用例全绿；一键门禁 `node tools/verify-1.4.0.mjs` = **8/8 PASS**，
-汇总 node:test 用例 **841–845 pass / 0 fail**（发布冻结口径 837 / 835；收尾期仍在并行新增用例）。最终数字以 [docs/VERIFICATION.md](docs/VERIFICATION.md) §20
+汇总 node:test 用例 **850 / 848 pass / 0 fail**。最终数字以 [docs/VERIFICATION.md](docs/VERIFICATION.md) §20
 与发布门禁输出为准；CI 在 Linux/Windows/macOS × Node 20/22/24 上校验）：
 `test/` 覆盖引擎用例 + `simulate`（含 v1.3.0 的 compat / compat-autopatch / heuristic-score /
 passive-archive / qq-media / recall `minAlpha` 用例、`test/portability.test.mjs` 跨平台用例，

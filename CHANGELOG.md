@@ -310,9 +310,8 @@ The project follows a lightweight [SemVer](https://semver.org/) scheme.
   `test/turn-protection-engine.test.mjs`、`test/memory-audit.test.mjs`、`test/config-consistency.test.mjs`、
   `test/e2e-adapter-simulate.test.mjs`、`test/e2e-real-data-readonly.test.mjs`，以及 `test-adapter/` 的
   公平性/确定性/评分压力/时间工具适配用例。
-- 发布门禁 `node tools/verify-1.4.0.mjs` = **8/8 PASS**；`node --test` = **827 tests / 825 pass / 0 fail / 2 skip**
-  （2 skip = Node zstd 平台条件跳过，非缺陷）+ e2e **8 + 6 = 14** → 门禁汇总 **837 / 835 pass / 0 fail**
-  （发布冻结口径）；收尾期最后一次工作树实测为 845 / 843 pass / 0 fail（差异=并行收尾新增用例，0 fail 不变）。
+- 发布门禁 `node tools/verify-1.4.0.mjs` = **8/8 PASS**；`node --test` = **836 tests / 834 pass / 0 fail / 2 skip**
+  （2 skip = Node zstd 平台条件跳过，非缺陷）+ e2e **8 + 6 = 14** → 门禁汇总 **850 / 848 pass / 0 fail**。
   最终数字以 `docs/VERIFICATION.md` §20 与门禁输出为准（本条目不改写历史 v1.3.0 的 493 用例基线）。
 
 ## [1.3.0] — 2026-10-31

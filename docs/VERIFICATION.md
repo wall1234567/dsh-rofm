@@ -945,17 +945,15 @@ macOS 专项处理：APFS 大小写不敏感由 **`realpath` 归一化**吸收�
 > 一键门禁 `node tools/verify-1.4.0.mjs` 是最终可复现的发布口径（8 步全部 exit 0 才算 PASS）。
 > 所有对真实 `memory/` 的操作**只读**，写盘测试全部使用 `os.tmpdir()` 临时目录。
 >
-> **测试数（发布冻结版）**：`node --test` = **827 tests / 825 pass / 0 fail / 2 skip**
-> （2 skip = Node zstd 平台条件跳过，非缺陷；不是 Windows 符号链接用例）；
-> 另有 2 个 e2e 文件 **8 + 6 = 14 用例**全绿 → 一键门禁汇总 **837 / 835 pass / 0 fail**
-> （收尾期工作树实测为 **841–845 / 839–843 pass / 0 fail** = 827 + 14 起，差异来自并行收尾新增的
-> adapter 用例；门禁结论同为 **0 fail**，最终以 `node tools/verify-1.4.0.mjs` 输出为准）。
+> **测试数（v1.4.0 最终版）**：`node --test` = **836 tests / 834 pass / 0 fail / 2 skip**
+> （2 skip = Node zstd 平台条件跳过，非缺陷；不是 Windows 符号链接用例；engine 层 622 / adapter 层 213）；
+> 另有 2 个 e2e 文件 **8 + 6 = 14 用例**全绿 → 一键门禁汇总 **850 / 848 pass / 0 fail**。
 
 ### 20.1 门禁命令与实测结果（8 步全部 exit 0）
 
 | # | 命令 | 结果（实测） | 耗时 |
 |---|---|---|---|
-| 1 | `node --test`（全量，= verify 第 1 步） | **827 tests / 825 pass / 0 fail / 2 skip**（发布冻结口径；收尾期工作树实测 831 / 829 / 0 / 2） | ~19–25 s |
+| 1 | `node --test`（全量，= verify 第 1 步） | **836 tests / 834 pass / 0 fail / 2 skip** | ~20 s |
 | 2 | `node test/simulate.mjs` | exit 0（`context added back 11.98 %`；legacy 路径，v1.3.0 回归口径） | ~0.3 s |
 | 3 | `node tools/selfcheck.mjs` | exit 0；检测到 QQ 插件 **10 passed / 1 warning / 0 failed**（11 条 check）；neutral profile **7 / 1 / 0**（8 条） | ~1–2 s |
 | 4 | `node engine/cli.mjs --help` | exit 0 | ~0.1 s |
@@ -966,7 +964,7 @@ macOS 专项处理：APFS 大小写不敏感由 **`realpath` 归一化**吸收�
 | — | `node --test test/release.test.mjs test/config-consistency.test.mjs` | 30 / 30 pass（release 段存在性 + 配置/版本一致性） | <1 s |
 
 **一键门禁**：`node tools/verify-1.4.0.mjs`（= `npm run verify`）→ **8/8 PASS**，汇总
-`node:test cases 837 / 835 pass / 0 fail`（发布冻结口径；工作树收尾实测 841–845 / 839–843），`RESULT: PASS`，exit 0。
+`node:test cases 850 / 848 pass / 0 fail`，`RESULT: PASS`，exit 0。
 `npm run check` 是等价展开：`node --test` + simulate + selfcheck + cli --help + memory-audit --json +
 time-view --help（不含 e2e，e2e 由 verify 覆盖）。CI 另在 Linux/Windows/macOS × Node 20/22/24 上跑矩阵
 （见 §19.2；v1.4.0 未改动 CI 结构）。
@@ -1163,9 +1161,9 @@ v1.4.0 新增/扩展测试文件（当前用例数，`node --test <file>` 实测
 
 | 项目 | 实测 | 门槛 |
 |---|---|---|
-| `buildRecallIndex` 合成 N=10⁴（测试） | **29.5 ms**（发布冻结口径；本轮复跑 32.2 ms） | 目标 N=10⁴ <60ms（CI 放宽 200ms） |
+| `buildRecallIndex` 合成 N=10⁴（测试） | **29.5 ms**（本轮复测 32.2 ms） | 目标 N=10⁴ <60ms（CI 放宽 200ms） |
 | `selectRecall` 合成 N=10⁴（测试） | **≤ 0.4 ms**（worstSelect 0.3ms / pops 25） | 目标单次 <5ms（CI 放宽 50ms） |
-| `buildTimeIndex` 真实 2780 folders（session-a46df597） | **5.83 ms**（发布冻结口径；本轮冷构建复测 6.49–9.58ms，含新进程读配置/索引与 `Intl` 预热） | 设计 1.5–2.8ms@2780 为**热构建**口径 |
+| `buildTimeIndex` 真实 2780 folders（session-a46df597） | **5.83 ms**（本轮冷构建复测 6.49–9.58ms，含新进程读配置/索引与 `Intl` 预热） | 设计 1.5–2.8ms@2780 为**热构建**口径 |
 | `buildTimeIndex` 全库（6 store / 3742 folders） | **9.1 ms** | N=10⁴ 目标 ≤20ms |
 | 3 日查询（真实/合成） | **0.014 ms/次**（测试 N=10⁴ 0.013ms） | 目标 <5ms，CI 放宽 50ms |
 | `buildTimeIndex` 同进程热构建（本轮 best of 5，真实 2780） | 1.88 ms | 补充口径 |
@@ -1177,7 +1175,7 @@ v1.4.0 新增/扩展测试文件（当前用例数，`node --test <file>` 实测
 > 真实数据测量命令（只读）：`readIndex('memory/sessions/session-a46df597-…')` +
 > `buildTimeIndex()` / `buildRecallIndex()` / `selectRecall()`；合成 N=10⁴ 数字来自
 > `test/recall-index.test.mjs` / `test/time-index.test.mjs` 的 perf 用例输出。
-> 发布冻结数字以 Lead 的最终门禁记录为准（本表同时保留本轮复测值以便复现）。
+> 性能数字以最终门禁/复测记录为准（本表保留复测值以便复现）。
 
 ### 20.9 残余风险与未覆盖项（诚实说明）
 
@@ -1197,7 +1195,6 @@ v1.4.0 新增/扩展测试文件（当前用例数，`node --test <file>` 实测
 - **CLI 没有 turn 语义**：`engine/cli.mjs` 不暴露 `protectSeq`（文档已写明）；
   `compress --allow-small-window` 只是逐 plan 覆盖，不改变产品默认；
 - **Linux/macOS**：仍以 CI 三平台矩阵为准（本机无真机，同 §19.4）；
-- **数字口径**：本节测试数为发布冻结口径（827 / 825 pass / 0 fail / 2 skip + e2e 14 →
-  门禁 837 / 835 / 0）；收尾期工作树实测为 841–845 / 839–843 / 0（差异=并行新增用例），
-  发布门禁以 `node tools/verify-1.4.0.mjs` 输出为准（结论均为 **0 fail**）。
+- **数字口径**：本节测试数为 v1.4.0 最终版（836 / 834 pass / 0 fail / 2 skip + e2e 14 →
+  门禁 850 / 848 / 0），发布门禁以 `node tools/verify-1.4.0.mjs` 输出为准。
 

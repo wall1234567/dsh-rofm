@@ -2707,10 +2707,10 @@ As of the v1.2.1 revision the suites were **188/188 (engine)** and **115/115
 (adapter)**; v1.3.0 measured **493 (491 pass + 2 skip)**. The v1.4.0 release gate is
 `node tools/verify-1.4.0.mjs` (8 steps: full `node --test` / simulate / selfcheck /
 cli `--help` / memory-audit `--json` / time-view `--help` / e2e-adapter / e2e-real-data;
-all 8 exit 0 → PASS). Current measured numbers: full suite **827 tests / 825 pass /
-0 fail / 2 skip**, e2e **8 + 6 = 14**, gate summary **837 / 835 pass / 0 fail**
-(frozen release caliber); final numbers are recorded in `docs/VERIFICATION.md` §20 and
-printed by the gate — do not hardcode them here (they drift every release). Run
+all 8 exit 0 → PASS). Current measured numbers: full suite **836 tests / 834 pass /
+0 fail / 2 skip**, e2e **8 + 6 = 14**, gate summary **850 / 848 pass / 0 fail**;
+final numbers are recorded in `docs/VERIFICATION.md` §20 and printed by the gate — do not
+hardcode them here (they drift every release). Run
 `node tools/verify-1.4.0.mjs`, `node --test test/*.test.mjs`,
 `node --test test-adapter/*.test.mjs`, `node test/simulate.mjs`,
 `node tools/selfcheck.mjs`, `node engine/cli.mjs --help`,

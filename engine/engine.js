@@ -33,7 +33,7 @@ import {
     selectRecall,
     serializeLanes,
 } from './recall-index.js'
-import { buildTimeIndex, normalizeTimeQuery, queryTimeIndex, timeFallbackLadder } from './time-index.js'
+import { buildTimeIndex, folderTimeRange, normalizeTimeQuery, queryTimeIndex, timeFallbackLadder } from './time-index.js'
 import {
     appendStats,
     cleanupCommitJournals,
@@ -53,6 +53,17 @@ function clampInt(value, min, max, fallback) {
   if (truncated < min) return min
   if (truncated > max) return max
   return truncated
+}
+
+/** Normalize an optional id collection (Set, array or any iterable) to a Set. */
+function toIdSet(value) {
+  if (value instanceof Set) return value
+  const set = new Set()
+  if (value === null || value === undefined) return set
+  if (typeof value === 'object' && typeof value[Symbol.iterator] === 'function') {
+    for (const id of value) if (typeof id === 'string') set.add(id)
+  }
+  return set
 }
 
 /** Round to two decimals (telemetry) without ever returning -0. */
@@ -315,8 +326,25 @@ export class MemoryEngine {
     const refreshed = this._refresh()
     const mode = this.recallMode(opts)
     const timePlan = this._recallTimePlan(opts)
-    let result =
-      mode === 'legacy'
+    // Pure time browsing works in every mode (it is a lookup, not a recall
+    // decision): `memory_recall` without keywords returns the folders inside the
+    // requested window, ordered by event start. Legacy mode keeps it too.
+    const browsing = typeof userText === 'string' && userText.trim().length === 0 && timePlan.active === true
+    let result = browsing
+      ? this._browseRecall({
+          index: this.recallIndex(),
+          opts,
+          timePlan,
+          context: ctx,
+          offset: clampInt(opts.offset, 0, 1_000_000, 0),
+          take: Number.isFinite(Number(opts.limit)) && Number(opts.limit) > 0
+            ? Math.min(1000, Math.floor(Number(opts.limit)))
+            : Number.isFinite(Number(this.cfg?.recall?.firstGenMax))
+              ? Math.max(1, Math.floor(Number(this.cfg.recall.firstGenMax)))
+              : 10,
+          warnings: [],
+        })
+      : mode === 'legacy'
         ? null
         : this._deterministicRecall({
             userText,
@@ -379,7 +407,8 @@ export class MemoryEngine {
     const preFilterCandidates = (Number(stats.matchedFolders) || 0) + (Number(stats.timeFiltered) || 0)
     let missType = null
     if (pageItems.length === 0) {
-      if (timePlan.active && preFilterCandidates > 0 && (Number(stats.matchedFolders) || 0) === 0) missType = 'time'
+      if (result.browse === true) missType = 'time'
+      else if (timePlan.active && preFilterCandidates > 0 && (Number(stats.matchedFolders) || 0) === 0) missType = 'time'
       else if (preFilterCandidates === 0) missType = 'keyword'
     }
 
@@ -585,6 +614,14 @@ export class MemoryEngine {
     const hops = Number.isFinite(hopsRaw) ? Math.max(0, Math.floor(hopsRaw)) : recallCfg.hops
     const warnings = []
 
+    // --- pure time browsing (no keywords): the time window *is* the query ----
+    // `memory_recall` without keywords is a documented 1.4.0 mode (plan §3.3.3
+    // "纯时间浏览"): every scored folder inside the window, ordered by event start.
+    const browsing = userText.trim().length === 0 && timePlan.active === true
+    if (browsing) {
+      return this._browseRecall({ index, opts, timePlan, offset, take, warnings, context: request.context })
+    }
+
     // --- time fallback ladder (plan §3.3.3): L0 → day3 → month → year → all --
     const attempts = [{ ids: timePlan.active ? timePlan.ids : null, widenedTo: null, level: timePlan.normalized ? timePlan.normalized.level : null }]
     const canLadder = timePlan.active === true && timePlan.enforced === true && timePlan.hardWindow !== true && timeCfg.mode === 'constrain'
@@ -751,6 +788,120 @@ export class MemoryEngine {
         returned: additions.length,
         candidates: Number(selectStats.candidates) || 0,
         hasMore,
+      },
+    }
+  }
+
+  /**
+   * Pure time browsing (v1.4.0 §3.3.3): `memory_recall` called without keywords
+   * returns the scored folders inside the requested time window, ordered by the
+   * folder's event start (`eventStart` when known, else `createdAt`).
+   *
+   * No lane state is consumed (browsing is not a "recall decision"), but folders
+   * already injected into the current block (`excludeIds`) are skipped so the
+   * answer is not a duplicate of what the model already sees.
+   */
+  _browseRecall(input) {
+    const request = input && typeof input === 'object' ? input : {}
+    const opts = request.opts && typeof request.opts === 'object' ? request.opts : {}
+    const timePlan = request.timePlan || {}
+    const ctx = request.context && typeof request.context === 'object' ? request.context : {}
+    const index = request.index || this.recallIndex()
+    const offset = clampInt(request.offset, 0, 1_000_000, 0)
+    const take = Number.isFinite(request.take) && request.take > 0 ? Math.floor(request.take) : 10
+    const warnings = Array.isArray(request.warnings) ? request.warnings : []
+    const windowIds = timePlan.ids instanceof Set ? timePlan.ids : null
+    const excluded = toIdSet(opts.excludeIds)
+    const minAlphaRaw = Number(opts.minAlpha)
+    const alphaFloor = Number.isFinite(minAlphaRaw) ? Math.min(1, Math.max(0, minAlphaRaw)) : 0
+
+    const candidates = []
+    for (const entry of index.entries) {
+      if (windowIds && !windowIds.has(entry.id)) continue
+      if (alphaFloor > 0 && entry.alpha < alphaFloor) continue
+      if (excluded.has(entry.id)) continue
+      const folder = entry.folder && typeof entry.folder === 'object' ? entry.folder : {}
+      let range = null
+      try {
+        range = folderTimeRange(folder)
+      } catch {
+        range = null
+      }
+      const start = Number.isFinite(range?.start) ? range.start : Number(entry.createdAt) || 0
+      candidates.push({ entry, start })
+    }
+    candidates.sort(
+      (left, right) =>
+        left.start - right.start ||
+        Number(left.entry.createdAt) - Number(right.entry.createdAt) ||
+        (left.entry.id < right.entry.id ? -1 : left.entry.id > right.entry.id ? 1 : 0),
+    )
+
+    const pageCandidates = candidates.slice(offset, offset + take)
+    const picked = pageCandidates.map((candidate) => ({
+      folder: candidate.entry.folder || { id: candidate.entry.id, alpha: candidate.entry.alpha, createdAt: candidate.entry.createdAt },
+      id: candidate.entry.id,
+      generation: 1,
+      alpha: candidate.entry.alpha,
+      createdAt: candidate.entry.createdAt,
+      probability: 1,
+      roll: 1,
+      lane: 'browse',
+    }))
+    const loadWarnings = []
+    const additions = sortRecallAdditions(loadRecallAdditions(picked, { memoryDir: this.memoryDir, warnings: loadWarnings }), this.cfg?.recall?.sort)
+    for (const warning of loadWarnings) warnings.push(warning)
+
+    let addedChars = 0
+    let addedTokens = 0
+    for (const addition of additions) {
+      addedChars += Number(addition.chars) || 0
+      addedTokens += Number(addition.tokens) || 0
+    }
+    const contextChars = Number.isFinite(ctx.chars) ? ctx.chars : null
+    const windowTokens = Number.isFinite(ctx.windowTokens) ? ctx.windowTokens : null
+    const stats = {
+      userKeywords: [],
+      matchedFolders: candidates.length,
+      excludedFolders: 0,
+      attempts: 0,
+      addedFolders: additions.length,
+      addedChars,
+      addedTokens,
+      contextChars,
+      windowTokens,
+      addedPercentOfContext: contextChars > 0 ? round2((addedChars / contextChars) * 100) : null,
+      addedPercentOfWindow: windowTokens > 0 ? round2((addedTokens / windowTokens) * 100) : null,
+      byGeneration: additions.length > 0 ? { 1: additions.length } : {},
+      elapsedMs: 0,
+      candidates: candidates.length,
+      candidatesAll: candidates.length,
+      lowCandidates: 0,
+      lanesPicked: null,
+      pops: 0,
+      frontierHits: 0,
+      registerDrops: 0,
+      reInjections: 0,
+      degraded: false,
+      timeFiltered: 0,
+      filteredByAlpha: 0,
+      browse: true,
+      round: Number.isFinite(Number(this._round)) ? this._round : 0,
+    }
+    return {
+      additions,
+      stats,
+      warnings,
+      lanes: this._lanes,
+      timeWindow: { widenedTo: null, level: timePlan.normalized ? timePlan.normalized.level : null },
+      paginated: true,
+      browse: true,
+      page: {
+        offset,
+        limit: take,
+        returned: additions.length,
+        candidates: candidates.length,
+        hasMore: offset + take < candidates.length,
       },
     }
   }

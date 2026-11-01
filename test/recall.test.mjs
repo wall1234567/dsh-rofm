@@ -996,3 +996,53 @@ test('engine v1.4.0: fair-mode recall stays within budget on 1000 folders', () =
   // fingerprint invalidate it); a warm select costs a few k-way merge pops.
   assert.ok(warmMs < warmBudgetMs, `warm fair select averaged ${warmMs.toFixed(2)}ms (budget ${warmBudgetMs}ms)`)
 })
+
+test('recall v1.4.0: pure time browsing works in fair, deterministic and legacy modes', () => {
+  for (const mode of ['fair', 'deterministic', 'legacy']) {
+    const engine = engineWithFolders(
+      [
+        timedFolder('mem-a', SH_DAY['2026-10-30'], ['部署']),
+        timedFolder('mem-b', SH_DAY['2026-10-31'], ['部署']),
+        timedFolder('mem-c', SH_DAY['2026-11-01'], ['部署']),
+      ],
+      { time: { mode: 'constrain', timezone: 'Asia/Shanghai' }, recall: { mode } },
+    )
+    // no keywords, only a time window → pure browsing, ordered by event start
+    // (a natural month keeps the window unambiguous: Oct only, not Nov 1)
+    const browsed = engine.recall('', {}, { timeFrom: '2026-10' })
+    assert.equal(browsed.browse, true, `${mode}: browse flag`)
+    assert.equal(browsed.mode, mode)
+    assert.deepEqual(browsed.additions.map((addition) => addition.id), ['mem-a', 'mem-b'], `${mode}: window content in event order`)
+    assert.equal(browsed.stats.candidates, 2)
+    assert.equal(browsed.missType, null)
+    // pagination over the browse result
+    const page = engine.recall('', {}, { timeFrom: '2026-10', limit: 1, offset: 1 })
+    assert.deepEqual(page.additions.map((addition) => addition.id), ['mem-b'])
+    assert.equal(page.page.offset, 1)
+    // a window with no folders is a time miss (never a keyword miss)
+    const empty = engine.recall('', {}, { timeFrom: '2026-12', timeTo: '2026-12-02' })
+    assert.equal(empty.additions.length, 0)
+    assert.equal(empty.missType, 'time')
+  }
+})
+
+test('recall v1.4.0: browsing skips folders already in the block (excludeIds)', () => {
+  const engine = engineWithFolders(
+    [
+      timedFolder('mem-a', SH_DAY['2026-10-30'], ['部署']),
+      timedFolder('mem-b', SH_DAY['2026-10-31'], ['部署']),
+    ],
+    { time: { mode: 'constrain', timezone: 'Asia/Shanghai' } },
+  )
+  const browsed = engine.recall('', {}, { timeFrom: '2026-10', excludeIds: new Set(['mem-a']) })
+  assert.deepEqual(browsed.additions.map((addition) => addition.id), ['mem-b'])
+})
+
+test('recall v1.4.0: browsing without a time window recalls nothing (no keywords → no query)', () => {
+  const engine = engineWithFolders([timedFolder('mem-a', SH_DAY['2026-10-30'], ['部署'])], {
+    time: { mode: 'constrain', timezone: 'Asia/Shanghai' },
+  })
+  const result = engine.recall('', {}, {})
+  assert.equal(result.additions.length, 0)
+  assert.equal(result.browse, undefined, 'without time args it is a plain (empty) keyword recall')
+})

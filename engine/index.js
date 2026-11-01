@@ -93,3 +93,18 @@ export {
 
 // report math (extra convenience exports, used by tools/recall-report.mjs)
 export { summarizeStats, formatReport, roundNumber } from './stats.js'
+
+// v1.4.0 data-era classification (legacy / synthetic / current pending buckets).
+// Single truth shared by lib/plugin.js, tools/memory-audit.mjs,
+// tools/selfcheck.mjs and tools/recall-report.mjs.
+export {
+  LEGACY_ERA_CUTOFF_MS,
+  SYNTHETIC_WINDOW_TOKENS,
+  SYNTHETIC_BEFORE_PERCENT,
+  STRESS_MIN_FOLDERS,
+  STRESS_MIN_PENDING,
+  sessionEraSignals,
+  sessionEra,
+  classifyFolderEra,
+  summarizeEras,
+} from './era.js'

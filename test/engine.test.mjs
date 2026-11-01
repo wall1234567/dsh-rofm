@@ -56,6 +56,12 @@ import {
   cleanupCommitJournals,
   finishCommitJournal,
   removeFolder,
+  // v1.4.0 data eras
+  LEGACY_ERA_CUTOFF_MS,
+  classifyFolderEra,
+  sessionEra,
+  sessionEraSignals,
+  summarizeEras,
 } from '../engine/index.js'
 
 const tempDirs = []
@@ -1151,4 +1157,124 @@ test('store: commit journal helpers and removeFolder are safe with bad ids and s
   beginCommitJournal(dir, id, {})
   cleanupCommitJournals(dir, { maxAgeMs: 0, now: Date.now() + 60_000 })
   assert.equal(folderExists(dir, id), true)
+})
+
+// ---------------------------------------------------------------------------
+// data era classification (v1.4.0, docs/SPEC.md §4.1) — single truth shared by
+// plugin task filtering, memory-audit, selfcheck and recall-report.
+// ---------------------------------------------------------------------------
+
+test('era: signals detect a fake window from compress telemetry', () => {
+  assert.equal(LEGACY_ERA_CUTOFF_MS, Date.parse('2026-10-27T19:14:00Z'))
+  const fake = sessionEraSignals([
+    { type: 'compress', windowTokens: 2000, beforePercent: 1375 },
+    { type: 'recall', windowTokens: 999999 },
+  ])
+  assert.equal(fake.fakeWindow, true)
+  assert.equal(fake.tinyWindow, true)
+  assert.equal(fake.overWindow, true)
+  assert.equal(fake.windowTokens, 2000, 'the smallest recorded window wins')
+  assert.equal(fake.maxBeforePercent, 1375)
+  const real = sessionEraSignals([{ type: 'compress', windowTokens: 1000000, beforePercent: 71 }])
+  assert.equal(real.fakeWindow, false)
+  assert.equal(real.windowTokens, 1000000)
+  // non-window events are ignored; garbage never throws
+  assert.deepEqual(sessionEraSignals([{ type: 'recall' }, null, 'x']), {
+    fakeWindow: false, tinyWindow: false, overWindow: false, windowTokens: null, maxBeforePercent: null,
+  })
+  assert.equal(sessionEraSignals(undefined).fakeWindow, false)
+})
+
+test('era: synthetic requires fake window AND stress-level volume; qqb-g stays current', () => {
+  const fake = sessionEraSignals([{ type: 'compress', windowTokens: 2000, beforePercent: 1375 }])
+  // a46df597: pressure test — fake window + 2780 folders / 2180 pending
+  const pressure = sessionEra({ folders: 2780, pending: 2180, signals: fake })
+  assert.equal(pressure.era, 'synthetic')
+  assert.equal(pressure.reasons.stressBacklog, true)
+  assert.equal(pressure.reasons.fakeWindow, true)
+  // qqb-g-1134030529: channel test — fake window but only 10 folders / 2 pending
+  const channel = sessionEra({ folders: 10, pending: 2, signals: fake })
+  assert.equal(channel.era, 'current', 'a small channel session is not a pressure test')
+  assert.equal(channel.reasons.fakeWindow, true)
+  assert.equal(channel.reasons.stressBacklog, false)
+  // a real window never becomes synthetic, however big the backlog
+  const realWindow = sessionEra({ folders: 5000, pending: 4000, signals: sessionEraSignals([{ type: 'compress', windowTokens: 1000000 }]) })
+  assert.equal(realWindow.era, 'current')
+  // both stress thresholds work independently
+  assert.equal(sessionEra({ folders: 100, pending: 0, signals: fake }).era, 'synthetic')
+  assert.equal(sessionEra({ folders: 10, pending: 100, signals: fake }).era, 'synthetic')
+  assert.equal(sessionEra({ folders: 99, pending: 99, signals: fake }).era, 'current')
+})
+
+test('era: per-folder legacy boundary beats the session era; explicit markers win', () => {
+  const cutoff = LEGACY_ERA_CUTOFF_MS
+  const syntheticSession = { era: 'synthetic' }
+  const currentSession = { era: 'current' }
+  assert.equal(classifyFolderEra({ createdAt: cutoff - 1 }, currentSession), 'legacy')
+  assert.equal(classifyFolderEra({ createdAt: cutoff }, currentSession), 'current', 'the boundary itself is current')
+  assert.equal(classifyFolderEra({ createdAt: cutoff - 1 }, syntheticSession), 'legacy', 'legacy wins over synthetic')
+  assert.equal(classifyFolderEra({ createdAt: cutoff + 1 }, syntheticSession), 'synthetic')
+  assert.equal(classifyFolderEra({ createdAt: cutoff + 1 }, currentSession), 'current')
+  // createdAt 0 / missing / garbage falls through to the session era
+  assert.equal(classifyFolderEra({ createdAt: 0 }, currentSession), 'current')
+  assert.equal(classifyFolderEra({}, syntheticSession), 'synthetic')
+  assert.equal(classifyFolderEra(null, currentSession), 'current')
+  // an explicit pendingEra marker (memory-audit --apply) always wins
+  assert.equal(classifyFolderEra({ createdAt: cutoff + 1, pendingEra: 'legacy' }, currentSession), 'legacy')
+  assert.equal(classifyFolderEra({ createdAt: cutoff - 1, pendingEra: 'synthetic' }, currentSession), 'synthetic')
+  assert.equal(classifyFolderEra({ createdAt: cutoff - 1, pendingEra: 'nonsense' }, currentSession), 'legacy', 'unknown marker is ignored')
+})
+
+test('era: summarizeEras reproduces the documented 74.0% / 0.54% buckets', () => {
+  const cutoff = LEGACY_ERA_CUTOFF_MS
+  const folders = []
+  // legacy: 593 folders, 6 scored / 587 pending
+  for (let i = 0; i < 593; i += 1) folders.push({ id: `legacy-${i}`, createdAt: cutoff - 1000 - i, scored: i < 6 })
+  // synthetic: a46df597 shape — 2780 folders, 600 scored / 2180 pending
+  const syntheticSession = { era: 'synthetic' }
+  const synthetic = []
+  for (let i = 0; i < 2780; i += 1) synthetic.push({ id: `syn-${i}`, createdAt: cutoff + 1000 + i, scored: i < 600 })
+  // current: b5eeee7e 359/359 + qqb-g 10/8 (2 pending)
+  const current = []
+  for (let i = 0; i < 359; i += 1) current.push({ id: `b5-${i}`, createdAt: cutoff + 2000 + i, scored: true })
+  for (let i = 0; i < 10; i += 1) current.push({ id: `qq-${i}`, createdAt: cutoff + 5000 + i, scored: i >= 2 })
+
+  const legacy = summarizeEras(folders, { era: 'current' })
+  assert.equal(legacy.total, 593)
+  assert.equal(legacy.scored.legacy, 6)
+  assert.equal(legacy.pending.legacy, 587)
+
+  const syntheticSummary = summarizeEras(synthetic, syntheticSession)
+  assert.equal(syntheticSummary.pending.synthetic, 2180)
+  assert.equal(syntheticSummary.folders.synthetic, 2780)
+
+  const currentSummary = summarizeEras(current, { era: 'current' })
+  assert.equal(currentSummary.total, 369)
+  assert.equal(currentSummary.scored.current, 367)
+  assert.equal(currentSummary.pending.current, 2)
+  assert.equal(currentSummary.currentPendingPercent, 0.54)
+  assert.deepEqual(currentSummary.pendingFolders, ['qq-0', 'qq-1'])
+
+  // combined store: 74.0% overall, current-only 0.54% (era is classified per
+  // store, so the combined numbers are the sum of the three store summaries)
+  const all = {
+    total: legacy.total + syntheticSummary.total + currentSummary.total,
+    pending: {
+      legacy: legacy.pending.legacy,
+      synthetic: syntheticSummary.pending.synthetic,
+      current: currentSummary.pending.current,
+    },
+    scored: {
+      legacy: legacy.scored.legacy,
+      synthetic: syntheticSummary.scored.synthetic,
+      current: currentSummary.scored.current,
+    },
+  }
+  assert.equal(all.total, 3742)
+  assert.equal(all.pending.legacy, 587)
+  assert.equal(all.pending.synthetic, 2180)
+  assert.equal(all.pending.current, 2)
+  assert.equal(all.pending.legacy + all.pending.current + all.pending.synthetic, 2769)
+  assert.equal(Math.round(((all.pending.legacy + all.pending.current + all.pending.synthetic) / all.total) * 1000) / 10, 74)
+  assert.equal(all.scored.legacy + all.scored.synthetic + all.scored.current, 973)
 })

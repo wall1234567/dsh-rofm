@@ -1436,8 +1436,8 @@ node engine/cli.mjs --help        # 独立引擎 CLI
 | 7 | e2e-adapter | `node --test test/e2e-adapter-simulate.test.mjs`（8 用例，~4s） |
 | 8 | e2e-real-data | `node --test test/e2e-real-data-readonly.test.mjs`（6 用例，~5–8s） |
 
-**结果：8/8 PASS**；汇总 node:test 用例为 **827 + 14 = 841 / 839 pass / 0 fail**
-（发布冻结口径为 837 / 835 / 0；差异来自收尾期新增的 adapter 用例，门禁结论同为 0 fail）。
+**结果：8/8 PASS**；汇总 node:test 用例 = `node --test` 827 + e2e 14 = **841+ / 839+ pass / 0 fail**
+（发布冻结口径 837 / 835 / 0；收尾期实测 841–845，差异来自并行收尾新增的 adapter 用例，门禁结论同为 0 fail）。
 `npm run check` 是同一套检查的等价展开（把 e2e 换成 `npm test` 一步）。
 
 > 仓库零依赖，不需要 `npm install`；`npm test` 只是 `node --test` 的快捷方式。
@@ -1478,8 +1478,9 @@ node tools/selfcheck.mjs [--json] [--memory-dir <dir>] [--sessions-dir <dir>] \
 3. **memory store** — `index.json` ↔ 磁盘双向对账；每个 folder 的 `meta.json` 合法
    （id 与目录同名、`createdAt` 有限、α∈[0.01,1]、β∈[-10,10]、`scored` 布尔、scored=true 时 keywords 3~8）、
    不安全的 folder id、`images/index.json` 条目指向的文件存在、`stats.jsonl` 每行是合法 JSON；
-4. **recall state** — 各 `recall-state.json` 合法、`version: 3`（v2/v1 旧文件仍可读并给出提示）、
-   additions 与 ids 一致、id 安全；
+4. **recall state** — 各 `recall-state.json` 合法：`ids`/`additions` 数组一致、id 安全、addition 数字字段有限、
+   β 在 [-10,10]；v1.4.0 写 v3（含 lanes/ledger/counters），v2/v1 旧文件仍可读
+   （历史输出里的 “(v2 snapshot)” 是检查项的旧标签措辞，校验本身对 v3 同样适用，正在随遥测复核一起统一）；
 5. **pending era（v1.4.0 新增）** — 用 `engine/era.js` 的同一套规则把 pending 分到
    legacy/synthetic/current 三桶；legacy/synthetic 只 INFO（历史残留，不重评）；**只对 current 判 WARN/FAIL**
    （>5% 且 >20 条 WARN；>20% FAIL；current folder 少于 20 个时不判 FAIL，避免新库噪音）；
@@ -1524,10 +1525,10 @@ selfcheck: 10 passed, 1 warnings, 0 failed
 > neutral profile（没有 QQ 插件）下是 **7 passed / 1 warning / 0 failed**（8 条 check 行）。
 > 两种环境**只有 compat 行不同**，非 compat 检查的名称与状态逐一相同。
 
-测试覆盖（v1.3.0 为 **493 用例：491 pass + 2 skip、0 fail**；v1.4.0 在 2026-11-01 收尾实测为
-**827 用例：825 pass + 2 skip、0 fail**（engine 613 = 611 pass + 2 skip / adapter 213 / simulate 1），
+测试覆盖（v1.3.0 为 **493 用例：491 pass + 2 skip、0 fail**；v1.4.0 发布冻结口径为 **827 用例：825 pass + 2 skip、0 fail**
+（收尾期工作树实测 831 / 829 / 0 / 2；engine 613 / adapter 213+ / simulate 1），
 另有 2 个 e2e 文件 8 + 6 = 14 用例全绿；一键门禁 `node tools/verify-1.4.0.mjs` = **8/8 PASS**，
-汇总 node:test 用例 **841 / 839 pass / 0 fail**。最终数字以 [docs/VERIFICATION.md](docs/VERIFICATION.md) §20
+汇总 node:test 用例 **841–845 pass / 0 fail**（发布冻结口径 837 / 835；收尾期仍在并行新增用例）。最终数字以 [docs/VERIFICATION.md](docs/VERIFICATION.md) §20
 与发布门禁输出为准；CI 在 Linux/Windows/macOS × Node 20/22/24 上校验）：
 `test/` 覆盖引擎用例 + `simulate`（含 v1.3.0 的 compat / compat-autopatch / heuristic-score /
 passive-archive / qq-media / recall `minAlpha` 用例、`test/portability.test.mjs` 跨平台用例，

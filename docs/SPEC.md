@@ -2455,8 +2455,10 @@ exists**, WARN does not fail the run):
 3. `memory store` (`index.json` ↔ disk reconciliation both ways, `meta.json`
    schema including α/β/`scored`/keywords, unsafe ids, `images/index.json` files
    exist, `stats.jsonl` lines valid JSON);
-4. `recall state` (v3 `recall-state.json` snapshots consistent; v2/v1 accepted
-   with an INFO note);
+4. `recall state` (recall-state snapshots consistent: `ids`/`additions` arrays agree,
+   safe ids, finite addition numbers, β within [-10,10]; v1.4.0 writes v3 and the
+   check validates it like v2/v1 — the historical human-output label still says
+   "(v2 snapshot)", a cosmetic wording being unified with the telemetry review);
 5. `pending era` (v1.4.0 — same rules as `engine/era.js`): legacy/synthetic only
    INFO (historical residue, never re-judged); **only the current bucket** is
    judged: WARN when current pending > 5 % **and** > 20 folders, FAIL when
@@ -2702,9 +2704,14 @@ Required coverage (v1.3.0 baseline, still enforced):
       packaged config vs documented values; both package versions = 1.4.0).
 
 As of the v1.2.1 revision the suites were **188/188 (engine)** and **115/115
-(adapter)**; v1.3.0 measured **493 (491 pass + 2 skip)**. The v1.4.0 final numbers
-are recorded in `docs/VERIFICATION.md` §20 and printed by `npm test` — do not
-hardcode them here (they drift every release). Run `node --test test/*.test.mjs`,
+(adapter)**; v1.3.0 measured **493 (491 pass + 2 skip)**. The v1.4.0 release gate is
+`node tools/verify-1.4.0.mjs` (8 steps: full `node --test` / simulate / selfcheck /
+cli `--help` / memory-audit `--json` / time-view `--help` / e2e-adapter / e2e-real-data;
+all 8 exit 0 → PASS). Current measured numbers: full suite **827 tests / 825 pass /
+0 fail / 2 skip**, e2e **8 + 6 = 14**, gate summary **837 / 835 pass / 0 fail**
+(frozen release caliber); final numbers are recorded in `docs/VERIFICATION.md` §20 and
+printed by the gate — do not hardcode them here (they drift every release). Run
+`node tools/verify-1.4.0.mjs`, `node --test test/*.test.mjs`,
 `node --test test-adapter/*.test.mjs`, `node test/simulate.mjs`,
 `node tools/selfcheck.mjs`, `node engine/cli.mjs --help`,
 `node tools/memory-audit.mjs --json`, `node tools/recall-report.mjs --help`,

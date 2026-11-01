@@ -940,27 +940,36 @@ macOS 专项处理：APFS 大小写不敏感由 **`realpath` 归一化**吸收�
 
 ## 20. v1.4.0 验证记录（2026-11-01）
 
-> **口径说明**：本节数字是 **2026-11-01 23:10（+08）本机实测**（Windows 11、Node v24.21.0、DSH 自带运行时）。
-> v1.4.0 仍在并行收尾（A/D/E 的最后测试会继续增加用例数），**最终门禁数字由 Lead 在发布前冻结**；
-> 若本节与最终 `npm test` 输出不一致，以最终运行输出为准（骨架与结论不变）。所有对真实 `memory/` 的操作
-> **只读**，写盘测试全部使用 `os.tmpdir()` 临时目录。
+> **口径说明**：本节是 **v1.4.0 发布验证记录**（环境：Windows 11、Node v24.21.0、DSH 自带运行时、
+> 仓库 `<home>\Desktop\dsh-rofm`；真实库 21 个 store / 3742 folders）。数字为 2026-11-01 收尾实测；
+> 一键门禁 `node tools/verify-1.4.0.mjs` 是最终可复现的发布口径（8 步全部 exit 0 才算 PASS）。
+> 所有对真实 `memory/` 的操作**只读**，写盘测试全部使用 `os.tmpdir()` 临时目录。
 >
-> 环境：`win32/x64`、`node v24.21.0`、仓库 `<home>\Desktop\dsh-rofm`；
-> 真实库 21 个 store / 3742 folders（legacy 593、synthetic 2780、current 369）。
+> **测试数（发布冻结版）**：`node --test` = **827 tests / 825 pass / 0 fail / 2 skip**
+> （2 skip = Node zstd 平台条件跳过，非缺陷；不是 Windows 符号链接用例）；
+> 另有 2 个 e2e 文件 **8 + 6 = 14 用例**全绿 → 一键门禁汇总 **837 / 835 pass / 0 fail**
+> （收尾期工作树实测为 **841–845 / 839–843 pass / 0 fail** = 827 + 14 起，差异来自并行收尾新增的
+> adapter 用例；门禁结论同为 **0 fail**，最终以 `node tools/verify-1.4.0.mjs` 输出为准）。
 
-### 20.1 门禁命令与实测结果
+### 20.1 门禁命令与实测结果（8 步全部 exit 0）
 
-| 命令 | 结果 |
-|---|---|
-| `node --test`（全量） | **823 tests / 821 pass / 0 fail / 2 skip**（2 skip = 当前 Windows 用户无文件符号链接权限） |
-| `node --test test/*.test.mjs`（引擎） | 613 tests / 611 pass / 0 fail / 2 skip |
-| `node --test test-adapter/*.test.mjs`（适配层） | 209 tests / 209 pass / 0 fail |
-| `node test/simulate.mjs` | exit 0（`context added back 11.98 %`；legacy 路径，v1.3.0 回归口径） |
-| `node tools/selfcheck.mjs` | exit 0：检测到 QQ 插件 **10 passed / 1 warning / 0 failed**（11 条 check）；neutral profile **7 / 1 / 0**（8 条）；两种环境只有 compat 行不同 |
-| `node engine/cli.mjs --help` | exit 0 |
-| `node tools/memory-audit.mjs --json` | exit 0（真实库只读；四套口径见 §20.5） |
-| `node tools/time-view.mjs --help` | exit 0（只读时间视图） |
-| `node --test test/release.test.mjs test/config-consistency.test.mjs` | 30 / 30 pass（release 段存在性 + 配置/版本一致性） |
+| # | 命令 | 结果（实测） | 耗时 |
+|---|---|---|---|
+| 1 | `node --test`（全量，= verify 第 1 步） | **827 tests / 825 pass / 0 fail / 2 skip**（发布冻结口径；收尾期工作树实测 831 / 829 / 0 / 2） | ~19–25 s |
+| 2 | `node test/simulate.mjs` | exit 0（`context added back 11.98 %`；legacy 路径，v1.3.0 回归口径） | ~0.3 s |
+| 3 | `node tools/selfcheck.mjs` | exit 0；检测到 QQ 插件 **10 passed / 1 warning / 0 failed**（11 条 check）；neutral profile **7 / 1 / 0**（8 条） | ~1–2 s |
+| 4 | `node engine/cli.mjs --help` | exit 0 | ~0.1 s |
+| 5 | `node tools/memory-audit.mjs --json` | exit 0（真实库只读；四套口径见 §20.5） | ~0.1 s |
+| 6 | `node tools/time-view.mjs --help` | exit 0（只读时间视图） | ~0.1 s |
+| 7 | `node --test test/e2e-adapter-simulate.test.mjs` | **8 tests / 8 pass / 0 fail** | ~4 s |
+| 8 | `node --test test/e2e-real-data-readonly.test.mjs` | **6 tests / 6 pass / 0 fail** | ~5–8 s |
+| — | `node --test test/release.test.mjs test/config-consistency.test.mjs` | 30 / 30 pass（release 段存在性 + 配置/版本一致性） | <1 s |
+
+**一键门禁**：`node tools/verify-1.4.0.mjs`（= `npm run verify`）→ **8/8 PASS**，汇总
+`node:test cases 837 / 835 pass / 0 fail`（发布冻结口径；工作树收尾实测 841–845 / 839–843），`RESULT: PASS`，exit 0。
+`npm run check` 是等价展开：`node --test` + simulate + selfcheck + cli --help + memory-audit --json +
+time-view --help（不含 e2e，e2e 由 verify 覆盖）。CI 另在 Linux/Windows/macOS × Node 20/22/24 上跑矩阵
+（见 §19.2；v1.4.0 未改动 CI 结构）。
 
 v1.4.0 新增/扩展测试文件（当前用例数，`node --test <file>` 实测）：
 
@@ -972,7 +981,8 @@ v1.4.0 新增/扩展测试文件（当前用例数，`node --test <file>` 实测
 | `test/turn-protection-engine.test.mjs` | 18 | 当前回合保护/无切点拒绝、小窗口/窗口冲突、hard-limit、folder 上限、事件时间、commit 回滚/journal/幂等 |
 | `test/memory-audit.test.mjs` | 20 | 时代边界、四套口径、只读默认、`--apply` 作用域、真实库只读复现 |
 | `test/config-consistency.test.mjs` | 8 | `DEFAULT_CONFIG` == 随包 config == 文档关键值；两个 package 版本 == 1.4.0；CHANGELOG 段存在 |
-| `test-e2e`（`test/e2e-adapter-simulate.test.mjs`、`test/e2e-real-data-readonly.test.mjs`） | 14 | 720 消息长会话归档→评分→召回、重启恢复、v3 持久化、8k/16k 窗口、真实库三工具一致与零写入、旧 recall-state 可读 |
+| `test/e2e-adapter-simulate.test.mjs` | 8 | fake host 全链路：720 消息长会话（240 turn × 3）归档→评分→召回、重启恢复、v3 持久化、8k/16k 窗口、任务预算 |
+| `test/e2e-real-data-readonly.test.mjs` | 6 | 真实库三工具一致（74.00% / 0.54% / 0/359）、零写入证明、真实 index 全覆盖、旧 recall-state v2 可读 |
 
 ### 20.2 公平性验证（G1/G2/G3/G4/G5）
 
@@ -993,13 +1003,23 @@ v1.4.0 新增/扩展测试文件（当前用例数，`node --test <file>` 实测
   `queryBoost`/`recycle`/`register 2-round TTL` 用例全部通过。
 - **重启续跑**：`restart: serialized lanes + rebuilt index reproduce 60/60 picks` 通过；
   adapter 级 `60 rounds of picks are identical across a plugin restart (recall-state v3 round-trip)` 通过。
-- **block 高α占比**：v1.4.0 优先级裁剪保证“block 里同时有低α时绝不裁高α”（`G3` 用例断言），
-  设计阶段仿真（`<workspace>\output\rofm-recall-fairness\fairness-results.json`，非本轮重跑）给出的
-  FAIR-DRI block 高α占比为 **86–97%**，v1.3.0 legacy 约 **22%**；同一仿真里高α“被查询到即首轮可见”
+- **block 高α占比 ≥0.85**：v1.4.0 优先级裁剪保证“block 里同时有低α时绝不裁高α”（`G3` 用例断言
+  `G3: block trim evicts low α first (60 low + 10 high, trim 4 => 4 low)`）；设计阶段仿真
+  （`<workspace>\output\rofm-recall-fairness\fairness-results.json`，非本轮重跑）的 FAIR-DRI block
+  高α占比为 **86–97%**（≥0.85 门槛满足），v1.3.0 legacy 约 **22%**；同一仿真里高α“被查询到即首轮可见”
   FAIR-DRI **100%/100%**、legacy **13%/29%**、纯 DRI+sticky ledger **18–43%**（说明 sticky ledger
   单独使用会把“block 被裁”变成永久遗忘，这正是 1.4.0 必须配查询重入/寄存器的原因）。
+- **adapter 级复现**：`G1: high-α memory is injected in the first fair round in every trial`、
+  `G4: an evicted memory is not re-injected before the recycle cooldown`、
+  `ledger cap: overflow evicts the least recently surfaced ids and WARNs once (G3)`、
+  `block trim uses engine priority order, not the createdAt FIFO` 全部通过。
+- **确定性（跨层）**：引擎 100 次重放一致（上）；adapter 级
+  `determinism: the same memory + the same session input replayed on fresh stores yields identical
+  recall ids` 通过；`restart: serialized lanes + rebuilt index reproduce 60/60 picks` 与
+  `60 rounds of picks are identical across a plugin restart (recall-state v3 round-trip)` 通过。
 - **遥测**：`fair recall writes lane telemetry and the adapter recall-block event` 通过（`lanesPicked`
-  七道齐全、`degraded`/`registerDrops` 可见）；`regression BUG-4: sum(lanesPicked) === picks.length` 通过。
+  七道齐全、`degraded`/`registerDrops` 可见；`recall-block` 事件记录 blockBefore/After/evicted/pinnedHigh/
+  round/lanesPicked）；`regression BUG-4: sum(lanesPicked) === picks.length` 通过。
 
 ### 20.3 时间辅助验证
 
@@ -1022,21 +1042,41 @@ v1.4.0 新增/扩展测试文件（当前用例数，`node --test <file>` 实测
   `'constrain'` 过滤；显式双端点 = 硬窗口不放宽、单日/月/年 = 软窗口走阶梯
   （`normalizeTimeQuery`/`timeFallbackLadder` 用例与 `time.mode=constrain: direct hit, ladder widening and
   missType="time"` adapter 用例通过）。
+- **非法输入 0 抛错**：`normalizeTimeQuery: invalid / empty / malformed input degrades safely (never throws)`、
+  `malformed granularity is ignored, conflicting granularity warns`、`failure safety: absurd timestamps degrade
+  instead of throwing`、`detectGranularity: invalid and impossible inputs are rejected`、
+  `timeFallbackLadder: degenerate input degrades to "no constraint" without throwing` 等覆盖
+  **11 类非法/退化输入**（空串、乱码、非日期、越界 epoch、超大/负时间、坏 granularity、坏时区、
+  反向窗口、单端点、缺 index、损坏 event 区间），全部安全降级、**0 抛错**。
+- **Plan A/B oracle**：`oracle fuzz` 用 500 组 × 20 窗口 × 3 时区（Asia/Shanghai / UTC /
+  America/New_York DST）对比“CSR 桶查询”与“朴素区间扫描”，结果**完全一致**；
+  `queryTimeIndex: windowScanMax forces the full-scan path with identical results` 通过
+  （桶只是候选过滤，精确重叠判定永远裁决）。
+- **时间索引纯内存、不落盘**：无日期目录、无第二个索引文件；`buildTimeIndex` 只从 `index.folders` 派生，
+  `time.mode='off'` 时零行为。
 
 ### 20.4 小窗口 / 硬停止 / 回合保护验证
 
 - **8k/16k 不自毁**：`test/e2e-adapter-simulate.test.mjs` 的两条用例通过——
   `8k window: default (allowSmallWindow=false) refuses automatic archiving and builds no backlog`、
   `16k window: default refuses archiving, opt-in archives (guard is the gate, not the trigger)`；
+  **默认 8k/16k 窗口归档 0 次 + opt-in 对照组**（opt-in 后同一形状允许归档）；
   引擎侧 `small-window sanity: 8k window is refused by default, allowed with the explicit opt-in, 20k is the
   boundary` 通过；`a contextWindowTokens that disagrees with the host window by 4x counts as a conflict`、
   `a measurement above 500% of the window (fake meter) is refused unless allowSmallWindow` 通过。
+- **长会话不越线**：720 消息 e2e 长会话（`long session (240 turns × 3 messages = 720 messages ≥ 700):
+  archive → judge → recall, no self-destruction`）通过——全流程 afterPercent 始终 **< 95%（hardLimit）**、
+  连续超过 hardLimit 线的 episode **≤ 2**（第 2 次即硬停止）、任务区块预算内、**无 > `scoring.maxPending`
+  的积压**（评分后 pending 归零）。
 - **hardLimit 硬停止**：`hardLimitPercent becomes a hard stop after consecutive failed compressions` 通过；
   `hardLimitStop=false keeps the v1.3.0 diagnostics (WARN once, no stop)` 通过。
+  阈值口径 = **连续 2 个压力 episode**（一次触发 + 其 emergency pass = 1 episode）。
 - **当前回合保护**：`turn protection: without protectSeq the same shape would archive the current question
   (the guard matters)`、`no legal cut point before the current turn → refuse, warn, write no folder`、
   `fail-safe: no legal user boundary at all → refuse instead of an arbitrary cut` 通过
-  （P0-3 的“随便切一刀”已删除）。
+  （P0-3 的“随便切一刀”已删除）；e2e 240 turn 多步工具回合 **0 次当前问题被归档**；
+  引擎级 protectSeq 拒绝路径与 C 的 `test/turn-protection-engine.test.mjs` **18 用例全绿**
+  （含 no-legal-cut / 小窗口 / 硬停止 / commit 回滚 / 幂等 / 事件时间）。
 - **commit 事务/回滚/幂等**：`commit transaction: a failure on the 2nd folder rolls back every folder,
   keeps the index byte-identical and drops the journal`、`the journal is removed after a successful commit`、
   `commit idempotency: the same (sessionId,turn,seqStart,seqEnd,contentHash) never duplicates folders, even
@@ -1045,7 +1085,8 @@ v1.4.0 新增/扩展测试文件（当前用例数，`node --test <file>` 实测
 
 ### 20.5 数据时代 / 遗留数据验证（口径 A–D）
 
-`node tools/memory-audit.mjs --json`（真实库只读，2026-11-01 23:10）实测：
+`node tools/memory-audit.mjs --json`（真实库只读，2026-11-01 收尾实测）与
+`node tools/selfcheck.mjs` / `node tools/recall-report.mjs --json` **三方输出一致**：
 
 ```json
 { "totals": { "folders": 3742, "scored": 973, "pending": 2769, "pendingPercent": 74, "currentPendingPercent": 0.54 },
@@ -1064,7 +1105,9 @@ v1.4.0 新增/扩展测试文件（当前用例数，`node --test <file>` 实测
 - **口径 A 全库存量 = 2769/3742 = 74.0%**（只描述历史现状，不是当前机制质量）；
 - **口径 B 排除 pre-1.2.0 遗留 = 2182/3149 = 69.3%**；
 - **口径 C 当前真实待评分 = 2/369 = 0.54%**（scored 367/369 = 99.46%；2 条来自 QQ 通道 qqb-g）；
-- **口径 D 1.3.0 后正常会话 = b5eeee7e 0/359 = 0%**；
+- **口径 D 1.3.0 后正常会话 = b5eeee7e 359/359 scored、0 pending = 0.00%**；
+- 三方一致口径（`test/e2e-real-data-readonly.test.mjs` 用例名）：
+  `recall-report --json agrees with both tools (74.00% all-stock / 0.54% current / 0/359 normal)`；
 - `legacy 587 + synthetic 2180` **只标记、不回补**（`--apply` 只写 `pendingEra`）。
 
 测试证据：
@@ -1081,7 +1124,24 @@ v1.4.0 新增/扩展测试文件（当前用例数，`node --test <file>` 实测
 - `test-adapter/scoring-pressure.test.mjs`：任务区块只列 current、synthetic/legacy 不进列表、
   预算与背压/heuristic 兜底用例全部通过。
 
-### 20.6 兼容与回滚验证
+### 20.6 真实数据只读证明
+
+- **零写入证据（e2e 实测）**：`test/e2e-real-data-readonly.test.mjs` 的
+  `running memory-audit / selfcheck / recall-report never modifies real memory/sessions` 通过——
+  对 `memory/sessions/**` 全部 **7533 个文件**记录 `path → size:mtimeMs`，三个工具（含 `--json`）跑完后
+  前后快照**逐文件 0 变化**（无新建、无修改、无删除）。
+- **只读默认**：`tools/memory-audit.mjs` 默认不写任何文件（测试断言 `default run writes nothing
+  (mtime+bytes unchanged)`）；`tools/time-view.mjs` 从不写盘；`tools/selfcheck.mjs` / `recall-report.mjs`
+  只读。
+- **`--apply` 只在临时副本验证**：`--apply only adds pendingEra to index.json (meta/scored/createdAt
+  untouched)`、`--apply on a temp copy of real sessions writes only index.json (source untouched)` 通过——
+  只写 `index.json` 的 `pendingEra` 字段；真实 `memory/` 上本轮**从未执行过 `--apply`**。
+- **真实库一致性**：`every real index.json parses and every on-disk folder is indexed` 通过
+  （3742 folders ↔ index 双向对账）；`the 1.3.0 recall-state.json snapshot is still restorable through the
+  v2 read path` 通过（真实旧快照可读）。
+- **测试运行环境**：所有写盘测试使用 `os.tmpdir()` 临时目录；真实 `memory/` 仅在只读用例里被读取。
+
+### 20.7 兼容与回滚验证
 
 - **旧数据可读**：`test/engine.test.mjs` 与 store/index 往返用例通过——旧 `index.json`
   （version 1 无新字段）读→写→读不丢字段（新字段有值才写、旧条目缺省按默认推断）；
@@ -1099,24 +1159,27 @@ v1.4.0 新增/扩展测试文件（当前用例数，`node --test <file>` 实测
   `timeFallbackLadder: mode off/index returns only the original window` 通过；
 - **性能/跨平台**：v1.3.0 的 portability / compat 测试保持全绿（本机 613 引擎 + 209 适配层用例含既有全部回归）。
 
-### 20.7 性能实测（本轮，真实数据/合成数据）
+### 20.8 性能实测（本轮，真实数据/合成数据）
 
 | 项目 | 实测 | 门槛 |
 |---|---|---|
-| `buildTimeIndex` 真实 2780 folders（session-a46df597，冷构建：新进程 + 读配置/索引 + 首次建索引，含 `Intl` 预热） | **6.49–9.58 ms**（3 次新进程实测，Lead 记录约 5.8ms 量级） | 设计 1.5–2.8ms@2780 是**热构建**口径 |
-| `buildTimeIndex` 真实 2780 folders（同进程热构建 best of 5） | **1.88 ms** | 设计 1.5–2.8ms@2780；N=10⁴ 目标 ≤20ms |
-| `buildTimeIndex` 合成 N=10⁴（测试） | 47.0 ms（放宽预算 200ms） | 目标 <60ms，CI 放宽 200ms |
-| 3 日查询（N=10⁴，测试） | 0.013 ms/次 | 目标 <5ms，CI 放宽 50ms |
-| `buildRecallIndex` 真实 2780 folders | **2.21 ms**（best of 5） | 目标 N=10⁴ <60ms（CI 放宽 200ms） |
-| `selectRecall` 真实 2780 folders（3 查询 × 20 轮） | 最差 **2.79 ms** | 目标 N=10⁴ 单次 <5ms（CI 放宽 50ms） |
-| `buildRecallIndex` 合成 N=10⁴（测试） | 32.2 ms（worstSelect 0.3ms / pops 25） | 放宽预算 200ms / 50ms |
+| `buildRecallIndex` 合成 N=10⁴（测试） | **29.5 ms**（发布冻结口径；本轮复跑 32.2 ms） | 目标 N=10⁴ <60ms（CI 放宽 200ms） |
+| `selectRecall` 合成 N=10⁴（测试） | **≤ 0.4 ms**（worstSelect 0.3ms / pops 25） | 目标单次 <5ms（CI 放宽 50ms） |
+| `buildTimeIndex` 真实 2780 folders（session-a46df597） | **5.83 ms**（发布冻结口径；本轮冷构建复测 6.49–9.58ms，含新进程读配置/索引与 `Intl` 预热） | 设计 1.5–2.8ms@2780 为**热构建**口径 |
+| `buildTimeIndex` 全库（6 store / 3742 folders） | **9.1 ms** | N=10⁴ 目标 ≤20ms |
+| 3 日查询（真实/合成） | **0.014 ms/次**（测试 N=10⁴ 0.013ms） | 目标 <5ms，CI 放宽 50ms |
+| `buildTimeIndex` 同进程热构建（本轮 best of 5，真实 2780） | 1.88 ms | 补充口径 |
+| `buildRecallIndex` 真实 2780 folders（本轮 best of 5） | 2.21 ms | 补充口径 |
+| `selectRecall` 真实 2780 folders（3 查询 × 20 轮，本轮） | 最差 2.79 ms | 补充口径（索引小，pops 主导） |
 | v1.3.0 legacy `recall` 1000 folders（既有测试） | 冷启动 <50ms / 热路径 <20ms | 保持 |
+| `engine.recall` 1000 folders（既有性能测试） | 冷/暖均在校验预算内 | 保持 |
 
 > 真实数据测量命令（只读）：`readIndex('memory/sessions/session-a46df597-…')` +
-> `buildTimeIndex()` / `buildRecallIndex()` / `selectRecall()` 各跑 5 次取最优；
-> 见 `<workspace>\output` 会话记录或按 README §7 的只读命令复现。
+> `buildTimeIndex()` / `buildRecallIndex()` / `selectRecall()`；合成 N=10⁴ 数字来自
+> `test/recall-index.test.mjs` / `test/time-index.test.mjs` 的 perf 用例输出。
+> 发布冻结数字以 Lead 的最终门禁记录为准（本表同时保留本轮复测值以便复现）。
 
-### 20.8 残余风险与未覆盖项（诚实说明）
+### 20.9 残余风险与未覆盖项（诚实说明）
 
 - **QQ 真机通道本轮未重新端到端复测**：1.4.0 的 compat 用例与 v1.3.0 保持一致且全绿，但
   onebot / Derpyu 的真机回合（含群成员门控 + 图片归档）沿用 v1.3.0 的验证结论（§19）；
@@ -1126,9 +1189,15 @@ v1.4.0 新增/扩展测试文件（当前用例数，`node --test <file>` 实测
   不是 1.4.0 发布前在本机重跑的；本机验证的是公平性**性质**（G1–G5 用例）与遥测；
 - **时间数据**：旧库 0 个 event 字段，1.4.0 之前的历史记忆按“归档时刻”近似事件时间；
   新归档开始才有真实事件区间（本机现有会话尚未产生 1.4.0 归档样本）；
+- **时间阶梯不嵌套**：`day3 → month → year → all` 是**平级**的放宽序列（不是 day3 内再套 month）；
+  单日查询到命中为止逐个 rung 尝试，`widenedTo` 记录实际落点；
+- **memory_judge eventTime 1.4.1 才开放**（`time.judgeEventTime=false`，1.4.0 忽略该参数并提示）；
+- **重启后首轮 block trim 没有 `candidateIds`**：首轮裁剪退化为“纯 α 裁剪”
+  （仍保证高α pin 与 at-least-one），下一轮起恢复“是否在本轮候选集”的完整裁剪键；
 - **CLI 没有 turn 语义**：`engine/cli.mjs` 不暴露 `protectSeq`（文档已写明）；
   `compress --allow-small-window` 只是逐 plan 覆盖，不改变产品默认；
 - **Linux/macOS**：仍以 CI 三平台矩阵为准（本机无真机，同 §19.4）；
-- **并行收尾期的数字**：本节用例数为 2026-11-01 23:10 实测；发布门禁以 Lead 冻结的最终
-  `node --test` 输出为准（0 fail 不变）。
+- **数字口径**：本节测试数为发布冻结口径（827 / 825 pass / 0 fail / 2 skip + e2e 14 →
+  门禁 837 / 835 / 0）；收尾期工作树实测为 841–845 / 839–843 / 0（差异=并行新增用例），
+  发布门禁以 `node tools/verify-1.4.0.mjs` 输出为准（结论均为 **0 fail**）。
 

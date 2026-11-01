@@ -559,3 +559,75 @@ test('event time: the adapter parallel `eventTimes` array (no message.time) maps
   const removedTimes = eventTimes.slice(0, plan.remove.length).filter((time) => Number.isFinite(time))
   assert.deepEqual(plan.eventTime, { start: Math.min(...removedTimes), end: Math.max(...removedTimes) + 1, source: 'messages' })
 })
+
+// ---------------------------------------------------------------------------
+// P2/D2 — idempotency keys must come from the index, not a per-commit scan of
+// every folder's meta.json (the adapter always sends idempotencyKey: true).
+// ---------------------------------------------------------------------------
+
+test('commit idempotency is index-based: a 1000-folder index with no meta files stays fast and dedupes', () => {
+  const cfg = makeCfg()
+  const memoryDir = tempDir()
+  // Fixture: an index with 1000 folders that carry idempotencyKey entries but NO
+  // meta.json on disk at all. The pre-D2 implementation scanned memory/<id>/meta.json
+  // on every commit, which both cost O(folders) disk reads and could not see any
+  // key in this fixture; the index-based implementation reads the already-loaded
+  // index once and must recover every key from it.
+  const seedFolders = []
+  for (let index = 0; index < 1000; index += 1) {
+    seedFolders.push({
+      id: formatFolderId(1700000000000, index + 1),
+      createdAt: 1700000000000 + index,
+      alpha: 0.5,
+      beta: 0,
+      keywords: ['部署'],
+      chars: 100,
+      tokens: 40,
+      messageCount: 2,
+      title: `seed ${index}`,
+      scored: true,
+      idempotencyKey: `seed|0|${index}|${index}|${`h${index}`.padEnd(16, 'h')}`,
+    })
+  }
+  writeIndex(memoryDir, cfg, { version: 1, folders: seedFolders, nextCounter: 1001 })
+  const { indexPath } = memoryPaths(memoryDir, cfg)
+  assert.equal(JSON.parse(fs.readFileSync(indexPath, 'utf8')).folders.length, 1000)
+  assert.deepEqual(
+    fs.readdirSync(memoryDir).filter((name) => name.startsWith('mem-')),
+    [],
+    'the fixture intentionally has no folder directories: only index.json exists',
+  )
+
+  const messages = withSeq(makeMessages(16))
+  const base = { messages, usedPercent: 90, cfg, totalUsedTokens: 1600, sessionId: 'perf-idem', turn: 6 }
+  const planA = planCompression({ ...base, now: 1700000005000 })
+  assert.ok(planA.folders.length > 0)
+  const onCi = process.env.CI === 'true' || process.env.GITHUB_ACTIONS === 'true'
+  const budgetMs = onCi ? 1500 : 300
+  const startedAt = performance.now()
+  const first = commitCompression(planA, { memoryDir, cfg, sessionId: 'perf-idem', turn: 6, idempotencyKey: true })
+  const elapsed = performance.now() - startedAt
+  assert.equal(first.folders.length, planA.folders.length)
+  assert.ok(elapsed < budgetMs, `idempotent commit over a 1000-folder index took ${elapsed.toFixed(2)}ms (budget ${budgetMs}ms)`)
+
+  // New index entries must expose the idempotency key (it is copied by
+  // store.indexEntryFromMeta), otherwise the next commit could not dedupe.
+  const indexAfterFirst = loadIndex(memoryDir, cfg)
+  assert.equal(indexAfterFirst.folders.length, 1000 + planA.folders.length)
+  for (const folder of first.folders) {
+    const entry = indexAfterFirst.folders.find((item) => item.id === folder.id)
+    assert.ok(entry, `committed folder ${folder.id} is listed in the index`)
+    assert.equal(typeof entry.idempotencyKey, 'string')
+    assert.ok(entry.idempotencyKey.length > 0)
+    assert.equal(readFolder(memoryDir, folder.id).meta.idempotencyKey, entry.idempotencyKey)
+  }
+
+  // Retry with a new `now` (different createdAt/folder ids) is deduped from the
+  // index alone — no meta scan and no duplicate folders.
+  const planB = planCompression({ ...base, now: 1700000009999 })
+  assert.notEqual(planB.folders[0].id, planA.folders[0].id)
+  const second = commitCompression(planB, { memoryDir, cfg, sessionId: 'perf-idem', turn: 6, idempotencyKey: true })
+  assert.equal(second.folders.length, 0, 'the retry must not write duplicate folders')
+  assert.equal(second.skipped, planB.folders.length)
+  assert.equal(loadIndex(memoryDir, cfg).folders.length, 1000 + planA.folders.length)
+})

@@ -78,8 +78,14 @@ The project follows a lightweight [SemVer](https://semver.org/) scheme.
   pendingHigh、highRecycle、recycle）/ `ledger` / `counters{reInjections,registerDrops,recallTimeEvicted,timeMisses}` /
   `degraded`；读 v2 只恢复 block（ledger/lanes 重置，允许有界重复、不丢记忆），读 v1 仍按 ids 重建；写回 v3。
 - **`memory_recall` 分页**：`offset` 参数（0..10000，默认 0）；结果渲染“本页：第 N～M 条 / 还有更多：可用 offset=… 继续翻页”。
-- **lane/保证遥测**：`recall` 事件新增 `mode/candidates/lanesPicked{…}/pops/frontierHits/registerDrops/
-  reInjections/degraded/timeFiltered/timeWindow/offset/limit/hasMore/missType`，`added[].lane` 记录来源车道。
+- **`memory_recall` 选路与自动召回一致（G4）**：手动检索也通过 `plugin.getRecallContext()` 传入
+  `{lanes, round, blockIds, ledger}`（`exclude = block ∪ ledger`），因此不会绕过 recycle 冷却重复注入
+  刚被裁掉的记忆；重新浮出的合法通道是 recycle 冷却与 `offset` 分页。纯时间 browse 不读不写 lane 状态；
+  legacy 模式完全不传这些 v1.4.0 参数（回滚）。
+- **lane/保证遥测**：`recall` 事件（engine）新增 `mode/candidates/lanesPicked{…}/pops/frontierHits/registerDrops/
+  reInjections/degraded/timeFiltered/timeWindow/offset/limit/hasMore/missType`，`added[].lane` 记录来源车道；
+  另新增 adapter 侧 **`recall-block`** 事件：`blockBefore/blockAfter/evicted/pinnedHigh/round/lanesPicked`
+  （记录注入 + 优先级裁剪对 block 的实际影响）。
 - **`tools/selfcheck.mjs` 新检查 `recall fairness`**：聚合 lane 分布、`registerDrops`、`degraded`、`missType`、
   `guarantees`（meanPicks / highAlphaLaneShare）；旧遥测缺字段只 INFO。
 
@@ -279,6 +285,12 @@ The project follows a lightweight [SemVer](https://semver.org/) scheme.
 - **版本**：`package.json` 与 `engine/package.json` → **1.4.0**。
 - **`test/config-consistency.test.mjs`（新）**：断言 `DEFAULT_CONFIG` == 随包 `config.json`（除两处有意的
   `time` 产品覆盖）== 文档中的关键默认值，且两个 `package.json` 版本一致 = 1.4.0。
+- **`tools/verify-1.4.0.mjs`（新）一键门禁**：8 步 = 全量 `node --test` / `test/simulate.mjs` /
+  `tools/selfcheck.mjs` / `engine/cli.mjs --help` / `tools/memory-audit.mjs --json` /
+  `tools/time-view.mjs --help` / `test/e2e-adapter-simulate.test.mjs` / `test/e2e-real-data-readonly.test.mjs`；
+  全部 exit 0 → `RESULT: PASS`，并汇总 node:test 用例数。
+- **`package.json` scripts**：`check` 追加 `memory-audit --json` 与 `time-view --help`；新增
+  `verify` = `node tools/verify-1.4.0.mjs`（保留 `release`/`release:status`/`test`/`simulate`/`selfcheck`/`cli`）。
 
 ### 已知限制
 
@@ -289,13 +301,19 @@ The project follows a lightweight [SemVer](https://semver.org/) scheme.
 - heuristic 兜底质量低于模型评分（α 启发式、β=0、关键词 tokenizer），只保证可回忆、不保证准。
 - 时间辅助不建物理日/月/年目录；不要手工按日期搬 folder（会被判定为数据损坏）。
 - 1.4.0 不开放 `memory_judge` 的 eventTime 覆写（`time.judgeEventTime=false`，留 1.4.1 评估）。
+- 时间阶梯 `day3 → month → year → all` 是平级放宽序列（不是 day3 内再嵌套 month）。
+- 重启后首轮 block 裁剪没有 `candidateIds`，退化为纯 α 裁剪（仍保证高α pin 与至少保留 1 条）。
 
 ### Tests
 
 - v1.4.0 新增/扩展测试：`test/recall-index.test.mjs`、`test/time-index.test.mjs`、`test/keyword-match.test.mjs`、
-  `test/turn-protection-engine.test.mjs`、`test/memory-audit.test.mjs`、`test/config-consistency.test.mjs`，
-  以及 `test-adapter/` 的公平性/确定性/评分压力/时间工具适配用例；最终全量数字以
-  `docs/VERIFICATION.md` §20 为准（本条目不改写历史 v1.3.0 的 493 用例基线）。
+  `test/turn-protection-engine.test.mjs`、`test/memory-audit.test.mjs`、`test/config-consistency.test.mjs`、
+  `test/e2e-adapter-simulate.test.mjs`、`test/e2e-real-data-readonly.test.mjs`，以及 `test-adapter/` 的
+  公平性/确定性/评分压力/时间工具适配用例。
+- 发布门禁 `node tools/verify-1.4.0.mjs` = **8/8 PASS**；`node --test` = **827 tests / 825 pass / 0 fail / 2 skip**
+  （2 skip = Node zstd 平台条件跳过，非缺陷）+ e2e **8 + 6 = 14** → 门禁汇总 **837 / 835 pass / 0 fail**
+  （发布冻结口径）；收尾期最后一次工作树实测为 845 / 843 pass / 0 fail（差异=并行收尾新增用例，0 fail 不变）。
+  最终数字以 `docs/VERIFICATION.md` §20 与门禁输出为准（本条目不改写历史 v1.3.0 的 493 用例基线）。
 
 ## [1.3.0] — 2026-10-31
 

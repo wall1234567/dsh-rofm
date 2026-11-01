@@ -900,3 +900,33 @@ test('compress: eventStart/eventEnd/eventTimeSource are collected from message t
   assert.deepEqual(eventTimeRangeOf([{ time: 30 }, { time: 10 }]), { start: 10, end: 31, source: 'messages' })
   assert.equal(eventTimeRangeOf([{ role: 'user', content: 'no time' }]), null)
 })
+
+test('compress: a release-capped 1-folder archive is flagged as trickle telemetry (O1)', () => {
+  // Just above the trigger in a large window: the remaining releasable amount
+  // ((61-60)% of 128k = 1280 tokens) is smaller than the compressPercent target
+  // (20% of 8000 = 1600), so the archive is release-capped and yields one folder.
+  const cfg = makeCfg({
+    compress: { compressPercent: 20, keepRecentMessages: 2, targetChunkChars: 2000, minChunkChars: 50, maxFoldersPerRun: 100 },
+  })
+  const messages = makeMessages(16)
+  const plan = planCompression({ messages, usedPercent: 61, cfg, totalUsedTokens: 8000, windowTokens: 128000, sessionId: 'trickle', now: 1700000000000 })
+  assert.equal(plan.shouldCompress, true)
+  assert.equal(plan.releaseCapped, true)
+  assert.equal(plan.folders.length, 1)
+  assert.equal(plan.trickleArchive, true, 'a capped 1-folder archive is a trickle archive')
+
+  const memoryDir = tempDir()
+  const committed = commitCompression(plan, { memoryDir, cfg, sessionId: 'trickle' })
+  assert.equal(committed.folders.length, 1)
+  const compressEvent = readStats(memoryDir, cfg).filter((event) => event.type === 'compress').at(-1)
+  assert.equal(compressEvent.trickleArchive, true)
+  assert.equal(compressEvent.releaseCapped, true)
+  assert.equal(compressEvent.foldersArchived, 1)
+
+  // A normal multi-folder archive keeps the flag off (behaviour is unchanged).
+  const normalCfg = makeCfg({ compress: { compressPercent: 80, keepRecentMessages: 2, targetChunkChars: 120, minChunkChars: 20 } })
+  const normalPlan = planCompression({ messages: makeMessages(16), usedPercent: 90, cfg: normalCfg, totalUsedTokens: 1600, now: 1700000000001 })
+  assert.ok(normalPlan.folders.length > 1)
+  assert.notEqual(normalPlan.releaseCapped, true)
+  assert.equal(normalPlan.trickleArchive, false)
+})

@@ -22,8 +22,18 @@ import {
     validateConfig,
 } from './config.js'
 import { commitCompression, planCompression } from './compress.js'
-import { buildRecallBlock, recall as runRecall } from './recall.js'
-import { buildTimeIndex, normalizeTimeQuery, queryTimeIndex } from './time-index.js'
+import { buildRecallBlock, loadRecallAdditions, recall as runRecall } from './recall.js'
+import {
+    buildRecallIndex,
+    countCandidates,
+    deserializeLanes,
+    emptyLanes,
+    lanesFingerprint,
+    querySeeds,
+    selectRecall,
+    serializeLanes,
+} from './recall-index.js'
+import { buildTimeIndex, normalizeTimeQuery, queryTimeIndex, timeFallbackLadder } from './time-index.js'
 import {
     appendStats,
     cleanupCommitJournals,
@@ -43,6 +53,58 @@ function clampInt(value, min, max, fallback) {
   if (truncated < min) return min
   if (truncated > max) return max
   return truncated
+}
+
+/** Round to two decimals (telemetry) without ever returning -0. */
+function round2(value) {
+  if (!Number.isFinite(value)) return 0
+  const rounded = Math.round((value + Number.EPSILON) * 100) / 100
+  return Object.is(rounded, -0) ? 0 : rounded
+}
+
+/** Same ordering rules as the v1.3.0 recall renderer (`recall.sort`). */
+function sortRecallAdditions(additions, sortMode) {
+  const list = Array.isArray(additions) ? additions.slice() : []
+  const createdAtOf = (addition) => (Number.isFinite(Number(addition?.createdAt)) ? Number(addition.createdAt) : 0)
+  const idCompare = (a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0)
+  if (sortMode === 'alpha') list.sort((a, b) => b.alpha - a.alpha || createdAtOf(a) - createdAtOf(b) || idCompare(a, b))
+  else if (sortMode === 'generation') list.sort((a, b) => a.generation - b.generation || createdAtOf(a) - createdAtOf(b) || idCompare(a, b))
+  else list.sort((a, b) => createdAtOf(a) - createdAtOf(b) || idCompare(a, b))
+  return list
+}
+
+/**
+ * Unique candidate counts for one query: |C(Q)| (all keyword matches above the
+ * α floor) and |C(Q) ∩ W| (inside the time window).
+ *
+ * The selector's own counters are lane/pop oriented (and count per-lane work),
+ * so telemetry and the time-miss classification measure the two set sizes here.
+ * O(sum of posting lengths), Set-deduplicated.
+ */
+function uniqueCandidateCounts(index, seeds, options = {}) {
+  const entries = index && Array.isArray(index.entries) ? index.entries : []
+  const postings = index && index.postings instanceof Map ? index.postings : new Map()
+  const minAlpha = Number(options.minAlpha)
+  const alphaFloor = Number.isFinite(minAlpha) ? Math.min(1, Math.max(0, minAlpha)) : 0
+  const timeIds = options.timeIds instanceof Set ? options.timeIds : null
+  const seen = new Set()
+  let all = 0
+  let inWindow = 0
+  for (const seed of Array.isArray(seeds) ? seeds : []) {
+    const posting = postings.get(seed)
+    if (!Array.isArray(posting)) continue
+    for (const at of posting) {
+      if (seen.has(at)) continue
+      seen.add(at)
+      const entry = entries[at]
+      if (!entry) continue
+      if (alphaFloor > 0 && entry.alpha < alphaFloor) continue
+      all += 1
+      if (timeIds && !timeIds.has(entry.id)) continue
+      inWindow += 1
+    }
+  }
+  return { all, inWindow }
 }
 
 export class MemoryEngine {
@@ -149,6 +211,11 @@ export class MemoryEngine {
     this.cfg = validateConfig(mergeConfig(this.cfg, partial || {}))
     if (!this._explicitMemoryDir) this.memoryDir = resolveMemoryDir(this.cfg, this.baseDir)
     this._cache = { index: null, mtimeMs: -1, size: -1 }
+    // v1.4.0 derived caches are config-fingerprint keyed; drop them eagerly.
+    this._timeIndexCache = undefined
+    this._recallIndexCache = undefined
+    this._lanes = undefined
+    this._round = 0
     this._loaded = false
     this.load()
     return this.cfg
@@ -251,7 +318,15 @@ export class MemoryEngine {
     let result =
       mode === 'legacy'
         ? null
-        : this._deterministicRecall({ userText, context: ctx, options: opts, index: refreshed.index, mode, timePlan })
+        : this._deterministicRecall({
+            userText,
+            context: ctx,
+            options: opts,
+            index: refreshed.index,
+            mode,
+            timePlan,
+            startedAt: typeof performance !== 'undefined' && performance && typeof performance.now === 'function' ? performance.now() : undefined,
+          })
     if (!result) {
       result = runRecall({
         userText,
@@ -275,17 +350,29 @@ export class MemoryEngine {
       result.warnings = [...(Array.isArray(result.warnings) ? result.warnings : []), ...timePlan.warnings]
     }
 
-    // --- v1.4.0 pagination (deterministic selectors only in practice) --------
-    const offset = clampInt(opts.offset, 0, 1_000_000, 0)
-    const limitRaw = Number(opts.limit)
-    const limit = Number.isFinite(limitRaw) && limitRaw > 0 ? Math.min(1000, Math.floor(limitRaw)) : additions.length
-    const pageItems = offset > 0 || limit < additions.length ? additions.slice(offset, offset + limit) : additions
-    const page = {
-      offset,
-      limit,
-      total: additions.length,
-      returned: pageItems.length,
-      hasMore: offset + limit < additions.length,
+    // --- v1.4.0 pagination ---------------------------------------------------
+    // The deterministic selector already paginated (it needs offset+limit to
+    // build the page); the legacy path is sliced here for signature parity.
+    let offset = 0
+    let limit = additions.length
+    let pageItems = additions
+    let page
+    if (result.paginated === true && result.page) {
+      page = result.page
+      offset = page.offset
+      limit = page.limit
+    } else {
+      offset = clampInt(opts.offset, 0, 1_000_000, 0)
+      const limitRaw = Number(opts.limit)
+      limit = Number.isFinite(limitRaw) && limitRaw > 0 ? Math.min(1000, Math.floor(limitRaw)) : additions.length
+      pageItems = offset > 0 || limit < additions.length ? additions.slice(offset, offset + limit) : additions
+      page = {
+        offset,
+        limit,
+        total: additions.length,
+        returned: pageItems.length,
+        hasMore: offset + limit < additions.length,
+      }
     }
 
     // --- v1.4.0 miss classification (drives the memory_recall strike logic) --
@@ -305,6 +392,7 @@ export class MemoryEngine {
           widenedTo: result.timeWindow?.widenedTo ?? null,
           requested: timePlan.normalized.requested,
           enforced: timePlan.enforced,
+          hardWindow: timePlan.hardWindow === true,
           hits: timePlan.hits,
           timezone: timePlan.timezone,
         }
@@ -394,6 +482,12 @@ export class MemoryEngine {
       const normalized = normalizeTimeQuery({ timeFrom: opts.timeFrom, timeTo: opts.timeTo, granularity: opts.granularity }, this.cfg, Date.now())
       const timeIndex = this.timeIndex()
       const query = queryTimeIndex(timeIndex, normalized, this.cfg)
+      // A caller-provided explicit *range* (both endpoints) is a HARD window: it
+      // must not silently widen, because "no memory in that range" is exactly the
+      // signal the model needs ("the time may be wrong — ask the user"). A single
+      // day/month/year is a SOFT window and follows the fallback ladder.
+      const hasFrom = opts.timeFrom !== undefined && opts.timeFrom !== null && opts.timeFrom !== ''
+      const hasTo = opts.timeTo !== undefined && opts.timeTo !== null && opts.timeTo !== ''
       return {
         active: true,
         normalized,
@@ -402,6 +496,7 @@ export class MemoryEngine {
         ids: query.ids,
         hits: query.count,
         enforced: query.ids !== null,
+        hardWindow: hasFrom && hasTo,
         timezone,
         warnings: Array.isArray(normalized.warnings) ? normalized.warnings : [],
       }
@@ -452,12 +547,223 @@ export class MemoryEngine {
   }
 
   /**
-   * v1.4.0 FAIR-DRI recall. Implemented in engine/recall-index.js (wave-2); the
-   * engine keeps the v1.3.0 probability path as long as this returns null so the
-   * migration never ships a half-wired selector.
+   * v1.4.0 FAIR-DRI recall (engine/recall-index.js): deterministic selection with
+   * the rare-term / high-α / register / probe / rotation / recycle lanes.
+   *
+   * Returns `null` for `mode === 'legacy'` callers (see recall()). The lane state
+   * is mutable and *replaced* by the selector's normalized copy, so the caller
+   * (the adapter, via recall-state.json v3) must persist `result.lanes`.
    */
-  _deterministicRecall() {
-    return null
+  _deterministicRecall(input) {
+    const request = input && typeof input === 'object' ? input : {}
+    const opts = request.options && typeof request.options === 'object' ? request.options : {}
+    const cfg = this.cfg
+    const recallCfg = cfg && typeof cfg.recall === 'object' && cfg.recall ? cfg.recall : {}
+    const timeCfg = cfg && typeof cfg.time === 'object' && cfg.time ? cfg.time : {}
+    const timePlan = request.timePlan || { active: false, ids: null, enforced: false, normalized: null }
+    const mode = request.mode === 'deterministic' ? 'deterministic' : 'fair'
+    const userText = typeof request.userText === 'string' ? request.userText : ''
+
+    // --- page window (deterministic: k = offset + limit) ---------------------
+    const offset = clampInt(opts.offset, 0, 1_000_000, 0)
+    const limitRaw = Number(opts.limit)
+    const requestedLimit = Number.isFinite(limitRaw) && limitRaw > 0 ? Math.min(1000, Math.floor(limitRaw)) : null
+    const firstGenMax = Number.isFinite(Number(recallCfg.firstGenMax)) ? Math.max(1, Math.floor(Number(recallCfg.firstGenMax))) : 10
+    const take = requestedLimit ?? firstGenMax
+    // +1 lookahead pick so the page can report `hasMore` without a second pass.
+    const k = Math.min(2000, offset + take + 1)
+
+    const index = this.recallIndex()
+    const baseLanes = opts.lanes && typeof opts.lanes === 'object' && opts.lanes
+      ? opts.lanes
+      : this._lanes && typeof this._lanes === 'object'
+        ? this._lanes
+        : emptyLanes()
+    const fallbackRound = Number.isFinite(Number(baseLanes.round)) ? Number(baseLanes.round) + 1 : 1
+    const round = clampInt(opts.round, 1, 2_000_000_000, Math.max(1, fallbackRound))
+    const hopsRaw = Number(opts.hops)
+    const hops = Number.isFinite(hopsRaw) ? Math.max(0, Math.floor(hopsRaw)) : recallCfg.hops
+    const warnings = []
+
+    // --- time fallback ladder (plan §3.3.3): L0 → day3 → month → year → all --
+    const attempts = [{ ids: timePlan.active ? timePlan.ids : null, widenedTo: null, level: timePlan.normalized ? timePlan.normalized.level : null }]
+    const canLadder = timePlan.active === true && timePlan.enforced === true && timePlan.hardWindow !== true && timeCfg.mode === 'constrain'
+    if (canLadder) {
+      try {
+        const timeIndex = this.timeIndex()
+        for (const rung of timeFallbackLadder(timePlan.normalized, cfg)) {
+          const query = queryTimeIndex(timeIndex, rung, cfg)
+          attempts.push({
+            // ids === null means "no constraint" (the `all` rung): never filter.
+            ids: query.ids,
+            widenedTo: rung.widenedTo,
+            level: rung.level,
+          })
+        }
+      } catch (error) {
+        warnings.push(`recall: time ladder failed (${error && error.message ? error.message : error}); using the requested window`)
+      }
+    }
+    const minResults = Math.max(1, Number(timeCfg.fallbackMinResults) || 1)
+    // A failed (too narrow) rung must not advance cursor/register/recycle state:
+    // every attempt starts from this pre-round snapshot and only the chosen
+    // attempt's lane state is committed at the end.
+    const laneSnapshot = serializeLanes(baseLanes)
+    let chosen
+    for (let step = 0; step < attempts.length; step += 1) {
+      const attempt = attempts[step]
+      const lanesForAttempt = deserializeLanes(laneSnapshot)
+      const result = selectRecall(index, userText, {
+        cfg,
+        lanes: lanesForAttempt,
+        round,
+        mode,
+        blockIds: opts.blockIds,
+        ledger: opts.ledger,
+        excludeIds: opts.excludeIds,
+        minAlpha: opts.minAlpha,
+        timeIds: attempt.ids,
+        k,
+        hops,
+      })
+      if (Array.isArray(result.warnings) && result.warnings.length > 0) {
+        for (const warning of result.warnings) if (!warnings.includes(warning)) warnings.push(warning)
+      }
+      if (!chosen) chosen = { result, attempt }
+      if ((result.picks || []).length >= minResults) {
+        chosen = { result, attempt }
+        break
+      }
+      if (!canLadder) break
+    }
+
+    const result = chosen.result
+    const attempt = chosen.attempt
+    const selectStats = result.stats || {}
+    const allPicks = Array.isArray(result.picks) ? result.picks : []
+    const pagePicks = allPicks.slice(offset, offset + take)
+    const pageHasMore = allPicks.length > offset + take
+
+    // --- load the folder bodies (same shape as the legacy path) -------------
+    const picked = []
+    for (const pick of pagePicks) {
+      const at = index.byId.get(pick.id)
+      const entry = at === undefined ? null : index.entries[at]
+      picked.push({
+        folder: entry && entry.folder ? entry.folder : { id: pick.id, alpha: pick.alpha, createdAt: pick.createdAt },
+        id: pick.id,
+        generation: Number.isFinite(pick.generation) ? pick.generation : 1,
+        alpha: Number.isFinite(pick.alpha) ? pick.alpha : 0,
+        createdAt: Number.isFinite(pick.createdAt) ? pick.createdAt : 0,
+        probability: 1,
+        roll: 1,
+        lane: pick.lane,
+      })
+    }
+    const loadWarnings = []
+    const additions = sortRecallAdditions(loadRecallAdditions(picked, { memoryDir: this.memoryDir, warnings: loadWarnings }), recallCfg.sort)
+    for (const warning of loadWarnings) warnings.push(warning)
+
+    // --- stats (v1.3.0 field names + v1.4.0 lanes) -------------------------
+    const ctx = request.context && typeof request.context === 'object' ? request.context : {}
+    // `matchedFolders` keeps the v1.3.0 meaning: candidates *inside* the time
+    // window (the legacy path counts after its first-generation filter). The
+    // selector's own counters are lane/pop oriented, so the two unique candidate
+    // counts are measured here — O(sum of posting lengths), not per-lane work.
+    let candidatesInWindow = Number(selectStats.candidates) || 0
+    let candidatesAll = candidatesInWindow
+    let timeFiltered = Number(selectStats.filteredByTime) || 0
+    try {
+      const seedList = querySeeds(index, userText, cfg).seeds
+      const counts = uniqueCandidateCounts(index, seedList, {
+        minAlpha: opts.minAlpha,
+        timeIds: timePlan.active && timePlan.enforced ? timePlan.ids : null,
+      })
+      candidatesAll = counts.all
+      candidatesInWindow = counts.inWindow
+      timeFiltered = Math.max(0, counts.all - counts.inWindow)
+    } catch {
+      /* keep the selector counters when the recount fails */
+    }
+    let userKeywords = []
+    try {
+      userKeywords = querySeeds(index, userText, cfg).userKeywords
+    } catch {
+      userKeywords = []
+    }
+    let addedChars = 0
+    let addedTokens = 0
+    const byGeneration = {}
+    for (const addition of additions) {
+      addedChars += Number(addition.chars) || 0
+      addedTokens += Number(addition.tokens) || 0
+      const key = String(addition.generation)
+      byGeneration[key] = (byGeneration[key] || 0) + 1
+    }
+    const contextChars = Number.isFinite(ctx.chars) ? ctx.chars : null
+    const windowTokens = Number.isFinite(ctx.windowTokens) ? ctx.windowTokens : null
+    const stats = {
+      userKeywords,
+      matchedFolders: candidatesInWindow,
+      excludedFolders: Number(selectStats.excludedSkips) || 0,
+      attempts: Number(selectStats.pops) || 0,
+      addedFolders: additions.length,
+      addedChars,
+      addedTokens,
+      contextChars,
+      windowTokens,
+      addedPercentOfContext: contextChars > 0 ? round2((addedChars / contextChars) * 100) : null,
+      addedPercentOfWindow: windowTokens > 0 ? round2((addedTokens / windowTokens) * 100) : null,
+      byGeneration,
+      elapsedMs: round2(typeof performance !== 'undefined' && performance && typeof performance.now === 'function' ? performance.now() - (request.startedAt ?? performance.now()) : 0),
+      // v1.4.0 lane telemetry (contract §7)
+      candidates: candidatesInWindow,
+      candidatesAll,
+      lowCandidates: Number(selectStats.lowCandidates) || 0,
+      lanesPicked: selectStats.lanesPicked || null,
+      pops: Number(selectStats.pops) || 0,
+      frontierHits: Number(selectStats.frontierHits) || 0,
+      registerDrops: Number(selectStats.registerDrops) || 0,
+      reInjections: Number(selectStats.reInjections) || 0,
+      degraded: selectStats.degraded === true,
+      timeFiltered,
+      filteredByAlpha: Number(selectStats.filteredByAlpha) || 0,
+      round,
+    }
+
+    // Commit the winning lane state (the selector returns a normalized copy).
+    if (result.lanes && typeof result.lanes === 'object') {
+      this._lanes = result.lanes
+      this._round = Number.isFinite(result.lanes.round) ? result.lanes.round : round
+    }
+    const hasMore = pageHasMore || result.hasMore === true
+
+    return {
+      additions,
+      stats,
+      warnings,
+      lanes: result.lanes,
+      timeWindow: { widenedTo: attempt.widenedTo ?? null, level: attempt.level ?? null },
+      paginated: true,
+      page: {
+        offset,
+        limit: take,
+        returned: additions.length,
+        candidates: Number(selectStats.candidates) || 0,
+        hasMore,
+      },
+    }
+  }
+
+  /** The in-memory deterministic recall index (rebuilt when the index/config changed). */
+  recallIndex() {
+    const refreshed = this._refresh()
+    const folders = Array.isArray(refreshed.index.folders) ? refreshed.index.folders : []
+    const key = `${refreshed.mtimeMs}|${refreshed.size ?? -1}|${folders.length}|${lanesFingerprint(this.cfg)}`
+    if (this._recallIndexCache && this._recallIndexCache.key === key) return this._recallIndexCache.value
+    const value = buildRecallIndex(folders, this.cfg)
+    this._recallIndexCache = { key, value }
+    return value
   }
 
   /** Render the recall block (see docs/SPEC.md §6.7). */

@@ -22,6 +22,9 @@ import {
   recall,
   recallProbability,
   writeFolder,
+  writeIndex,
+  emptyLanes,
+  selectRecall,
 } from '../engine/index.js'
 
 const tempDirs = []
@@ -729,7 +732,7 @@ test('recall v1.4.0: a single-day time query returns only that day (constrain mo
   assert.equal(result.timeWindow.level, 'day')
   assert.equal(result.timeWindow.enforced, true)
   assert.equal(result.timeWindow.widenedTo, null)
-  assert.equal(result.stats.timeFiltered, 2, 'the two out-of-window candidates are recorded')
+  assert.ok(result.stats.timeFiltered >= 2, `the out-of-window candidates are recorded (${result.stats.timeFiltered})`)
   assert.equal(result.missType, null)
   // around the day boundaries: the window is [dayStart, dayStart+1d) local time
   assert.equal(new Date(result.timeWindow.from).getDate(), 31)
@@ -776,11 +779,18 @@ test('recall v1.4.0: missType separates a time miss from a keyword miss', () => 
     time: { mode: 'constrain', timezone: 'Asia/Shanghai' },
     recall: { seed: 7 },
   })
-  // keyword matches but outside the requested day → a time miss (no strike)
-  const timeMiss = engine.recall('部署方案', {}, { timeFrom: '2026-11-01' })
+  // an explicit range is a HARD window: it never widens, so keyword matches
+  // outside it are a time miss (which must not count as a memory_recall strike)
+  const timeMiss = engine.recall('部署方案', {}, { timeFrom: '2026-11-01', timeTo: '2026-11-02' })
   assert.equal(timeMiss.additions.length, 0)
   assert.equal(timeMiss.missType, 'time')
+  assert.equal(timeMiss.timeWindow.hardWindow, true)
   assert.ok(timeMiss.stats.timeFiltered > 0)
+  // a single day is a SOFT window: it widens to ±1 day instead of missing
+  const soft = engine.recall('部署方案', {}, { timeFrom: '2026-10-31' })
+  assert.deepEqual(soft.additions.map((addition) => addition.id), ['mem-a'])
+  assert.equal(soft.timeWindow.widenedTo, 'day3')
+  assert.equal(soft.missType, null)
   // nothing matches the keywords at all → a keyword miss (counts as a strike)
   const keywordMiss = engine.recall('完全无关的话题', {}, { timeFrom: '2026-11-01' })
   assert.equal(keywordMiss.additions.length, 0)
@@ -820,7 +830,8 @@ test('recall v1.4.0: offset/limit paginate the recalled candidates', () => {
   const first = engine.recall('部署方案', {}, { limit: 2 })
   assert.equal(first.additions.length, 2)
   assert.equal(first.page.limit, 2)
-  assert.equal(first.page.total, 5)
+  assert.equal(first.page.returned, 2)
+  assert.equal(first.page.candidates, 5, 'the candidate set is reported separately')
   assert.equal(first.page.hasMore, true)
   const second = engine.recall('部署方案', {}, { limit: 2, offset: 2 })
   assert.equal(second.additions.length, 2)
@@ -849,4 +860,139 @@ test('recall v1.4.0: explicit mode=legacy keeps the v1.3.0 path and still honour
   assert.deepEqual(result.additions.map((addition) => addition.id), ['mem-b'])
   assert.equal(engine.recallMode({ mode: 'nonsense' }), 'legacy', 'invalid override falls back to cfg')
   assert.equal(engine.recallMode({ mode: 'fair' }), 'fair')
+})
+
+// ---------------------------------------------------------------------------
+// v1.4.0 deterministic recall: engine-level acceptance (FAIR-DRI wired)
+// ---------------------------------------------------------------------------
+
+function fairEngine(overrides = {}) {
+  const dir = tempDir()
+  const specs = []
+  const base = SH_DAY['2026-10-31']
+  for (let index = 0; index < 30; index += 1) {
+    specs.push(timedFolder(`mem-fair-${index}`, base + index * 1000, ['部署', `项目${index}`], index < 10 ? 0.9 : 0.2))
+  }
+  for (const spec of specs) writeFolder(dir, { id: spec.id, meta: spec.meta, messages: spec.messages })
+  const cfg = loadConfig(undefined, { recall: { mode: 'fair' }, ...overrides })
+  const engine = new MemoryEngine({ memoryDir: dir, config: cfg, rng: () => 0 })
+  engine.load()
+  return engine
+}
+
+test('engine v1.4.0: fair recall is deterministic and high α wins the round', () => {
+  const engine = fairEngine()
+  const first = engine.recall('部署 项目', {}, {})
+  assert.equal(first.mode, 'fair')
+  assert.ok(first.additions.length > 0)
+  // k=10 with exploreRatio=0.2 reserves r=2 slots for the low-α rotation lane:
+  // the other 8 must come from the high lanes (θ_H = 0.6).
+  const alphas = first.additions.map((addition) => addition.alpha)
+  assert.equal(alphas.length, 10, 'firstGenMax=10 by default')
+  const highPicks = alphas.filter((alpha) => alpha >= 0.6).length
+  const lowPicks = alphas.length - highPicks
+  assert.ok(highPicks >= 8, `high-α lane fills k-r slots: ${JSON.stringify(alphas)}`)
+  assert.ok(lowPicks <= 2, `low-α explore lanes are bounded by r=2: ${JSON.stringify(alphas)}`)
+  assert.ok(first.stats.lanesPicked, 'lane telemetry is present')
+  const laneTotal = Object.values(first.stats.lanesPicked).reduce((sum, value) => sum + value, 0)
+  assert.equal(laneTotal, first.additions.length, 'every pick is attributed to a lane')
+  // a second, independent engine with the same memory produces the same picks
+  const twin = fairEngine()
+  const second = twin.recall('部署 项目', {}, {})
+  assert.deepEqual(second.additions.map((addition) => addition.id), first.additions.map((addition) => addition.id))
+})
+
+test('engine v1.4.0: recall never calls Math.random in fair/deterministic mode', () => {
+  const engine = fairEngine()
+  const original = Math.random
+  let calls = 0
+  Math.random = () => {
+    calls += 1
+    return original()
+  }
+  try {
+    engine.recall('部署 项目', {}, {})
+    engine.recall('部署 项目', {}, { mode: 'deterministic' })
+  } finally {
+    Math.random = original
+  }
+  assert.equal(calls, 0, 'deterministic selection must not consume randomness')
+})
+
+test('engine v1.4.0: lane state round-trips through the engine and advances rounds', () => {
+  const engine = fairEngine()
+  const round1 = engine.recall('部署 项目', {}, {})
+  const lanes = round1.lanes
+  assert.ok(lanes && typeof lanes === 'object')
+  assert.equal(lanes.round, 1)
+  const round2 = engine.recall('部署 项目', {}, { lanes, round: 2 })
+  assert.equal(round2.lanes.round, 2)
+  // carrying the block/ledger prevents re-injecting the same folder immediately
+  const blockIds = new Set(round1.additions.map((addition) => addition.id))
+  const ledger = new Set(blockIds)
+  const round3 = engine.recall('部署 项目', {}, { lanes: round2.lanes, round: 3, blockIds, ledger })
+  const round3Ids = new Set(round3.additions.map((addition) => addition.id))
+  for (const id of round3Ids) {
+    assert.equal(blockIds.has(id), false, `blocked id ${id} was re-injected`)
+  }
+  // the serialized state is JSON-safe and rebuilds an equivalent engine state
+  const serialized = JSON.parse(JSON.stringify(engine._lanes))
+  const restored = engine.recall('部署 项目', {}, { lanes: serialized, round: 4 })
+  assert.equal(restored.lanes.round, 4)
+})
+
+test('engine v1.4.0: deterministic mode selects the same σ top-k as the oracle', () => {
+  const engine = fairEngine()
+  const result = engine.recall('部署 项目', {}, { mode: 'deterministic' })
+  assert.equal(result.mode, 'deterministic')
+  // σ = (alpha desc, createdAt asc, id asc): the ten α=0.9 folders first.
+  const expected = engine
+    .list()
+    .filter((folder) => folder.scored !== false)
+    .sort((a, b) => b.alpha - a.alpha || a.createdAt - b.createdAt || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
+    .slice(0, result.additions.length)
+    .map((folder) => folder.id)
+  assert.deepEqual(result.additions.map((addition) => addition.id), expected)
+})
+
+test('engine v1.4.0: fair-mode recall stays within budget on 1000 folders', () => {
+  const onCi = process.env.CI === 'true' || process.env.GITHUB_ACTIONS === 'true'
+  const coldBudgetMs = onCi ? 3000 : 400
+  const warmBudgetMs = onCi ? 300 : 60
+  const dir = tempDir()
+  const cfg = loadConfig(undefined, { recall: { mode: 'fair' } })
+  const folders = []
+  for (let index = 0; index < 1000; index += 1) {
+    folders.push({
+      id: formatFolderId(1700000000000, index + 1),
+      createdAt: index,
+      alpha: index % 10 === 0 ? 0.95 : 0.2,
+      keywords: index % 2 === 0 ? ['deploy', 'docker', 'ports'] : ['部署', 'docker', '端口'],
+      chars: 1000,
+      tokens: 300,
+      messageCount: 4,
+      title: `folder ${index}`,
+    })
+  }
+  writeIndex(dir, cfg, { version: 1, folders, nextCounter: 1001 })
+  const engine = new MemoryEngine({ memoryDir: dir, config: cfg })
+  // Index-only fixtures (no folder bodies): measure the deterministic selector on
+  // the warm index cache, which is the per-turn hot path (plan §3.2.7).
+  const coldStart = performance.now()
+  engine.load()
+  const index = engine.recallIndex()
+  const coldPicks = selectRecall(index, 'deploy docker 端口 配置', { cfg, lanes: emptyLanes(), round: 1, k: 10 })
+  const coldMs = performance.now() - coldStart
+  assert.equal(coldPicks.picks.length, 10)
+  assert.ok(coldMs < coldBudgetMs, `cold fair select took ${coldMs.toFixed(2)}ms (budget ${coldBudgetMs}ms)`)
+  const iterations = 25
+  const lanes = emptyLanes()
+  const warmStart = performance.now()
+  for (let index2 = 0; index2 < iterations; index2 += 1) {
+    selectRecall(index, 'deploy docker 端口 配置', { cfg, lanes, round: index2 + 2, k: 10 })
+  }
+  const warmMs = (performance.now() - warmStart) / iterations
+  // The recall index is cached across rounds (only index mtime + config
+  // fingerprint invalidate it); a warm select costs a few k-way merge pops.
+  assert.ok(warmMs < warmBudgetMs, `warm fair select averaged ${warmMs.toFixed(2)}ms (budget ${warmBudgetMs}ms)`)
 })

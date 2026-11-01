@@ -50,10 +50,49 @@ export { computeImportance, alphaForFolder, DECISION_MARKERS } from './importanc
 export { erf, recallProbability, createRng } from './recall.js'
 
 // compression
-export { planCompression, commitCompression, buildArchiveNote, parseArchiveNote } from './compress.js'
+export { planCompression, commitCompression, buildArchiveNote, parseArchiveNote, eventTimeRangeOf } from './compress.js'
 
 // recall
-export { recall, buildRecallBlock, formatBeta, RECALL_BLOCK_PREAMBLE } from './recall.js'
+export { recall, loadRecallAdditions, buildRecallBlock, formatBeta, RECALL_BLOCK_PREAMBLE } from './recall.js'
+
+// v1.4.0 deterministic recall selector (FAIR-DRI, docs/SPEC.md §6.2)
+export {
+  buildRecallIndex,
+  querySeeds,
+  countCandidates,
+  selectRecall,
+  selectSigma,
+  comparePriority,
+  emptyLanes,
+  serializeLanes,
+  deserializeLanes,
+  lanesFingerprint,
+  trimBlock,
+  simulateTurns,
+  summarizeGuarantees,
+} from './recall-index.js'
+
+// v1.4.0 keyword matching (bidirectional, docs/SPEC.md §6.6)
+export { matchKeywords, hasMatch } from './keyword-match.js'
+
+// v1.4.0 time assistance (in-memory index only, docs/SPEC.md §6.8)
+export {
+  TIME_DEFAULTS,
+  detectGranularity,
+  normalizeTimeQuery,
+  folderTimeRange,
+  buildTimeIndex,
+  queryTimeIndex,
+  timeFallbackLadder,
+  timeConstraintEnabled,
+  zonedDayStart,
+  zonedMonthStart,
+  zonedYearStart,
+  dayKey,
+  addZonedDays,
+  formatWindow,
+  validateTimezone,
+} from './time-index.js'
 
 // engine facade
 export { MemoryEngine } from './engine.js'

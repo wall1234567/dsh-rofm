@@ -715,7 +715,7 @@ test('engine: load/list/recall telemetry/report/setConfig', () => {
 
 test('engine: recall forwards excludeIds and records excludedFolders in telemetry', () => {
   const dir = tempDir()
-  const cfg = loadConfig(undefined, { recall: { probabilityScale: 1000 } })
+  const cfg = loadConfig(undefined, { recall: { probabilityScale: 1000, mode: 'legacy' } })
   const oldId = formatFolderId(1700000000000, 1)
   const newId = formatFolderId(1700000000000, 2)
   writeFolderDirect(dir, { id: oldId, createdAt: 1, alpha: 1, keywords: ['部署'], messages: [{ role: 'user', content: '旧部署' }] })
@@ -736,7 +736,7 @@ test('engine: recall forwards excludeIds and records excludedFolders in telemetr
 
 test('engine: recall telemetry records β for every added folder', () => {
   const dir = tempDir()
-  const cfg = loadConfig(undefined, { recall: { probabilityScale: 1000 } })
+  const cfg = loadConfig(undefined, { recall: { probabilityScale: 1000, mode: 'legacy' } })
   const scoredId = formatFolderId(1700000000000, 1)
   const oldId = formatFolderId(1700000000000, 2)
   writeFolder(dir, {
@@ -783,7 +783,7 @@ test('performance: 1000 folders recall < 50ms cold and < 20ms warm', () => {
   const coldBudgetMs = onCi ? 1000 : 50
   const warmBudgetMs = onCi ? 200 : 20
   const dir = tempDir()
-  const cfg = loadConfig(undefined, { recall: { probabilityScale: 0, seed: 1 } })
+  const cfg = loadConfig(undefined, { recall: { probabilityScale: 0, seed: 1, mode: 'legacy' } })
   const folders = []
   for (let index = 0; index < 1000; index += 1) {
     folders.push({

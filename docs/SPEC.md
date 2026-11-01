@@ -68,6 +68,51 @@ The DSH plugin (`index.js` at the repo root) is a thin adapter around it.
 > Both `package.json` files (`dsh-rofm` and the nested `dsh-rofm-engine`) are
 > `1.3.0`; the nested version tracks the plugin release.
 >
+> **Revision note (2026-11-01, v1.4.0).** Four changes, all backwards compatible
+> at the storage level (old `index.json` version 1 without the new optional
+> fields, old `recall-state.json` v2/v1 and old pending folders remain readable;
+> no migration is required).
+>
+> 1. **Deterministic recall + fairness** — `recall.mode` selects `'fair'`
+>    (default, FAIR-DRI: `engine/recall-index.js`), `'deterministic'` (plain DRI +
+>    sticky ledger + priority block trim, research control) or `'legacy'` (the
+>    v1.3.0 probability path of §6.1, kept byte-compatible for rollback). In
+>    `fair`/`deterministic` α is a **priority** (`σ = (alpha desc, createdAt asc,
+>    id asc)`), not a probability multiplier: selection is fully deterministic and
+>    never calls `Math.random()`; high-α memories matched by a rare query term are
+>    guaranteed in the same round, low-α memories are never discarded and get a
+>    bounded worst-case latency through the rotation lane, block trimming is
+>    priority-based with a high-α pin (§6.2–§6.4), and `memory_recall` gains
+>    `offset` pagination (§6.5). The lane state is persisted in
+>    `recall-state.json` **v3** (§3.1).
+> 2. **Time assistance** — `engine/time-index.js` derives a **purely in-memory**
+>    day/month/year index from `index.folders` (never written to disk) and
+>    `memory_recall` accepts `timeFrom`/`timeTo`/`granularity` (day/month/year/
+>    epoch, minimum 3-day range, widening ladder, time-only browse). `createdAt`
+>    stays the **archival time**; event time lives in optional folder fields
+>    (`eventStart`/`eventEnd`/`eventTimeSource`), old data falls back to
+>    `[createdAt, createdAt+1)`. `time.mode` is `off`/`index` (engine default)/
+>    `constrain` (packaged config default). See §6.8.
+> 3. **Scoring pipeline & data eras** — data-era bucketing (`legacy` /
+>    `synthetic` / `current`, single truth `engine/era.js`), task-section token
+>    budget (`min(scoring.taskMaxTokens, window×scoring.taskBudgetPercent%)`),
+>    pending backpressure (`scoring.maxPending`), heuristic fallback
+>    (`scoring.fallback='onPressure'` + `autoHeuristicAfterRounds`),
+>    non-blocking quality warnings and `type:'judge'` telemetry (§4.5, §4.6).
+>    Legacy/synthetic pending is marked but never re-judged; the current real
+>    pending caliber is 2/369 = 0.54% (§4.5).
+> 4. **Archive robustness** — current-turn protection
+>    (`compress.protectCurrentTurn`), small/fake-window sanity
+>    (`compress.allowSmallWindow`/`smallWindowTokens`), hard-limit hard stop
+>    (`compress.hardLimitStop`), per-step folder cap
+>    (`compress.maxFoldersPerStep`), commit journal + rollback + content-based
+>    idempotency (§5.7). Config schema extended in §2 (single truth remains
+>    `engine/config.js` `DEFAULT_CONFIG`; the packaged `config.json` uses product
+>    values `time.mode='constrain'` / `time.timezone='Asia/Shanghai'` and is kept
+>    in sync by `test/config-consistency.test.mjs`). Both `package.json` files are
+>    `1.4.0`; `engine/config.js` adds the new keys, `engine/store.js` the optional
+>    index fields + commit helpers, `engine/index.js` the new exports (§7).
+>
 > **Revision note (2026-10-28, v1.2.1).** Patch release for the high-α warning:
 > the `importance.warnAbove` warning is now actually surfaced by the adapter —
 > a host log line (`archive: alpha=… exceeds importance.warnAbove=…`) plus a
@@ -84,26 +129,34 @@ Repository layout (owned files):
 dsh-rofm/
 ├── engine/            ← standalone engine (THIS TASK)
 │   ├── index.js       ← public API
-│   ├── config.js      ← defaults + deep merge + validation
+│   ├── config.js      ← defaults + deep merge + validation (single truth, §2)
 │   ├── tokenize.js    ← keyword extraction (Chinese + English)
 │   ├── importance.js  ← α heuristic (standalone/CLI/simulate only; DSH α comes from memory_judge)
-│   ├── store.js       ← memory folder / index persistence (beta/scored/rescorePending)
-│   ├── recall.js      ← recall graph, generations, probability (skips unscored folders)
-│   ├── compress.js    ← compression planning + commit + note build/parse
+│   ├── keyword-match.js ← v1.4.0 bidirectional keyword matching + quality (§6.6)
+│   ├── recall-index.js  ← v1.4.0 FAIR-DRI deterministic recall selector (§6.2–§6.5)
+│   ├── time-index.js    ← v1.4.0 in-memory time index + query normalisation (§6.8)
+│   ├── era.js           ← v1.4.0 data-era classification (legacy/synthetic/current, §4.5)
+│   ├── store.js       ← memory folder / index persistence (beta/scored/rescorePending; v1.4.0 optional fields + commit journal)
+│   ├── recall.js      ← legacy probability recall graph (mode='legacy', §6.1) + block rendering (§6.7)
+│   ├── compress.js    ← compression planning + commit + note build/parse (+ v1.4.0 guards, §5.7)
 │   ├── stats.js       ← stats math + JSONL report helpers
-│   ├── engine.js      ← MemoryEngine class (cached index, fast path)
+│   ├── engine.js      ← MemoryEngine class (cached index; v1.4.0 deterministic recall/time index/pagination)
 │   └── cli.mjs        ← standalone CLI
 ├── tools/
-│   ├── recall-report.mjs ← test-phase report: % recalled + chars + rearchive/pending + β stats
+│   ├── recall-report.mjs ← test-phase report: % recalled + chars + rearchive/pending + β/lane/time/era stats
 │   ├── show-recall.mjs   ← inspect sessions/folders/recall-state (α, β, scored, rescorePending)
-│   ├── selfcheck.mjs     ← v1.2 independent self-check (config/engine/store/recall-state/session logs/tests)
+│   ├── selfcheck.mjs     ← independent self-check (config/engine/store/recall-state/era/time/fairness/session logs/tests)
+│   ├── memory-audit.mjs  ← v1.4.0 data-era audit (read-only by default; --apply writes only pendingEra)
+│   ├── time-view.mjs     ← v1.4.0 read-only time view (never writes)
 │   └── repair-session-log.mjs ← repair session logs with id-less legacy messages (v1.2)
 ├── test/
 │   ├── engine.test.mjs
 │   ├── recall.test.mjs
 │   ├── compress.test.mjs
 │   ├── stats.test.mjs
-│   ├── selfcheck.test.mjs ← v1.2: covers tools/selfcheck.mjs
+│   ├── recall-index.test.mjs / time-index.test.mjs / keyword-match.test.mjs ← v1.4.0
+│   ├── turn-protection-engine.test.mjs / memory-audit.test.mjs / config-consistency.test.mjs ← v1.4.0
+│   ├── selfcheck.test.mjs ← covers tools/selfcheck.mjs
 │   └── simulate.mjs   ← end-to-end simulation printing the report
 ├── memory/            ← runtime data (ships with .gitkeep only)
 ├── docs/SPEC.md       ← this file
@@ -116,10 +169,12 @@ Rules:
 - Every exported function is synchronous and fast (no `await` needed in the hot path).
 - Use `node:test` (`node --test test/*.test.mjs` — Node 24 does not accept a bare directory) for tests.
 - Do not create files outside `engine/`, `test/`, `tools/`, `docs/`, `memory/`.
-- Do not modify the root `package.json`, `index.js`, `cordis.patch.yml`, `README.md`.
+- Do not modify the root `package.json` (version bumps excepted), `index.js`, `cordis.patch.yml`, `README.md`.
 - All persistence must be atomic (`write tmp file → fs.renameSync`) and resilient to
   a corrupt/missing index (rebuild index by scanning `memory/*/meta.json`).
 - Times are epoch milliseconds (`Date.now()`), ISO strings for display only.
+  **v1.4.0: recall selection never lets `Date.now()`/`Math.random()` influence the
+  picks**; only `legacy` mode may consume randomness (`recall.seed` PRNG).
 - Platform and path rules (separators, `node:path`-only composition, case
   sensitivity, `~` expansion, symlinks, LF) are part of the contract: see §11.
   CI runs the full suite on Windows, Linux and macOS × Node 20/22/24.
@@ -188,6 +243,12 @@ export const DEFAULT_CONFIG = {
     // user boundary would overshoot the target by more than this factor, fall
     // back to the previous boundary (remove less). See §5.2.
     maxBoundaryOvershoot: 1.25,
+    // --- v1.4.0 robustness (docs/SPEC.md §5.7) ---------------------------
+    protectCurrentTurn: true,   // never remove the current turn's user message / tool pairs
+    allowSmallWindow: false,    // refuse automatic archiving on a tiny window unless opted in
+    smallWindowTokens: 20000,   // a window below this token count counts as "small"
+    hardLimitStop: true,        // stop archiving once hardLimitPercent cannot be beaten
+    maxFoldersPerStep: 500,     // per-step folder cap (combined with the release estimate)
   },
   importance: {
     min: 0.01,               // α lower bound
@@ -210,13 +271,65 @@ export const DEFAULT_CONFIG = {
   },
   recall: {
     enabled: true,
-    firstGenMax: 10,         // gen-1 folders added back (successes), <= 10
+    // --- v1.4.0 selector (docs/SPEC.md §6) -------------------------------
+    mode: 'fair',            // 'fair' | 'deterministic' | 'legacy'
+    firstGenMax: 10,         // k: quota of folders added back per round
+    hops: 0,                 // optional descendant expansion rounds (0 = first generation)
+    maxRecalledBlocks: 64,   // injected block cap (blocks)
+    maxRecalledChars: 120000,// injected block cap (chars)
+    maxWindowPercent: 10,    // injected block is also capped at windowTokens × this
+    minAlpha: 0,             // query-time α floor (0 = no gate; compat.memberMinAlpha overrides)
+    persistInjected: true,   // persist the injected block / lane state (recall-state v3)
+    sort: 'createdAt',       // rendering order only (createdAt | alpha | generation)
+    // --- legacy probability path only (mode === 'legacy', §6.1) ----------
     mu: 5,                   // p(n) = (1-erf((n-μ)/(σ√2))) / (1-erf((1-μ)/(σ√2)))
     sigma: 3,
     maxGeneration: 0,        // 0 = unlimited
     probabilityScale: 1,     // multiplier applied to every probability
     seed: 0,                 // 0 = non-deterministic; >0 = seeded PRNG (tests)
-    sort: 'createdAt',       // order of recalled context in the prompt
+    // --- fairness lanes (mode === 'fair', §6.2) --------------------------
+    fairness: {
+      thetaHigh: 0.6,        // α >= θ_H is "high importance"
+      exploreRatio: 0.2,     // r = max(1, min(k-1, round(k * ratio)))
+      specificProbeSlots: 1, // rare-term low-α probe slots (explicit reference surfaces now)
+      rareTerm: { ratio: 0.002, minPosting: 8, scanCap: 512 }, // τ = max(minPosting, ceil(ratio*N))
+      register: { lookahead: 3, capFactor: 8, ttlRounds: 2 },  // deferred high-α register
+      queryBoost: true,      // re-admit an evicted high-α when matched again
+      recycle: { enabled: true, cooldownRounds: 15, maxPerRound: 1 },
+      ledger: { maxEntries: 10000, overflow: 'evict-lowest-alpha-last-seen' },
+      blockTrim: { policy: 'priority', protectCurrentQuery: true, pinHigh: true },
+      roundBudget: { maxChars: 20000 },
+    },
+  },
+  // --- v1.4.0 time assistance (§6.8); the index is strictly in-memory ------
+  time: {
+    mode: 'index',           // 'off' | 'index' | 'constrain' (packaged config.json: 'constrain')
+    timezone: '',            // '' = host local (packaged config.json: 'Asia/Shanghai')
+    minRangeDays: 3,         // a shorter explicit range is widened to this many days
+    maxRangeDays: 366,       // a longer range is truncated
+    centerDayPriority: true, // a single-day query tries the centre day first
+    fallback: ['day3', 'month', 'year', 'all'], // widening ladder
+    fallbackMinResults: 1,   // widen while the filtered candidate set is smaller
+    windowScanMax: 4096,     // max buckets scanned for one query
+    askUserHint: true,       // tell the model it may ask the user for a time
+    judgeEventTime: false,   // 1.4.0: the scoring model cannot override event time
+  },
+  // --- v1.4.0 scoring pipeline (§4.5/§4.6) --------------------------------
+  scoring: {
+    includeLegacy: false,    // pre-1.2.0 / synthetic pending never enters the task list
+    maxPending: 200,         // backpressure threshold before an archive
+    fallback: 'onPressure',  // 'never' | 'onPressure' | 'always'
+    autoHeuristicAfterRounds: { plain: 4, channel: 2 },
+    taskBudgetPercent: 15,   // task section <= window × this %
+    taskMaxTokens: 12000,    // ... and <= this many tokens
+    order: 'newest',         // 'newest' | 'mixed' | 'oldest'
+    warnUniformAlpha: true,  // warn on uniform α/β batches
+    maxItemsPerJudge: 100,   // memory_judge updates batch cap
+  },
+  // --- v1.4.0 keyword matching (§6.6), both default off -------------------
+  match: {
+    expandLatinCase: false,
+    cjkBigram: false,
   },
   storage: {
     dir: 'memory',           // relative to the plugin root
@@ -235,7 +348,22 @@ export const DEFAULT_CONFIG = {
 
 Validation: percentages clamped to (0, 100], `min <= max`, μ/σ > 0,
 `firstGenMax >= 0`, `targetChunkChars >= minChunkChars >= 1`, α bounds inside
-[0.01, 1]. On invalid input replace with default and append a warning.
+[0.01, 1]. v1.4.0 adds enum validation (`recall.mode`, `time.mode`,
+`scoring.fallback`, `scoring.order`, `recall.sort`,
+`recall.fairness.blockTrim.policy`, `recall.fairness.ledger.overflow`), numeric
+range validation for every new key (invalid values fall back to the default with
+a warning), IANA time-zone validation through `Intl` (`time.timezone`), and
+`time.fallback` element filtering (unknown rungs dropped with a warning). On
+invalid input replace with default and append a warning.
+
+> **The packaged `config.json` uses product values.** `engine/config.js` is the
+> single default truth; the shipped `config.json` overrides exactly two keys on
+> purpose: `time.mode='constrain'` (engine default `'index'` = build the index but
+> never filter) and `time.timezone='Asia/Shanghai'` (engine default `''` = host
+> local). Everything else matches `DEFAULT_CONFIG`, and
+> `test/config-consistency.test.mjs` asserts that (plus the README §3 /
+> SPEC §2 documented values and the two `package.json` versions = `1.4.0`); a
+> stale value in either file fails the suite.
 
 > **β is not a configuration knob.** The trust score β (see §4.1) uses fixed
 > constants from `engine/config.js`: `BETA_MIN = -10`, `BETA_MAX = 10`,
@@ -246,19 +374,22 @@ Config used by the **plugin** additionally mirrors the important knobs in the
 DSH plugin `Config` schema (Lead owns that). The engine always reads the same
 `config.json`, so values stay consistent.
 
-> **Adapter-only keys.** The DSH adapter (`lib/config-store.js`) adds keys that
-> only make sense inside the host: `compress.applyToSubagents/applyToMainSessions`
-> /`preStepEnabled`/`emergencyPercent`/`emergencyCompressPercent`/
-> `maxExtraPasses`/`hardLimitPercent`, `recall.applyToSubagents`/
-> `applyToMainSessions`/`maxRecalledBlocks`/`maxRecalledChars`/`persistInjected`/
-> `triggerSourceKinds`, `storage.perSession`, `logging`, `test`. They are
-> documented in README §3 and completed by the adapter defaults; the engine
-> ignores them. The former extra-model keys (`importance.mode/llmProvider/
-> llmModel/llmMaxCharsPerFolder/llmMaxTotalChars`) and `recall.pressureChars`
-> were removed by the current-model scoring revision: α/β/keywords are judged by
-> the current session model through the `memory_judge` tool (§4.2), and the
-> recalled block is re-archived instead of pressure-trimmed (§5.6). Stale keys in
-> an old `config.json` are ignored, not errors.
+> **Adapter-only keys.** The DSH adapter (`lib/config-store.js`'s
+> `ADAPTER_DEFAULTS`) adds keys that only make sense inside the host:
+> `compress.applyToSubagents/applyToMainSessions/preStepEnabled/emergencyPercent/
+> emergencyCompressPercent/maxExtraPasses/hardLimitPercent`,
+> `recall.applyToSubagents/applyToMainSessions/maxRecalledBlocks/maxRecalledChars/
+> persistInjected/triggerSourceKinds`, `storage.perSession`, `logging`, `test`.
+> v1.4.0 adds `scoring.judgeTelemetry` and `recall.espEmptyHint` to the
+> adapter-only defaults (`time.askUserHint` is an engine key and is not
+> duplicated). They are documented in README §3 and completed by the adapter
+> defaults; the engine ignores them. The former extra-model keys
+> (`importance.mode/llmProvider/llmModel/llmMaxCharsPerFolder/llmMaxTotalChars`)
+> and `recall.pressureChars` were removed by the current-model scoring revision:
+> α/β/keywords are judged by the current session model through the
+> `memory_judge` tool (§4.2), and the recalled block is re-archived instead of
+> pressure-trimmed (§5.6). Stale keys in an old `config.json` are ignored, not
+> errors.
 >
 > `config.json` is hot-reloaded by the adapter: its **content** is compared on
 > every read (not just mtime/size) so same-tick saves are picked up. A partially
@@ -340,6 +471,28 @@ it through `memory_judge`, §4.2):
 - `beta` missing → reads as `DEFAULT_BETA` (0); `betaSource: "default"` is used
   by the standalone engine/CLI heuristic path (which writes `scored: true`).
 
+**v1.4.0 optional provenance / event-time fields.** All of them are optional and
+`indexEntryFromMeta()` copies them **explicitly** (`store.js copyOptionalIndexFields`,
+so a reload cannot silently drop them; values are only written when present and
+valid, which keeps an old index byte-compatible):
+
+| field | values | meaning |
+|---|---|---|
+| `pendingEra` | `'legacy' \| 'current' \| 'synthetic'` | data-era marker (§4.5). Written by `tools/memory-audit.mjs --apply` or the adapter; absent = derive from `createdAt` + the session era. Explicit marker always wins. |
+| `scoreMode` | `'model' \| 'heuristic'` | which scorer produced α/β/keywords (v1.4.0 marks every archive path). |
+| `archivedByVersion` | semver string | plugin version that archived the folder (`meta.archivedByVersion`). |
+| `archivedFrom` | `'adapter' \| 'passive'` | active pre-step archiving vs the passive/compaction fallback path. |
+| `pendingSince` | epoch ms | when the folder entered the pending backlog (defaults to `createdAt`); drives task-list ordering and the era/age display. |
+| `eventStart` / `eventEnd` | epoch ms | folder event interval, half-open `[eventStart, eventEnd)`; only written when the archived messages carry `time`. |
+| `eventTimeSource` | `'messages' \| 'judge' \| 'archive'` | where the event interval came from. `judge` is reserved for 1.4.1 (`time.judgeEventTime=false` keeps the scorer from writing it). Absent/`archive` → fall back to `[createdAt, createdAt+1)`. |
+
+`meta.json` mirrors the same fields (plus `idempotencyKey` for retry-safe
+commits, §5.7). Old `meta.json` without them is valid: the reader treats
+`scored` missing as `true`, `beta` missing as 0, `eventTimeSource` missing as
+`archive`, `pendingSince` missing as `createdAt`, and never rewrites old files
+just to add them. `store.js` exposes `PENDING_ERAS`, `SCORE_MODES`,
+`ARCHIVE_SOURCES` and `EVENT_TIME_SOURCES` as the single allowed-value lists.
+
 `meta.images` (adapter only, v1.2, §5.5): array of
 `{ name, placeholder, mediaType, width, height, bytes, attachmentId }`, one entry
 per image block that was archived from this folder's conversation span. The
@@ -369,10 +522,18 @@ The messages keep their original roles ordering; `time` is copied when known.
     { "id": "...", "createdAt": 1761217200000, "alpha": 0.42, "beta": 3,
       "scored": true, "rescorePending": false,
       "keywords": ["部署","docker","端口"], "chars": 1180, "tokens": 402,
-      "messageCount": 6, "title": "…" }
+      "messageCount": 6, "title": "…",
+      "pendingEra": "current", "scoreMode": "model", "archivedByVersion": "1.4.0",
+      "archivedFrom": "adapter", "pendingSince": 1761217200000,
+      "eventStart": 1761200000000, "eventEnd": 1761200300000, "eventTimeSource": "messages" }
   ]
 }
 ```
+
+`version` stays **1** in v1.4.0: the new fields are optional and an old reader
+that ignores them loses nothing (they are derived/provenance metadata, not the
+source of truth for α/β/keywords). A v1.4.0 reader on an old index simply sees
+the defaults described above.
 
 Index writes are atomic. `loadIndex(memoryDir, cfg)` rebuilds from `meta.json`
 files when the index is missing/corrupt and rewrites it. `refreshIndex` cheaply
@@ -382,6 +543,15 @@ commit). `indexEntryFromMeta()` normalizes and preserves the scoring fields:
 `beta: normalizeBeta(source.beta)`, `scored: source.scored !== false`,
 `rescorePending: source.rescorePending === true`; old entries/folders read as
 scored with `beta: 0` and no pending flags, and `writeIndex` keeps the fields.
+v1.4.0 additionally copies the optional fields above (valid values only, no
+invented values) and `writeIndex` re-normalizes every entry through the same
+function, so a read→write→read round trip is lossless.
+
+> **The v1.4.0 time index is NOT persisted.** Day/month/year buckets are derived
+> in memory from `index.folders` by `engine/time-index.js` (§6.8); there is no
+> second index file and no physical day/month/year directory layout. `memory/`
+> stays exactly the folder tree below.
+
 
 `stats.jsonl` lines (append only, one JSON per line):
 
@@ -437,7 +607,7 @@ telemetry must never break compression/recall (best effort).
 
 ---
 
-### 3.1 Recall-state snapshot (`recall-state.json`, v1 → v2)
+### 3.1 Recall-state snapshot (`recall-state.json`, v1 → v3)
 
 Location (adapter only): `memory/sessions/<session-id>/recall-state.json`,
 written atomically and only while `recall.persistInjected !== false`. It records
@@ -451,7 +621,7 @@ isolation, see README §1.5).
 
 ```json
 {
-  "version": 2,
+  "version": 3,
   "sessionId": "…",
   "updatedAt": 1761200000000,
   "block": "## 记忆回忆（按创建时间从早到晚）\n\n…\n",
@@ -462,50 +632,96 @@ isolation, see README §1.5).
       "generation": 1,
       "alpha": 0.62,
       "beta": 3,
-      "probability": 0.62,
+      "probability": 1,
+      "lane": "rareHigh",
       "chars": 1200,
       "tokens": 400,
       "createdAt": 1761200000000,
+      "injectedTurn": 7,
       "keywords": ["部署", "docker"],
       "title": "部署 docker 端口",
       "messages": [{ "role": "user", "content": "…", "time": 1761199999000 }]
     }
-  ]
+  ],
+  "round": 7,
+  "configFingerprint": "cfg1|{\"version\":1,\"mode\":\"fair\",…}",
+  "lanes": {
+    "frontier": [{ "seed": "部署", "key": { "alpha": 0.42, "createdAt": 1761200000000, "id": "mem-…" }, "length": 12 }],
+    "exploreCursor": { "seed": null, "key": { "alpha": 0.1, "createdAt": 1761200100000, "id": "mem-…" }, "pos": 5, "length": 300 },
+    "pendingHigh": ["mem-…"], "pendingHighRound": [6],
+    "highRecycle": [{ "id": "mem-…", "round": 5 }],
+    "recycle": [{ "id": "mem-…", "eligibleRound": 20 }],
+    "degraded": false,
+    "round": 7
+  },
+  "ledger": ["mem-…", "mem-…"],
+  "counters": { "reInjections": 1, "registerDrops": 0, "recallTimeEvicted": 0, "timeMisses": 0 },
+  "degraded": false
 }
 ```
 
+- `version: 3` (v1.4.0). Contract shape: `block` / `ids` / `additions` are kept
+  from v2 for compatibility (tools still read them), `round` is the deterministic
+  recall round counter, `configFingerprint` is `lanesFingerprint(cfg)` (only the
+  knobs that change selection semantics; a fingerprint change resets the lane
+  cursors but keeps `ledger`/`block`), `lanes` is `serializeLanes(lanes)` (the
+  FAIR-DRI state of §6.2/§6.3), `ledger` is the monotonic ever-surfaced id set
+  (bounded by `recall.fairness.ledger.maxEntries`, overflow evicts lowest
+  α/last-seen last), `counters` holds `reInjections` / `registerDrops` /
+  `recallTimeEvicted` / `timeMisses`, and `degraded` mirrors `lanes.degraded`
+  (`a_low ≥ r`: the rotation bound is not promised).
 - `block` is the rendered injection text (exactly what the model saw, never
   truncated). `ids` is kept for compatibility with v1 readers/tools.
 - `additions[].messages` keeps only the durable fields (`role`, string
   `content`, optional `time`/`name`); `meta`/`folder`/`roll` are dropped.
+  `lane` records which FAIR-DRI lane picked the memory (telemetry/debug) and
+  `injectedTurn` protects the current turn's additions from pass-0 re-archiving
+  (§5.7).
   Archived images appear there as their `[图片：（<name>）]` placeholder text — the
   bytes stay in the session image folder and the placeholder is expanded to the
   absolute file path when the block is rendered (§5.5). If the image folder was
   deleted together with the memory folders, the hint is marked `（缺失）`.
-- Written after every new injection, after `trimRecallBlock`, and after
+- Written after every new injection, after a priority `trimBlock`, and after
   re-archiving recalled entries (§5.6), so the persisted block always mirrors
   the text that was actually injected; the engine itself never writes this file.
+  `recall.persistInjected=false` disables the whole file.
 
 **Restore semantics (adapter, best effort — never throws):**
 
-1. A v2 snapshot is preferred when `additions` is a non-empty array: entries are
-   validated one by one (safe id `^[A-Za-z0-9._-]+$` and not `.`/`..`;
-   `messages` is an array; `alpha`/`beta`/`chars`/`tokens`/`createdAt` finite,
-   β normalized). Restored additions rebuild `meta` with
-   `stats: { messages, chars, tokens }`; `block` is used verbatim when every
-   entry was valid and trimming removed nothing, otherwise the block is
-   re-rendered from the retained additions.
-2. Bad v2 entries are skipped, never a reason to fail the whole snapshot; zero
+1. A **v3** snapshot restores `block` / `additions` / `ids` exactly like v2 and
+   additionally `round` (`lanes.round` fallback) and `lanes`/`ledger`/`counters`
+   when they validate; a missing/bad `lanes` degrades to `emptyLanes()` (allowed
+   bounded duplicates, **no data loss**), a missing `configFingerprint` keeps the
+   state (the next save writes the current one).
+2. A **v2** snapshot is still accepted when `additions` is a non-empty array:
+   entries are validated one by one (safe id `^[A-Za-z0-9._-]+$` and not
+   `.`/`..`; `messages` is an array; `alpha`/`beta`/`chars`/`tokens`/`createdAt`
+   finite, β normalized); `ledger` and `lanes` are **reset** (bounded duplicates
+   are accepted rather than dropping memories), the file is rewritten as v3.
+   Restored additions rebuild `meta` with `stats: { messages, chars, tokens }`;
+   `block` is used verbatim when every entry was valid and trimming removed
+   nothing, otherwise the block is re-rendered from the retained additions.
+3. Bad entries are skipped, never a reason to fail the whole snapshot; zero
    valid entries fall back to v1.
-3. **v1 fallback** (`{ "ids": [{ "id": "...", "generation": 1 }] }`): each id is
+4. **v1 fallback** (`{ "ids": [{ "id": "...", "generation": 1 }] }`): each id is
    rebuilt from `memory/` via `engine.readFolder`; folders that are missing or
    corrupt are skipped.
-4. Either path sets `forceNewSeries`, so the next `onPreStep` returns
+5. Either path sets `forceNewSeries`, so the next `onPreStep` returns
    `startsRequestSeries: true` and DSH rewrites the head system node instead of
    appending an in-history system prompt. Restore runs at most once per session
-   (`restoreAttempted`). Because v2 contains the rendered block and the message
+   (`restoreAttempted`). Because v2/v3 contain the rendered block and the message
    contents, the block is restored even when the memory folders were deleted or
    moved; v1 restore still depends on the folders on disk.
+
+> **Serialization details.** `recall-index.js` exposes
+> `serializeLanes(lanes)` / `deserializeLanes(raw)`; deserialization validates
+> every field and never throws (garbage → `emptyLanes()`). The frontier/cursor
+> recovery is **self-healing**: the σ key `{alpha, createdAt, id}` locates the
+> position again after the posting list changed (binary relocation, fall back to
+> position 0). `lanesFingerprint(cfg)` is a stable hand-written serialization
+> (never `JSON.stringify` key order) of the selection-relevant knobs:
+> `mode`, `firstGenMax`, `hops`, the effective `fairness` block and `matchMode`.
+
 
 ---
 
@@ -547,8 +763,19 @@ The CLI prints warnings to stderr.
 > lower it (§4.2). The standalone heuristic above is unchanged — it is the CLI
 > fallback, not the DSH α source.
 
-Important: α is **not** a measure of "keep the context", it is the probability
-multiplier for recall. High α means the folder will be recalled very eagerly.
+Important: α is **not** a measure of "keep the context". Its meaning depends on
+`recall.mode`:
+
+- `fair` (default) / `deterministic`: α is a **deterministic priority** — the
+  first key of `σ = (alpha desc, createdAt asc, id asc)` (§6.2). High α means
+  "recalled earlier/more reliably"; a query-matched high-α memory
+  (`α ≥ recall.fairness.thetaHigh`) is guaranteed in the same round, while low-α
+  memories are not discarded and get a bounded worst-case latency. No random
+  roll is involved.
+- `legacy`: α is the **probability multiplier** of the v1.3.0 path
+  (`1 × α` for generation 1, `α · p(n)` for generation n > 1, §6.1).
+
+β never affects either path.
 
 ---
 
@@ -558,7 +785,9 @@ multiplier for recall. High α means the folder will be recalled very eagerly.
 fact or an instruction when it is shown *without* its original conversation
 context? It is judged by the **current session model in its own turn** (§4.2)
 and is metadata for the reading model. β is **not** importance and **not** a
-recall-probability input: probability remains `1 × α` / `α · p(n)` (§6), and β
+recall-probability input: in `legacy` mode the probability remains `1 × α` /
+`α · p(n)` (§6.1), while in `fair`/`deterministic` the selection is
+deterministic (α is the first priority key, §6.2); β
 never affects `firstGenMax`, the roll, ordering or quota.
 
 **Data model (fixed constants — not configuration, `engine/config.js`):**
@@ -835,6 +1064,114 @@ model find a stored picture without guessing.
 
 ---
 
+### 4.5 v1.4.0 data-era buckets (`engine/era.js`)
+
+The installed store mixes three generations of data; treating them as one
+backlog produced the misleading "81.8% pending" number. `engine/era.js` is the
+**single truth** used by `lib/plugin.js` (task-list filtering),
+`tools/memory-audit.mjs`, `tools/selfcheck.mjs` and `tools/recall-report.mjs`:
+
+```js
+export const LEGACY_ERA_CUTOFF_MS = Date.parse('2026-10-27T19:14:00Z') // v1.2.0 tag (2026-10-28 03:14 +08)
+export const SYNTHETIC_WINDOW_TOKENS = 32000
+export const SYNTHETIC_BEFORE_PERCENT = 500
+export const STRESS_MIN_FOLDERS = 100
+export const STRESS_MIN_PENDING = 100
+export function sessionEraSignals(events) // -> {fakeWindow, tinyWindow, overWindow, windowTokens, maxBeforePercent}
+export function sessionEra({ folders, pending, signals }) // -> {era: 'synthetic'|'current', reasons}
+export function classifyFolderEra(folder, session) // -> 'legacy'|'current'|'synthetic'
+export function summarizeEras(folders, session) // -> per-era folders/scored/pending + pendingPercent/currentPendingPercent
+```
+
+Rules (exact):
+
+- **`legacy` is a per-folder property.** An explicit `pendingEra` marker
+  (`'legacy'|'current'|'synthetic'`, written by `tools/memory-audit.mjs --apply`
+  or the adapter) always wins. Otherwise `createdAt < LEGACY_ERA_CUTOFF_MS`
+  (the v1.2.0 tag) → `legacy`. Pre-1.2.0 sessions archived without the
+  "you must judge this round" instruction; **only marked, never re-judged**
+  (plan §9.3 Q6).
+- **`synthetic` is a per-session property.** `sessionEraSignals()` reads the
+  session `stats.jsonl` (`compress` / `compress-applied` / `archive` events):
+  `fakeWindow = any(windowTokens < 32000) || any(beforePercent > 500)`.
+  `sessionEra()` returns `synthetic` iff `fakeWindow && stressBacklog`, where
+  `stressBacklog = folders >= 100 || pending >= 100`. **Both** signals are
+  required: a fake window alone would mislabel the legitimate QQ channel session
+  (qqb-g: 2000-token channel window, 10 folders / 2 pending → `current`), and
+  volume alone would mislabel the normal 1M-window session (b5eeee7e: 359
+  folders, real window).
+- **`current`** = everything else (normal-window sessions after the v1.2.0
+  upgrade). Only its pending share is an actual signal.
+
+Real-data snapshot (2026-11-01, read-only via `node tools/memory-audit.mjs --json`):
+
+| era | folders | scored | pending | caliber |
+|---|---|---|---|---|
+| legacy | 593 | 6 | 587 | historical residue, not re-judged |
+| synthetic | 2780 | 600 | 2180 | a46df597 pressure test (8k/2k/400k fake windows + 500 folders/pass) |
+| current | 369 | 367 | **2** | the only meaningful backlog: **2/369 = 0.54%** |
+| total | 3742 | 973 | 2769 | caliber A = 74.0% (describes history, not the current mechanism) |
+
+Guard rail: plugin-level and doc-level wording must not present 74.0% as the
+current mechanism quality; the current caliber is 2/369 = 0.54%, and the
+post-1.3.0 normal session b5eeee7e is 0/359 = 0%. `scoring.includeLegacy=false`
+keeps legacy/synthetic pending out of the task section. See README §1.11.
+
+### 4.6 v1.4.0 scoring pipeline: budget, backpressure, fallback, quality, judge telemetry
+
+The task section (`dsh-rofm:memory-tasks`, §4.2) is part of the measured system
+prompt, so v1.4.0 bounds it and makes the pipeline observable:
+
+1. **Era filter** — with `scoring.includeLegacy=false` (default) only
+   `classifyFolderEra(folder, session) === 'current'` pending folders are listed.
+2. **Token budget (P0-1)** — the whole section is bounded by
+   `min(scoring.taskMaxTokens=12000, windowTokens × scoring.taskBudgetPercent=15%)`.
+   The fixed header + rubric is measured with `estimateTokens`; the rest is the
+   item budget. When both pending and re-review lists exist the item budget is
+   split **pending 60% / rescore 40%**; an item is only added if at least
+   `MIN_TASK_ITEM_TOKENS=60` tokens remain, otherwise the list is truncated with
+   a model-visible note. This is what breaks the v1.3.0 self-amplifying loop
+   (a growing task section triggering the next archive).
+3. **Ordering (P0-6)** — `scoring.order='newest'` (default) sorts pending by
+   `pendingSince` descending (newest archive first, i.e. the most relevant
+   memory gets judged first), `'oldest'` restores the v1.3.0 FIFO order, `'mixed'`
+   is an experimental blend. Re-review (rescorePending) entries stay createdAt
+   order. Each pending item renders `类型=<tool|decision|user> · 已等待 <age>`.
+4. **Backpressure** — before archiving, `pendingCount = pending folders in the
+   index`; `pendingCount > scoring.maxPending=200`:
+   - `scoring.fallback='never'` → **pause archiving** (log once per session),
+     the context is preserved instead of producing memories that can never be
+     recalled;
+   - `onPressure` (default) / `always` → degrade to heuristic scoring for this
+     archive (`meta.scoreMode='heuristic'`).
+   The `compress-applied` event records `pendingAtArchive` / `pendingCount` /
+   `pendingRounds`.
+5. **Heuristic fallback** — `scoring.fallback='onPressure'` + unresolved pending
+   for `scoring.autoHeuristicAfterRounds.plain=4` rounds (normal sessions) or
+   `.channel=2` (QQ channel sessions) → the archive is scored by
+   `lib/heuristic-score.js` instead of waiting for `memory_judge`
+   (`α` from `engine/importance.js`, keywords from `engine/tokenize.js`,
+   `β=0`, `meta.scoreMode='heuristic'`, immediately recallable, one WARN).
+   `fallback='always'` forces it; `'never'` disables it.
+6. **Quality warnings (non-blocking)** — `memory_judge` analyses the submitted
+   batch **after** writing the updates: keyword repeat rate > 50 %, all α equal,
+   all β equal, or `judgeReason` missing for > 90 % of entries →
+   `result.warnings` (model-visible, never blocks a saved update; gated by
+   `scoring.warnUniformAlpha` for the α/β part). Batch size is capped by
+   `scoring.maxItemsPerJudge=100` (over-limit → rejected with a split hint).
+7. **Judge telemetry (P2-5)** — one `type:'judge'` event per call:
+   `{ sessionId, batchSize, updated, kept, rejected, elapsedMs,
+   uniformAlphaRate, keywordRepeatRate, reasonMissingRate }` — **counts and rates
+   only, never ids, keyword text or conversation content**; disabled by
+   `scoring.judgeTelemetry=false`. Written through `plugin.recordJudgeEvent()`;
+   a missing/throwing hook never affects the update result.
+8. **Provenance** — every archive path writes `meta.scoreMode`,
+   `meta.archivedByVersion` (plugin version), `meta.archivedFrom`
+   (`'adapter'|'passive'`) and `meta.pendingSince` (§3), so era/quality can be
+   audited later (the pre-1.4.0 store has 0/3742 `scoreMode` values).
+
+---
+
 ## 5. Compression (`compress.js`)
 
 `planCompression({ messages, usedPercent, cfg, sessionId, now }) -> plan`
@@ -1042,7 +1379,10 @@ same `compressPercent` share:
 1. `targetTokens = totalTokens * compress.compressPercent / 100`.
 2. If the session has recalled additions, walk them in createdAt order from the
    oldest, accumulating `addition.tokens`, until the accumulated tokens are
-   `>= targetTokens` (or all are taken). For those additions:
+   `>= targetTokens` (or all are taken). **v1.4.0 P1-1: additions injected by the
+   current turn are protected** — `addition.injectedTurn === current turn` is not
+   removable (a multi-step tool turn re-runs pass 0 on every pre-step; v1.3.0
+   removed the memory the turn had just recalled). For the removable additions:
    - remove them from the injected block (`state.additions`,
      `state.recalledIds.delete(id)`); the block is re-rendered and
      `forceNewSeries` makes the next pre-step return
@@ -1051,9 +1391,14 @@ same `compressPercent` share:
      α/β/keywords as awaiting re-review — **no new folder is created** (one
      folder per memory, no duplication); a folder that no longer exists on disk
      is skipped with a warning;
-   - re-render the block, save the shrunk v2 recall-state snapshot, append a
+   - re-render the block, save the shrunk **v3** recall-state snapshot, append a
      `rearchive` telemetry event `{ removedIds, removedTokens, targetTokens,
-     beforePercent }`, and mark the engine for reload.
+     beforePercent, turn }`, and mark the engine for reload.
+   v1.4.0 priority block trimming (§6.4) runs before this pass: low-α /
+   not-in-current-query entries are evicted first, high-α entries are pinned;
+   an evicted high-α folder normally enters `highRecycle`/`queryBoost` instead of
+   being marked `rescorePending` (only an emergency pass may mark high-α, and it
+   documents that its recall guarantee is paused while re-scored).
 3. `remainingPercent = max(0, (targetTokens - removedTokens) / totalTokens *
    100)`; if it is `<= 0`, this pass does not archive conversational messages
    (the next pre-step re-evaluates), otherwise the remaining share continues
@@ -1064,11 +1409,128 @@ same `compressPercent` share:
    model re-reviews them (`memory_judge` `keep: true` keeps the values) and are
    listed in the `记忆评分任务` section under “待复核” (§4.2).
 
+### 5.7 v1.4.0 archive protection and transaction (`compress.js` + `planCompression`)
+
+All of the following is implemented in v1.4.0 (contract §5.5/§5.6/§11.6); the
+pre-1.4.0 behaviour is available only by explicitly turning the switch off.
+
+**a. Current-turn protection (P0-3).** `planCompression` accepts
+`protectTurn` (turn number, telemetry/debug) and `protectSeq` (session seq of the
+**first message of the current turn**). The removed prefix must stop before the
+first message with `seq >= protectSeq`; the current turn's user message and its
+tool pairs can never be archived. `lib/surface.js protectTurnOf(session, turn)`
+computes `{turn, startSeq, seqs}` from the real user messages (extra conversation
+source kinds included for QQ channels). **v1.3.0's arbitrary fallback cut is
+removed**: when no legal cut point exists the plan is refused with
+`shouldCompress=false`, `reason='protected-turn' | 'no-legal-cut'` and a warning —
+never "cut somewhere else". If `protectSeq` is given but the messages carry no
+seq numbers, the plan warns and falls back to the historical behaviour.
+
+**b. Small-window / fake-window sanity (P1-6).** With `windowTokens` provided and
+`compress.allowSmallWindow=false` (default) the plan is refused
+(`reason='small-window' | 'window-conflict'`) when
+`windowTokens < compress.smallWindowTokens` (20000) or when the configured
+`compress.contextWindowTokens` and the host window differ by more than 4×
+(`min/max < 0.25`). The adapter additionally skips (once per session, WARN) when
+the measured context exceeds 500 % of the window (`fakeWindow`), because
+archiving a fake window only amplifies it. Sanity check:
+`lib/surface.js checkWindowSanity(session, cfg)` →
+`{windowTokens, hostWindow, configured, threshold, smallWindow, conflict, allowSmallWindow, needsAllowSmallWindow}`.
+
+**c. Hard-limit hard stop.** `compress.hardLimitStop=true` (default): when the
+context still cannot be brought below `compress.hardLimitPercent` (95) for
+**2 consecutive pressure episodes** (one trigger + its extra passes = one
+episode), the session stops archiving and WARNs once instead of retrying on every
+model step (the retry loop used to grow the context). `planCompression` accepts
+the adapter-only optional `hardLimitReached` flag so the engine-side refusal is
+distinguishable (`reason='hard-limit'`). `hardLimitStop=false` restores the
+v1.3.0 "warn only" behaviour.
+
+**d. Per-step folder cap.** The plan's folder count is capped by
+`min(compress.maxFoldersPerRun, compress.maxFoldersPerStep,
+releaseEstimate)` where `releaseEstimate` is the folder count the remaining
+window can actually release (`releaseTokens` / `releaseCapped` are reported);
+`plan.maxFoldersCapped=true` when the natural folder count was cut. The adapter
+records `maxFoldersCapped` in `compress-applied`.
+
+**e. Plan fields (read-only).** `planCompression` returns
+`{shouldCompress, reason, usedPercent, totalTokens, remove, keep, folders,
+warnings}` (v1.3.0) plus v1.4.0:
+`protectedTurn / protectedStart / smallWindow / maxFoldersCapped / maxFolders /
+releaseTokens / releaseCapped / eventTime / eventTimeSourceCounts /
+pendingAtArchive / allowSmallWindow`; failure reasons are
+`'protected-turn' | 'no-legal-cut' | 'small-window' | 'window-conflict' |
+'hard-limit'` (in addition to the v1.3.0 `'below-threshold' |
+'too-few-messages' | 'nothing-to-remove' | 'ok'`).
+
+**f. Event-time capture.** `planCompression` writes
+`eventStart/eventEnd/eventTimeSource='messages'` per folder when the archived
+messages carry `time` (`eventTimeRangeOf(messages)` = `{start:min, end:max+1,
+source}`; a missing/partial source falls back to `archive`); passive archiving
+writes the same fields.
+
+**g. Commit transaction (P1-4).** `commitCompression` writes folders first and
+`index.json` last; the whole mutation is wrapped in a journal:
+`store.beginCommitJournal(memoryDir, id, payload)` creates
+`.commit-<id>.json`, `store.finishCommitJournal(journalPath)` deletes it
+(single-argument, contract §11.3), and `store.cleanupCommitJournals(memoryDir)`
+drops stale journals (older than the configured max age) — it **never deletes
+memory folders**. `engine.load()` and every commit start call the cleanup. On any
+exception the already-written folders + image files + in-memory index entry are
+rolled back (`store.removeFolder`, image cleanup) and the original error is
+**rethrown** with `error.rolledBack=true` and `error.writtenFolderIds:string[]`
+(contract §11.5) — the caller does not receive a "rollback result" object.
+Idempotency uses `(sessionId, turn, seqStart, seqEnd, contentHash)` (stored as
+`meta.idempotencyKey`), so retrying with a new `now` does not duplicate folders;
+when the content hash is unavailable the legacy `plan.id` collision check is used.
+
 ---
 
-## 6. Recall (`recall.js`, `engine.js`)
+## 6. Recall (`recall-index.js` / `recall.js` / `engine.js`)
 
-`recall({ userText, cfg, index, rng?, now?, context?, excludeIds?, minAlpha? }) -> result`
+`MemoryEngine.recall(userText, context?, options?) -> result` dispatches on
+`recall.mode` (option `mode` overrides it for tests/CLI):
+
+| mode | selector | semantics |
+|---|---|---|
+| `'fair'` (default) | `engine/recall-index.js` FAIR-DRI | deterministic: α is a priority; rare-term high-α lane, σ high lane, register/queryBoost, low-α probe/rotation/recycle, priority block trim, priority-preserving pagination. **No `Math.random()`; `Date.now()` never influences the picks** (§6.2–§6.5). |
+| `'deterministic'` | same module, reduced lanes | plain DRI + sticky ledger + priority block trim — the research control; no fairness re-admission of trimmed memories. |
+| `'legacy'` | `engine/recall.js` v1.3.0 path | probability math exactly as v1.3.0 (`1 × α` / `α × p(n)`, seeded PRNG optional); kept byte-compatible for rollback (§6.1). |
+
+Shared call shape (all optional additions are backwards compatible):
+
+```js
+recall(userText, context = {}, options = {}) // context: {chars, tokens, windowTokens, sessionId}
+// options:
+//   excludeIds, minAlpha,                 // v1.3.0 (folders already in the block / α floor)
+//   offset = 0, limit = null,             // v1.4.0 pagination (limit default cfg.recall.firstGenMax)
+//   timeFrom, timeTo, granularity,        // v1.4.0 time-constrained recall (§6.8)
+//   mode = undefined,                     // overrides cfg.recall.mode
+//   lanes = undefined,                    // LaneState (adapter persists it in recall-state v3)
+//   round = undefined,                    // deterministic round number (default lanes.round+1)
+//   blockIds = undefined,                 // current block (selection excludes them)
+//   ledger = undefined,                   // ever-surfaced ids (selection excludes them; recycle lane excepted)
+// returns { additions, stats, warnings, lanes, page:{offset,limit,returned,candidates,hasMore},
+//           timeWindow, missType, mode, browse? }
+```
+
+Shared pre-filters (both modes):
+
+- **Unscored folders** (`folder.scored === false`, i.e. archived but not yet
+  judged by the current model, §4.2) are filtered out **before matching**: they
+  never match keywords, never consume any quota and never act as keyword
+  bridges. Legacy folders without the `scored` field count as scored.
+- **`minAlpha`** (optional α floor in `[0, 1]`, `0` = no gate; used by the v1.3.0
+  QQ channel member gate via `compat.memberMinAlpha`) — folders below the floor
+  behave exactly like unscored folders: filtered before matching, never consume
+  quota, never act as keyword bridges.
+- **Time filter** (`C(Q) ∩ W`, §6.8) applies to the **first generation only**;
+  the rank/bound definitions are over `C(Q) ∩ W`.
+
+### 6.1 Legacy probability recall (`mode='legacy'`, `engine/recall.js`)
+
+`recall({ userText, cfg, index, rng?, now?, context?, excludeIds?, minAlpha?,
+timeIds? }) -> result` — v1.3.0 behaviour preserved for rollback:
 
 - `index` is the loaded `memory/index.json` object.
 - `userText` is the latest user message text (may include the text of the last
@@ -1078,18 +1540,14 @@ same `compressPercent` share:
   injected recall block** (`lib/plugin.js` passes the session's `recalledIds`).
   They are never added again and never consume `attempts` or `firstGenMax`;
   they only act as transparent bridge nodes for the keyword BFS (see below).
-- `minAlpha` optional α floor in `[0, 1]` (default / invalid = `0` = no gate;
-  added in v1.3.0 for QQ channel sessions, `docs/README` "QQ 渠道兼容"). Folders
-  whose `alpha` is below the floor behave **exactly like unscored folders**: they
-  are filtered out before matching, so they never match, never roll, never
-  consume `firstGenMax` and never act as keyword bridges — a low-α folder cannot
-  be reached through a bridge node either.
-- **Unscored folders** (`folder.scored === false`, i.e. archived but not yet
-  judged by the current model, §4.2) are filtered out **before matching**: they
-  never match keywords, never roll, never consume `firstGenMax` and never act as
-  keyword bridges. Legacy folders without the `scored` field count as scored.
+- `minAlpha` optional α floor as described above.
+- `timeIds` (v1.4.0) optional `Set<string>` of folder ids inside the time window;
+  when present it filters the **first-generation** matching set (`C(Q) ∩ W`) — a
+  legacy recall with time arguments is therefore still a filtered recall.
+  **Pure time browsing** (`userText === ''` + time arguments, §6.8) works in
+  all three modes and never touches the probability path.
 
-Algorithm (must be implemented exactly):
+Algorithm (must be implemented exactly in legacy mode):
 
 1. `userKeywords = extractKeywords(userText, cfg, { max: 16 })` — candidate
    keywords from the user utterance. Folders with `scored === false` are dropped
@@ -1159,6 +1617,9 @@ Algorithm (must be implemented exactly):
    - `rng`: `() => number in [0,1)`, default `Math.random`; `cfg.recall.seed`
      creates a deterministic mulberry32 PRNG when non-zero (exported
      `createRng(seed)`).
+   - Legacy mode ignores `recall.hops`, `recall.fairness.*` and the v1.4.0 lane
+     telemetry (`lanesPicked=null`); it keeps `minAlpha`, `timeIds` and the
+     `excludeIds` bridge semantics above.
 4. Sort `added` by `cfg.recall.sort` (`'createdAt'` asc = creation time order;
    also support `'alpha'`, `'generation'` for experiments) — the adapter
    concatenates them in this order.
@@ -1187,7 +1648,237 @@ Algorithm (must be implemented exactly):
    when the index file mtime changed. `recall()` for 1 000 folders must run in
    well under 20 ms after warm-up on this machine. Reading an added folder's
    `context.json` is the only disk read on the hit path.
-7. `buildRecallBlock(additions, cfg) -> string` renders the injection text
+
+### 6.2 Deterministic recall — FAIR-DRI (`mode='fair'` / `'deterministic'`)
+
+`engine/recall-index.js` exports the selector (contract §5.1):
+
+```js
+export function buildRecallIndex(folders, cfg)   // O(BN); entries/byId/postings/automaton/rareThreshold/signature
+export function querySeeds(index, userText, cfg) // { seeds: string[], userKeywords: string[] }
+export function countCandidates(index, seeds, options = { minAlpha }) // number
+export function selectRecall(index, userText, options) // { picks, stats, hasMore, lanes, warnings, candidateIds? }
+export function selectSigma(index, seeds, options)     // σ-order top-k (deterministic mode / test oracle)
+export function comparePriority(a, b)                  // σ comparator: (alpha desc, createdAt asc, id asc)
+export function trimBlock(block, options)              // priority block trim (§6.4)
+export function summarizeGuarantees(history)           // guarantee aggregation for tests/tools
+```
+
+**Global priority σ (query independent):** `σ(m) = (alpha desc, createdAt asc,
+id asc)`. Every per-keyword posting list is kept sorted by σ, so a keyword query
+is a k-way merge over the matched posting lists. Folder keywords are normalized
+through `engine/tokenize.js` (`normalizeText`); matching is the tokenizer's
+`contains` rule implemented as an Aho-Corasick automaton over the keyword set
+(CJK substring / Latin word-boundary), so the candidate set is identical to
+`keywordMatches()` (no regression). `buildRecallIndex` skips `scored === false`
+entries, non-string ids and duplicate ids (first wins); `minAlpha` is a
+**selection-time** filter (it does not shrink the index).
+
+**Determinism.** `selectRecall` never calls `Math.random()`, and `Date.now()` is
+only used to stamp `index.builtAt` (cache bookkeeping); `round`, `now`, `cfg`
+are caller-provided. The same `index + userText + options + lanes` always yields
+the same picks.
+
+**Quotas** (contract §5.1 / plan §3.2.3):
+
+- `k = options.k ?? cfg.recall.firstGenMax` (default 10) — total picks per round;
+- `r = max(1, min(k-1, round(k × fairness.exploreRatio)))` (default 2) — low-α
+  rotation budget; `k_H = max(1, k - r)` (default 8) — high-α lane budget;
+- `θ_H = fairness.thetaHigh` (default 0.6) — α ≥ θ_H is "high importance";
+- `τ = max(fairness.rareTerm.minPosting=8, ceil(fairness.rareTerm.ratio=0.002 × N))`
+  — a query term is "rare" when its posting length ≤ τ; `rareTerm.scanCap=512`
+  bounds how many seeds participate in the rare-term test (long-text safety).
+
+**Lane order (fair mode, strictly this order; all lanes internally
+deterministic):**
+
+1. **`rareHigh`** — high-α candidates matched by a query **rare term**, sorted by
+   `(稀有得分 Σ 1/ln(2+df) desc, α tier desc, α desc, createdAt asc)`, at most
+   `k_H`; surplus is deferred (warning: G1 has no finite bound under that arrival
+   rate).
+2. **`queryBoost`** — entries of `lanes.highRecycle` (high-α memories evicted from
+   the block earlier) that are matched by the current query, re-admitted (up to
+   `k_H`); `reInjections` counts re-admitted ledger ids.
+3. **`register`** — `lanes.pendingHigh` entries deferred in the previous round,
+   TTL `fairness.register.ttlRounds=2` rounds, sorted by σ, at most `k_H`;
+   entries filtered by `minAlpha`/`timeIds` stay queued (not injected).
+4. **σ high lane (`hi`)** — remaining high-α candidates (`C_t ∩ {α ≥ θ_H}`,
+   excluding ledger/block/extra excludes/register) merged in σ order up to
+   `lookahead = fairness.register.lookahead × k_H` (default 3×8=24 candidates);
+   the first `remainingHigh` fill the high lanes, the rest go to the register
+   (capacity `fairness.register.capFactor × k_H` = 8×8=64, σ-sorted; overflow
+   increments `registerDrops` and raises a warning that the ±ttlRounds deferral
+   bound is degraded).
+5. **`lowProbe`** — rare-term matched **low-α** (α < θ_H) candidates, best rare
+   score first, `fairness.specificProbeSlots=1` slot: an explicitly referenced
+   low-α memory surfaces in the same round.
+6. **`rotation`** — deterministic low-α round-robin over the global **explore
+   order** (`α asc, createdAt desc, id desc`) with a persistent, self-healing
+   cursor (`lanes.exploreCursor`); slots = `r - lowProbePicked + highSpill`
+   (unused high-lane quota spills so small `k` still fills every slot); inside
+   the lookahead window items are ordered by `matchCount` first.
+   `a_low ≥ r` (arrival pressure) sets `lanes.degraded=true` and a warning: the
+   `ceil(L/r)` rotation bound is not promised.
+7. **`recycle`** — after cooldown (`fairness.recycle.cooldownRounds=15`) evicted
+   memories re-enter, at most `fairness.recycle.maxPerRound=1` per round and only
+   while slots remain; `reInjections` counts recycled ledger ids.
+8. **Commit** — the selected ids are returned as `picks`; the caller applies
+   them to the block and then calls `trimBlock` (§6.4).
+
+After selection a candidate already picked by another lane is never picked twice
+(`pickedIds`); all pending/recycle pools are pruned of ids picked in the same
+round so the next round cannot inject the exact same id.
+
+**Guarantees (formal, plan §3.2.1).** Let `C_t` = candidates in round t (keyword
+match ∩ time window, scored, α ≥ minAlpha), `k_H = k - r`, `rank_H(m)` = m's rank
+inside `C_t ∩ {α ≥ θ_H}` by σ.
+
+- **G1 high-α same-round**: if `m ∈ C_t`, `α(m) ≥ θ_H`, and m is matched by a
+  **rare** query term, and `|rareHigh candidates in t| ≤ k_H`, then m is injected
+  in round t. For ordinary terms the delay is ≤ `ceil(rank_H(m)/k_H)` rounds; a
+  deferred high-α memory is delivered within `register.ttlRounds` more rounds.
+  When the high-α arrival rate exceeds `k_H` no finite bound exists
+  (`registerDrops`/warning) — quota pressure, not data loss.
+- **G2 low-α bounded worst-case**: the rotation lane visits low-α candidates in
+  the fixed explore order; with arrival rate `a_low < r` every not-yet-surfaced
+  low-α candidate is visited within `ceil(L_t / r)` rounds (`L_t` = low-α
+  candidates in `C_t`). If `a_low ≥ r` the plugin records
+  `lanes.degraded = true` and does not promise the bound (remediation: raise
+  `exploreRatio` or page with `memory_recall` `offset`).
+- **G3 no discard**: all archived memories stay in the index; eviction from the
+  block is not deletion (high-α → `highRecycle` → queryBoost; low-α → `recycle` →
+  cooldown re-entry); the ledger is monotonic and only overflows at
+  `fairness.ledger.maxEntries` (evicts lowest α / least recently surfaced,
+  warning); disk memory is never deleted by recall policy.
+- **G4 no cross-round duplicates**: selection excludes `blockIds ∪ ledger ∪
+  excludeIds`; only `recycle`/`queryBoost` can re-inject an id and only after
+  `cooldownRounds` (assert: same id injected twice has round distance ≥
+  cooldown).
+- **G5 high-α not starved by low-α/new arrivals**: rareHigh/queryBoost run before
+  the σ high lane; rotation has its own `r` budget and never consumes high-α
+  slots; the register bounds deferral by `ttlRounds`.
+- **G6 budget/cost**: `picks ≤ k`; block ≤ `maxRecalledBlocks` /
+  `maxRecalledChars` / `windowTokens×maxWindowPercent`; one round also respects
+  `fairness.roundBudget.maxChars` (20000); `pops` is bounded by
+  `MAX_MERGE_POPS`; exactly `picks.length` folder bodies are read.
+
+**`mode='deterministic'`** runs only the σ-merge (`selectSigma`) with
+`exclude = ledger ∪ blockIds ∪ excludeIds`, `sticky` = ledger, then returns
+`picks` with `lane:'hi'` and `stats.lanesPicked.hi`; no rareHigh/queryBoost/
+register/probe/rotation/recycle. It is the research control and the test oracle
+(`selectRecall(mode='deterministic')` must equal `selectSigma` over the same
+exclusion set).
+
+**Selector stats (also the `recall` telemetry fields, §9):**
+`candidates`, `lanesPicked{rareHigh,queryBoost,register,hi,lowProbe,rotation,recycle}`,
+`pops`, `frontierHits`, `duplicates`, `excludedSkips`, `registerDrops`,
+`reInjections`, `filteredByTime` (deduplicated), `filteredByAlpha`,
+`lowCandidates`, `degraded`, `round`, `mode`, `hasMore`; `warnings` carries the
+rare-arrival/register-capacity/degradation messages. `candidateIds` (σ-ordered)
+is returned for telemetry/debug.
+
+**Performance budget:** N=10⁴ one `selectRecall` (index part) < 5 ms (tests allow
+50 ms for slow CI); `buildRecallIndex` 10⁴ < 60 ms (tests allow 200 ms); the
+index is cached by index mtime + config fingerprint in `MemoryEngine`.
+
+### 6.3 Lane state, persistence and recovery (`LaneState`)
+
+```js
+emptyLanes() -> {
+  frontier: Map<seed, {key:{alpha,createdAt,id}, length}>,  // per-seed consumption position
+  exploreCursor: null | {seed, key:{alpha,createdAt,id}, pos, length},
+  pendingHigh: string[], pendingHighRound: number[],        // register (TTL)
+  highRecycle: [{id, round}],                              // evicted high-α
+  recycle: [{id, eligibleRound}],                          // evicted low-α (cooldown)
+  degraded: boolean, round: number,
+}
+serializeLanes(lanes) -> JSON-safe object
+deserializeLanes(raw) -> LaneState   // bad data -> emptyLanes(), never throws
+lanesFingerprint(cfg) -> string      // 'cfg1|' + stable hand-written serialization
+```
+
+- The state is persisted by the adapter in `recall-state.json` **v3** (§3.1);
+  the engine itself never writes it. `MemoryEngine` keeps an in-memory copy
+  (`_lanes`, `_round`) when the caller does not pass one.
+- **Self-healing**: frontier/cursor store the σ key `{alpha, createdAt, id}`
+  (not just an index) so a changed posting list can relocate the position
+  (binary search, fall back to position 0 when the key is gone); a missing/corrupt
+  field degrades to its empty value.
+- **Fingerprint reset**: `lanesFingerprint(cfg)` covers exactly the
+  selection-relevant knobs (`mode`, `firstGenMax`, `hops`, effective `fairness`,
+  `matchMode`). When the persisted `configFingerprint` differs, the lane cursors
+  are reset but `ledger`/`block` are preserved (no memory loss; bounded
+  duplicates only).
+- **Ledger**: monotonic ever-surfaced id set; the adapter persists it in v3 and
+  trims it at `fairness.ledger.maxEntries` with the documented overflow policy.
+  `memory_recall` (manual tool) deliberately **does not pass the ledger** — it
+  only excludes the current block, so a model-triggered search may re-surface a
+  memory that was trimmed out of the block (contract §11.10).
+
+### 6.4 Block management — priority trim (`trimBlock`, replaces v1.3.0 createdAt FIFO)
+
+`trimBlock(block, { index, candidates, cfg, maxBlocks?, maxChars?,
+maxWindowPercent?, windowTokens? }) -> { keep, evicted, droppedChars,
+droppedBlocks, pinnedHigh }`
+
+- Eviction key, lowest priority evicted first:
+  `(not in this round's candidate set C_t, α < θ_H, α asc, injectedRound asc, id)`.
+- **High-α pin**: while the block contains any low-α entry, high-α entries are
+  never evicted. A hard `maxChars` limit still keeps **at least one** entry.
+- Limits: `maxBlocks = recall.maxRecalledBlocks` (64),
+  `maxChars = recall.maxRecalledChars` (120000) and, when `windowTokens > 0`,
+  `windowTokens × recall.maxWindowPercent / 100` (10%); `keep` preserves
+  `{id, injectedRound}` (the round is used for the next eviction order).
+- Eviction is **not deletion**: the adapter moves evicted high-α ids into
+  `lanes.highRecycle` (queryBoost) and low-α ids into `lanes.recycle`
+  (eligibleRound = round + cooldownRounds); the ledger is untouched.
+- v1.3.0's FIFO (`createdAt` oldest first) is gone; `recall.fairness.blockTrim.
+  policy='fifo'` is accepted by config validation as an explicit compatibility
+  value (behavior documented as non-default).
+
+### 6.5 Pagination (`offset` / `limit`)
+
+- The deterministic selector computes the page directly: `k = offset + limit + 1`
+  (`+1` lookahead => `hasMore`), then `picks = allPicks.slice(offset, offset+limit)`
+  — deterministic and stable across calls with the same state.
+- `page = { offset, limit, returned, candidates, hasMore }`; `hasMore` is computed
+  from the `+1` lookahead (not from a second selector pass). The adapter also
+  reports `total` for its own bookkeeping when available.
+- **Lane state advances once per successful page**: a paginated round commits
+  the winning lane state (frontier/register/recycle) only after the page is
+  selected; failed fallback attempts run on a snapshot and never advance it.
+- `memory_recall` exposes `offset` (0..10000) and uses `limit` from its own
+  parameter (1..8, default 3); automatic recall uses `offset=0` and
+  `limit=cfg.recall.firstGenMax`.
+
+### 6.6 Bidirectional keyword matching (`engine/keyword-match.js`, P0-5)
+
+```js
+matchKeywords(normalizedUserText, folderKeywords, cfg) -> {
+  matchCount, phraseHit, titleHit, matched: string[]
+}
+hasMatch(normalizedUserText, folderKeywords, cfg) -> boolean
+```
+
+- Direction 1 (v1.3.0, hard no-regression): a folder keyword is a **substring**
+  of the user text (CJK) or matches on Latin word boundaries.
+- Direction 2 (v1.4.0): a **user-text token** appears inside a folder keyword
+  (including the parts of a multi-word phrase: `接口网关 8080` matches when the
+  user only says `网关`).
+- `phraseHit` = a multi-word folder keyword matched as a whole phrase;
+  `titleHit` = an optional folder-title token appears in the user text (the
+  caller may pass the title).
+- `match.expandLatinCase` / `match.cjkBigram` are opt-in expansions (default
+  **off**): they can only **add** matches, never remove one — default product
+  behaviour is unchanged.
+- Only fair/deterministic relevance uses this module; the legacy path keeps
+  `countKeywordMatches` to stay byte-compatible. Contract guarantee: every
+  folder that v1.3.0 `keywordMatches()` accepted must also be accepted here.
+
+### 6.7 Recall block rendering (`buildRecallBlock`)
+
+`buildRecallBlock(additions, cfg) -> string` renders the injection text
+
    (`''` when `additions` is empty). Format (verbatim, simplified Chinese; the
    three preamble lines are fixed text — `RECALL_BLOCK_PREAMBLE` — followed by a
    blank line, one entry block per addition, and the result is
@@ -1254,79 +1945,376 @@ Algorithm (must be implemented exactly):
    (dry-run supported, backups kept) — the current build no longer writes history
    messages at all.
 
+### 6.8 v1.4.0 time assistance (`engine/time-index.js`)
+
+**Dual-time contract.** `createdAt` is the **archival time** (`archivedAt`), not
+the event time; the folder's event interval is the optional
+`[eventStart, eventEnd)` (`eventTimeSource` `'messages'|'judge'`), otherwise it
+falls back to the archive time `[createdAt, createdAt+1)` with
+`eventTimeSource='archive'`. The event interval is captured mechanically while
+archiving (`eventTimeRangeOf(messages)` = `{start: min(time), end: max(time)+1,
+source:'messages'}`; engine/compress.js) and by the passive archive path. 1.4.0
+never lets the scoring model override it (`time.judgeEventTime=false`; a
+`memory_judge` `eventTime` argument is ignored with a 1.4.1 hint). Old data (0 of
+4825 messages carry `time` on this machine) therefore remains queryable via the
+archive time and is **not migrated**.
+
+**The index is virtual and strictly in-memory.** `buildTimeIndex(folders, cfg)`
+derives day/month/year buckets from `index.folders`; nothing is written to disk
+and no day/month/year directory layout exists (the folder tree stays the only
+source of truth). It is rebuilt lazily when the loaded index or the configured
+timezone changes, and `time.mode='off'` removes all of it. Rough memory: 2780
+folders ≈ 78 KB / ~2 ms build; N=10⁴ extrapolates to ≤ 20 ms. Moving folders into
+date directories is explicitly forbidden: it breaks every id-addressed read
+(folder dir lookup, image index, stats, recall-state) and `rebuildIndex` would
+write back an empty index — a data-corruption class of bug.
+
+**Exports (contract §5.3):**
+
+```js
+export const TIME_DEFAULTS // {mode:'index', timezone:'', minRangeDays:3, maxRangeDays:366,
+                           //  centerDayPriority:true, fallback:['day3','month','year','all'],
+                           //  fallbackMinResults:1, windowScanMax:4096, askUserHint:true, judgeEventTime:false}
+export function detectGranularity(value) // '2026-10-31'->day, '2026-10'->month, '2026'->year, number->epoch, else 'invalid'
+export function validateTimezone(tz)     // {ok, timezone, warning?} — Intl-based, never throws
+export function zonedDayStart(ms, tz) / zonedMonthStart(ms, tz) / zonedYearStart(ms, tz)
+export function dayKey(ms, tz)           // 'YYYY-MM-DD' local civil day
+export function addZonedDays(ms, days, tz) // calendar addition (never ±86400000)
+export function formatWindow(window, tz) // display string for tools
+export function timeConstraintEnabled(cfg) // mode === 'constrain'
+export function folderTimeRange(entry)   // {start, end, source:'messages'|'judge'|'archive'}
+export function buildTimeIndex(folders, cfg) // {timezone, folderCount, builtAt, byId, buckets, dayKeys, monthKeys, yearKeys, ranges}
+export function queryTimeIndex(timeIndex, window, cfg) // {ids: Set<string>|null, count}
+export function timeFallbackLadder(normalized, cfg) // [{from,to,level,widenedTo}]
+export function normalizeTimeQuery(input, cfg, now) // {from,to,level,granularity,center,requested,warnings}
+```
+
+**Normalization (`normalizeTimeQuery` is pure and never throws):**
+
+| input | rule |
+|---|---|
+| single day `2026-10-31` | L0 window = that natural day; `center` = day start; `granularity='day'` |
+| single month / year `2026-10` / `2026` | natural month / natural year window |
+| explicit range (`timeFrom`+`timeTo`) | endpoints expand at their own granularity; **hard window — never widened** |
+| one endpoint only | the other side falls back to `minRangeDays` |
+| `from > to` | swapped (warning) |
+| span `< time.minRangeDays` (3) | widened symmetrically to the minimum, the centre is preserved → a single-day query is "centre day, then ±1 day" |
+| span `> time.maxRangeDays` (366) | truncated to 366 days (warning) |
+| future timestamps | clamped to `now` |
+| blank/invalid/unknown granularity | degrades to "no constraint" + warning (never throws) |
+
+**Matching rule (the only truth).** A folder covers the half-open interval
+`[start, end)`; the query window is the half-open `[from, to)`; they match iff
+`start < to && end > from` (interval overlap). Day/month/year buckets are only a
+candidate filter — the exact overlap test always decides, so buckets cannot change
+semantics. Cross-day folders appear in every bucket they overlap; a point
+interval uses `+1` so it is not lost at a boundary.
+
+**Time zone.** All values are epoch ms; day/month/year boundaries are computed
+with `Intl.DateTimeFormat` for `time.timezone` (IANA id, `''` = host local). No
+`±86_400_000` arithmetic (DST days are 23/25 h, leap years have 366 days); a
+non-existent wall time resolves to the nearest existing instant and an ambiguous
+one to the first matching instant.
+
+**Fallback ladder.** For a **soft** window (single day/month/year) and
+`time.mode='constrain'`, `timeFallbackLadder()` produces the rungs
+`day → ['day3','month','year','all']` (month start: `['year','all']`; year:
+`['all']`); the engine tries rungs until the page has ≥
+`time.fallbackMinResults` results (default 1). Every rung carries `widenedTo`;
+the chosen rung is surfaced as `timeWindow.widenedTo`/`level` and rendered as
+`（日粒度 · 已放宽到 ±1 天）`. A failed rung must not advance the lane state:
+the engine snapshots `serializeLanes()` before the ladder and commits only the
+winning attempt's lanes.
+
+**Only the first generation.** The time filter applies to `C(Q) ∩ W`; the
+candidate set — and therefore the σ rank / quota bounds — is defined on the
+filtered set (`rank` in `C(Q)∩W`; otherwise `ceil(rank_H/k_H)` is unsound).
+`hops`/descendant expansion is not time-constrained (default `hops=0`).
+
+**`time.mode` semantics (contract §11.7).**
+
+- `'off'`: no event-time collection, no index, `engine.recall` ignores the time
+  arguments and returns a warning (`time.mode is "off"`); `timeWindow` is `null`.
+- `'index'` (engine default): normalize and build the index but **never filter** —
+  `timeWindow` is reported with `enforced=false`; the `memory_recall` tool must
+  say "时间约束未启用". `matchedFolders`/`candidates` are not filtered.
+- `'constrain'` (packaged `config.json` default): filter.
+
+**Time-only browsing (`memory_recall` without keywords).**
+`engine.recall('', ctx, {timeFrom,…})` works in `fair`/`deterministic`/`legacy`
+(contract §11.8): returns `browse=true`, additions ordered by event start
+ascending (`eventStart` when known, else `createdAt`), `excludeIds` respected
+(already-injected memories skipped), `missType='time'` when the window is empty,
+and it **never consumes/advances lanes** (browsing is a lookup, not a recall
+decision). It still respects `limit`/`offset` and `minAlpha`.
+
+**Miss classification.** `missType` is computed after the time filter:
+`'time'` when keyword-matched candidates existed but the window filtered them
+all (or a browse window is empty), `'keyword'` when the keyword candidate set was
+already empty, `null` when something was returned. `memory_recall` never counts a
+`missType='time'` as a 3/6 strike; only a true keyword miss does (§4.3).
+
+**`engine.recall` time inputs/outputs.**
+
+```js
+recall(text, ctx, { timeFrom, timeTo, granularity, ... }) -> {
+  ...,
+  timeWindow: { from, to, level, granularity, widenedTo, requested, enforced, hardWindow, hits, timezone },
+  missType: null | 'time' | 'keyword',
+  mode: 'fair'|'deterministic'|'legacy',
+  page: { offset, limit, returned, candidates, hasMore },
+  browse?: true,
+}
+```
+
+`engine.timeWindowFor({timeFrom,timeTo,granularity}, now)` returns the same
+normalization + hit set for tools/tests; `engine.timeIndex()` is the lazy cached
+index (rebuilt on index mtime/timezone change).
+
+**Tools/CLI.** `tools/time-view.mjs` is a read-only listing of a time window
+(`--memory/--from/--to/--granularity/--timezone/--limit/--json`, never writes).
+`engine/cli.mjs recall` accepts `--time-from/--time-to/--granularity/--offset/
+--limit/--mode`; with a time argument and no `--text` it browses. `compress`
+accepts `--allow-small-window`; the plan output includes
+`protectedTurn/smallWindow/maxFoldersCapped/eventTime`. The CLI has no turn
+semantics, so it never exposes `protectSeq`.
+
 ---
 
 ## 7. Public API (`engine/index.js`)
 
 ```js
-export { DEFAULT_CONFIG, loadConfig, validateConfig, resolveMemoryDir,
-         BETA_MIN, BETA_MAX, DEFAULT_BETA, normalizeBeta } from './config.js'
+// config
+export { DEFAULT_CONFIG, BUILTIN_STOPWORDS, PLUGIN_ROOT,
+         BETA_MIN, BETA_MAX, DEFAULT_BETA, normalizeBeta,
+         loadConfig, validateConfig, resolveMemoryDir, mergeConfigFile, mergeConfig,
+         deepMerge, cloneConfig, defaultConfigPath } from './config.js'
+// tokenization / message model
 export { estimateTokens, estimateMessagesTokens, normalizeMessages, renderMessage,
-         extractKeywords, tokenize } from './tokenize.js'
-export { computeImportance, alphaForFolder } from './importance.js'
+         extractKeywords, extractKeywordsDetailed, tokenize, normalizeText,
+         matchesKeyword, keywordMatches, countKeywordMatches, sharedKeywordCount,
+         normalizeKeywordScore, contentToText } from './tokenize.js'
+// α / probability primitives
+export { computeImportance, alphaForFolder, DECISION_MARKERS } from './importance.js'
 export { erf, recallProbability, createRng } from './recall.js'
-export { planCompression, commitCompression, buildArchiveNote, parseArchiveNote } from './compress.js'
-export { recall, buildRecallBlock, formatBeta, RECALL_BLOCK_PREAMBLE } from './recall.js'
+// compression
+export { planCompression, commitCompression, buildArchiveNote, parseArchiveNote,
+         eventTimeRangeOf } from './compress.js'
+// recall (legacy path + shared rendering)
+export { recall, loadRecallAdditions, buildRecallBlock, formatBeta, RECALL_BLOCK_PREAMBLE } from './recall.js'
+// v1.4.0 FAIR-DRI deterministic selector (§6.2–§6.5)
+export { buildRecallIndex, querySeeds, countCandidates, selectRecall, selectSigma,
+         comparePriority, emptyLanes, serializeLanes, deserializeLanes, lanesFingerprint,
+         trimBlock, simulateTurns, summarizeGuarantees } from './recall-index.js'
+// v1.4.0 keyword matching (§6.6)
+export { matchKeywords, hasMatch } from './keyword-match.js'
+// v1.4.0 time assistance — in-memory only (§6.8)
+export { TIME_DEFAULTS, detectGranularity, normalizeTimeQuery, folderTimeRange,
+         buildTimeIndex, queryTimeIndex, timeFallbackLadder, timeConstraintEnabled,
+         zonedDayStart, zonedMonthStart, zonedYearStart, dayKey, addZonedDays,
+         formatWindow, validateTimezone } from './time-index.js'
+// engine facade
 export { MemoryEngine } from './engine.js'
-export { readIndex, loadIndex, writeIndex, listFolders, readFolder, ensureMemoryDir,
-         appendStats, readStats } from './store.js'
+// persistence (+ v1.4.0 optional fields & commit transaction helpers)
+export { readIndex, loadIndex, rebuildIndex, writeIndex, refreshIndex, listFolders,
+         readFolder, writeFolder, ensureMemoryDir, appendStats, readStats,
+         folderExists, folderDir, allocateFolderId, formatFolderId, folderStamp,
+         memoryPaths, atomicWriteJson, indexEntryFromMeta, scanFolderMetas,
+         PENDING_ERAS, SCORE_MODES, ARCHIVE_SOURCES, EVENT_TIME_SOURCES,
+         removeFolder, beginCommitJournal, finishCommitJournal, cleanupCommitJournals } from './store.js'
+// report math
+export { summarizeStats, formatReport, roundNumber } from './stats.js'
+// v1.4.0 data-era classification (§4.5)
+export { LEGACY_ERA_CUTOFF_MS, SYNTHETIC_WINDOW_TOKENS, SYNTHETIC_BEFORE_PERCENT,
+         STRESS_MIN_FOLDERS, STRESS_MIN_PENDING, sessionEraSignals, sessionEra,
+         classifyFolderEra, summarizeEras } from './era.js'
 ```
 
-Added by the current-model scoring revision: `BETA_MIN`, `BETA_MAX`,
-`DEFAULT_BETA`, `normalizeBeta` (§4.1), `formatBeta` and
-`RECALL_BLOCK_PREAMBLE` (§6.7). `indexEntryFromMeta()` (exported) additionally
-normalizes/preserves `scored` and `rescorePending`. v1.2 adds
-`buildArchiveNote(plan, { totalSegments })` (backwards-compatible) and
-`parseArchiveNote(text)` (§5.4). Everything remains synchronous, zero-dependency
-and free of DSH imports. Both model-facing tools are **adapter-side**:
+Everything remains synchronous, zero-dependency and free of DSH imports. The
+v1.4.0 additions are documented in the sections referenced above; **contract
+§11.3** fixes `finishCommitJournal(journalPath)` as a single-argument function
+and **§11.5** fixes the commit-failure semantics (rollback then rethrow, no
+rollback result object). Both model-facing tools are **adapter-side**:
 `memory_judge` (`lib/memory-tool.js`, §4.2) and `memory_recall`
 (`lib/recall-tool.js`, §4.3). The v1.2 image folder helpers live in
 `lib/images.js` (pure, DSH-free) and are also adapter-side — they are deliberately
 not part of the engine API, so `engine/` stays image-agnostic (§1). The
 independent `tools/selfcheck.mjs` (§10, R5) is also adapter-side: it imports only
-the zero-dependency engine surface it needs (`engine/config.js` defaults and
-`planCompression`) plus `locateFrames` from `tools/repair-session-log.mjs`, and
-deliberately does **not** import `lib/plugin.js`.
+the zero-dependency engine surface it needs (`engine/config.js`, `engine/era.js`,
+`engine/time-index.js`, `planCompression`) plus `locateFrames` from
+`tools/repair-session-log.mjs`, and deliberately does **not** import
+`lib/plugin.js`.
 
 `MemoryEngine`:
 
 ```js
 const engine = new MemoryEngine({ memoryDir, config, rng })
-engine.load()                      // sync; loads/rebuilds index
-engine.planCompression(messages, usedPercent)
-engine.compress(messages, usedPercent, { sessionId }) // plan + commit, returns result
-engine.recall(userText, context, { excludeIds, minAlpha }) // returns recall result, updates stats.jsonl
+engine.load()                      // sync; loads/rebuilds index + cleans stale commit journals
+engine.planCompression(messages, usedPercent, opts?) // opts: protectTurn/protectSeq/pendingCount/windowTokens/
+                                   //        allowSmallWindow/maxFolders/eventTimes/hardLimitReached
+engine.compress(messages, usedPercent, { sessionId, ... }) // plan + commit; throws (rolledBack=true) on failure
+engine.recall(userText, context, { excludeIds, minAlpha, offset, limit, mode,
+                                   timeFrom, timeTo, granularity, lanes, round,
+                                   blockIds, ledger }) // returns recall result; appends stats.jsonl
+engine.timeIndex()                 // lazily cached in-memory time index (v1.4.0)
+engine.timeWindowFor(input, now)   // normalize + hit set for tools/tests (v1.4.0)
+engine.recallIndex()               // lazily cached FAIR-DRI index (v1.4.0)
 engine.report()                    // aggregate stats from stats.jsonl
 engine.setConfig(partial)          // deep merge + reload
 ```
 
-Thread-safety: single-process synchronous; documented as such.
+Thread-safety: single-process synchronous; documented as such. The caches are
+invalidated by index mtime + config fingerprint (`recallIndex()`) and index
+mtime + timezone (`timeIndex()`).
 
 ---
 
 ## 8. CLI (`engine/cli.mjs`)
 
-Zero-dependency argument parsing. Commands:
+Zero-dependency argument parsing. Commands (v1.4.0 additions marked ★):
 
 ```
 node engine/cli.mjs init [--dir memory] [--config config.json]
-node engine/cli.mjs compress --input conversation.json [--used-percent 63] [--session-id X] [--config config.json] [--dir memory]
-node engine/cli.mjs recall --text "用户这句话" [--context token=41000 window=128000] [--config config.json] [--seed 42] [--dir memory]
+node engine/cli.mjs compress --input conversation.json [--used-percent 63] [--session-id X]
+                             [--config config.json] [--dir memory] [★--allow-small-window]
+node engine/cli.mjs recall --text "用户这句话" [--context token=41000 window=128000]
+                           [--config config.json] [--seed 42] [--dir memory]
+                           [★--time-from 2026-10-31] [★--time-to 2026-10-31]
+                           [★--granularity day|month|year] [★--offset N] [★--limit N]
+                           [★--mode fair|deterministic|legacy]
 node engine/cli.mjs list [--config config.json] [--dir memory]
 node engine/cli.mjs report [--config config.json] [--dir memory] [--json]
 ```
 
-`--dir` points the CLI at one concrete memory directory (bypassing
-`config.storage.dir`), which is what the tools use for per-session dirs.
-
-`conversation.json` = `{ "messages": MemMessage[], "usedPercent": 63.2, "contextWindowTokens": 128000 }`.
-All commands print JSON to stdout (`--json` implied for machine use) and human
-text hints to stderr. Exit code 1 on invalid input. `recall` prints the recall
-block plus stats. CLI must never import DSH.
+- ★ `recall` without `--text` but with a time argument performs a **pure time
+  browse** (`browsing: true`); the JSON output adds
+  `mode` / `browsing` / `missType` / `page:{offset,limit,returned,candidates,hasMore}` /
+  `timeWindow:{from,to,level,granularity,widenedTo,requested,enforced,hardWindow,hits,timezone}`
+  and `additions[].lane`.
+- ★ `compress` accepts `--allow-small-window` (per-plan override of
+  `compress.allowSmallWindow`) and its output adds
+  `protectedTurn` / `smallWindow` / `maxFoldersCapped` / `eventTime` (plus the
+  plan fields of §5.7e). The CLI has no turn/seq semantics, so it never exposes
+  `protectSeq`.
+- `--dir` points the CLI at one concrete memory directory (bypassing
+  `config.storage.dir`), which is what the tools use for per-session dirs.
+- `conversation.json` = `{ "messages": MemMessage[], "usedPercent": 63.2, "contextWindowTokens": 128000 }`.
+- All commands print JSON to stdout (`--json` implied for machine use) and human
+  text hints to stderr. Exit code 1 on invalid input. `recall` prints the recall
+  block plus stats. CLI must never import DSH and must never import `lib/**`.
 
 ---
 
-## 9. Test-phase statistics (`tools/recall-report.mjs`)
+## 9. Telemetry (`stats.jsonl`) and test-phase statistics
+
+### 9.1 v1.4.0 telemetry events (contract §7)
+
+`stats.jsonl` stays an append-only, best-effort, per-session event log
+(`memory/sessions/<id>/stats.jsonl`); a failed append never breaks
+compression/recall. The engine writes `recall` / `compress`; the adapter writes
+`compress-applied` / `rearchive` / `judge`. v1.4.0 adds the following fields
+(older 1.3.0 events simply omit them — readers must treat them as absent, not
+as zero-loss):
+
+**`type:'recall'`** (new keys on top of the v1.3.0 event):
+
+```json
+{
+  "type": "recall",
+  "mode": "fair",
+  "candidates": 12,
+  "lanesPicked": { "rareHigh": 2, "queryBoost": 0, "register": 1, "hi": 4,
+                   "lowProbe": 0, "rotation": 2, "recycle": 1 },
+  "pops": 31,
+  "frontierHits": 3,
+  "registerDrops": 0,
+  "reInjections": 1,
+  "degraded": false,
+  "blockBefore": 5,
+  "blockAfter": 9,
+  "timeWindow": { "from": 1761177600000, "to": 1761264000000, "level": "day", "widenedTo": null },
+  "timeFiltered": 3,
+  "offset": 0,
+  "limit": 10,
+  "hasMore": false,
+  "missType": null
+}
+```
+
+- `mode` ∈ `'fair' | 'deterministic' | 'legacy'`.
+- `candidates` = unique candidates in the (time-filtered) window;
+  `timeFiltered` = unique candidates outside the time window.
+- `lanesPicked` is the exact per-lane pick count (all seven lane names are
+  always present in v1.4.0 events; `legacy` events carry `null`).
+- `pops` / `frontierHits` / `registerDrops` / `reInjections` / `degraded` are the
+  selector counters of §6.2; `degraded=true` means the low-α rotation bound is
+  not promised.
+- `blockBefore` / `blockAfter` = block entry count before/after this round's
+  injection + trim.
+- `timeWindow` = `{from, to, level, widenedTo}` or `null` when no time input was
+  given; `missType` ∈ `null | 'time' | 'keyword'`.
+- `offset` / `limit` / `hasMore` mirror the pagination page.
+- The existing v1.3.0 fields (`userKeywords`, `contextChars`, `windowTokens`,
+  `matchedFolders`, `excludedFolders`, `attempts`, `addedFolders`,
+  `addedChars`, `addedTokens`, `addedPercentOfContext`, `addedPercentOfWindow`,
+  `byGeneration`, `added[]`) remain; `added[]` gains `lane` and keeps `beta`.
+
+**`type:'compress'`** (new keys; also mirrored on `compress-applied`):
+
+```json
+{
+  "type": "compress",
+  "pendingAtArchive": 41,
+  "pendingCount": 41,
+  "smallWindow": false,
+  "protectedTurn": true,
+  "foldersPlanned": 12,
+  "foldersCommitted": 12,
+  "rollback": false,
+  "maxFoldersCapped": false,
+  "eventTimeSourceCounts": { "messages": 12 }
+}
+```
+
+- `pendingAtArchive` / `pendingCount`: pending backlog measured before the
+  archive (backpressure + era telemetry).
+- `smallWindow`: the archive happened under `allowSmallWindow` (otherwise it
+  would have been refused); `protectedTurn`: a current-turn protectSeq was
+  applied (the removed span stopped before it).
+- `foldersPlanned` / `foldersCommitted`: planned vs actually written folders
+  (a difference with `rollback=false` flags a partial commit).
+- `rollback`: whether a failed commit was rolled back and rethrown;
+  `maxFoldersCapped`: the per-step/release cap cut the folder count.
+- `eventTimeSourceCounts`: per-source folder counts (`messages` / `judge` /
+  `archive`) for the folders written by this archive.
+- Implementation additionally records `scoreMode` and `archivedByVersion`
+  (provenance, §4.6) and `pendingRounds`; those are additive and do not alter
+  the contract keys above.
+
+**`type:'judge'`** (new event, one per `memory_judge` call; counts/rates only,
+**never** ids, keyword text or conversation content; disabled by
+`scoring.judgeTelemetry=false`):
+
+```json
+{
+  "type": "judge",
+  "sessionId": "…",
+  "batchSize": 12,
+  "updated": 11,
+  "kept": 1,
+  "rejected": 0,
+  "elapsedMs": 842,
+  "uniformAlphaRate": 0.917,
+  "keywordRepeatRate": 0.25,
+  "reasonMissingRate": 0.5
+}
+```
+
+`type:'archive'` (if a host path still emits it) is unchanged; the engine's
+`appendStats` only serializes JSON-safe scalar/array/object values (never memory
+bodies), so a telemetry line can never leak folder content.
+
+### 9.2 Report tool (`tools/recall-report.mjs`)
 
 By default it reads the telemetry of the **per-session layout**: every
 `memory/sessions/<session-id>/stats.jsonl` plus the legacy global
@@ -1350,6 +2338,9 @@ archived images         : 2 (copied to images/)
 pinned context merged   : 1 recorded / 3 shadowed, 48 chars (into checkpoint notes)
 checkpoint notes merged : 1 previous note(s), latest cumulative segments: 4
 beta (trust)           : n=38, mean=+1.42, β≥7: 3, 0≤β<7: 28, β<0: 7
+lanes (v1.4.0)         : 3 event(s), picks=30 (mean 10), rareHigh=6/queryBoost=0/register=2/hi=14/lowProbe=1/rotation=5/recycle=2; …
+time filter            : 2 event(s), filtered 6 candidate(s), widened 1, missType time/keyword=1/0
+pending era            : legacy 587 / synthetic 2180 / current 2 (current true pending 2/369 = 0.54%)
 ```
 
 `re-archive events` / `pending folders created` are tool-only aggregates over
@@ -1360,11 +2351,16 @@ line to `pinnedRecorded recorded / pinnedShadowed shadowed` (sums of
 `compress-applied.pinnedRecorded` / `.pinnedShadowed`, §5.5) and adds
 `checkpoint notes merged`: the number of merged previous notes (`mergedCheckpoints`
 sum) and the latest cumulative `archiveSegments` (the per-archive values are
-cumulative, so the tool reports the maximum). The `beta (trust)` line
+cumulative, so the tool reports the maximum). v1.4.0 adds the three lines above:
+`lanes (v1.4.0)` (lane distribution, mean picks, registerDrops/degraded/
+reInjections and recall modes), `time filter` (timeFiltered, timeWindow/
+widenedTo, missType, hasMore) and `pending era` (engine/era.js buckets and the
+current true-pending caliber). Old telemetry that lacks the v1.4.0 fields prints
+`n/a (no v1.4.0 recall telemetry yet)` instead of failing. The `beta (trust)` line
 is aggregated from `recall` telemetry `added[].beta` (one value per recalled
 memory). β prints `n/a (no recall telemetry with β yet)` when no event carries
-it; β is metadata for the reading model and is **never** part of the
-recall-probability math. `--json` adds `betaStats` (`{ n, mean, aboveOrEqual7,
+it; β is metadata for the reading model and is **never** part of any recall
+selection decision. `--json` adds `betaStats` (`{ n, mean, aboveOrEqual7,
 between0And7, negative }`) and `workStats` (`{ rearchiveEvents, rearchivedFolders,
 rearchivedTokens, pendingCreated, archivedImages, pinnedShadowed, pinnedRecorded,
 pinnedChars, mergedCheckpoints, archiveSegments }`).
@@ -1389,11 +2385,12 @@ trigger compression), then user utterances that trigger recall chains with a
 seeded RNG, and prints both the report and every injected block — this is the
 required "test-phase program showing % of context added back and chars added".
 
-**Independent self-check (`tools/selfcheck.mjs`, v1.2 R5).** Zero-dependency
-health check over the *persisted* state; it deliberately does **not** import
-`lib/plugin.js`, so a broken adapter cannot hide its own damage (it only reuses
-the public zero-dependency engine surface `engine/config.js` + `planCompression`
-and `locateFrames` from `tools/repair-session-log.mjs`). Usage:
+**Independent self-check (`tools/selfcheck.mjs`, v1.2 R5; v1.4.0 checks 5–7).**
+Zero-dependency health check over the *persisted* state; it deliberately does
+**not** import `lib/plugin.js`, so a broken adapter cannot hide its own damage (it
+only reuses the public zero-dependency engine surface `engine/config.js`,
+`engine/era.js`, `engine/time-index.js` + `planCompression`, and `locateFrames`
+from `tools/repair-session-log.mjs`). Usage:
 
 ```bash
 node tools/selfcheck.mjs [--json] [--memory-dir <dir>] [--sessions-dir <dir>] \
@@ -1401,29 +2398,79 @@ node tools/selfcheck.mjs [--json] [--memory-dir <dir>] [--sessions-dir <dir>] \
 ```
 
 Checks (each PASS / WARN / FAIL; **exit code 1 only when at least one FAIL
-exists**, WARN does not fail the run): `config` (engine config loads,
-`config.json` valid, `compress.maxFoldersPerRun === 500`, key fields present),
-`engine` (`DEFAULT_CONFIG` default is 500; `planCompression` smoke test for the
-folder cap and R2 title uniqueness), `memory store` (`index.json` ↔ disk
-reconciliation both ways, `meta.json` schema including α/β/`scored`/keywords,
-unsafe ids, `images/index.json` files exist, `stats.jsonl` lines valid JSON),
-`recall state` (v2 `recall-state.json` snapshots consistent), `session logs`
-(zstd frames decoded and `surfaceOp` append/replace replayed to the final
-surface: at most one dsh-rofm note per session — more is WARN — legacy residue written before this release added the merge
-legacy; `N` a positive integer; appendices must not carry re-injected
-infrastructure; foreign checkpoints counted but ignored), and optionally
-`--with-tests` (`node --test` exits 0). Historical data shapes that older
-versions legitimately wrote are reported as **WARN, never FAIL**. Output: one
+exists**, WARN does not fail the run):
+1. `config` (engine config loads, `config.json` valid,
+   `compress.maxFoldersPerRun === 500`, key fields present);
+2. `engine` (`DEFAULT_CONFIG` default is 500; `planCompression` smoke test for the
+   folder cap and R2 title uniqueness);
+3. `memory store` (`index.json` ↔ disk reconciliation both ways, `meta.json`
+   schema including α/β/`scored`/keywords, unsafe ids, `images/index.json` files
+   exist, `stats.jsonl` lines valid JSON);
+4. `recall state` (v3 `recall-state.json` snapshots consistent; v2/v1 accepted
+   with an INFO note);
+5. `pending era` (v1.4.0 — same rules as `engine/era.js`): legacy/synthetic only
+   INFO (historical residue, never re-judged); **only the current bucket** is
+   judged: WARN when current pending > 5 % **and** > 20 folders, FAIL when
+   > 20 %; with fewer than 20 current folders it never FAILs (fresh store noise);
+6. `time index` (v1.4.0): the in-memory index is consistent with folder event
+   intervals (cross-checked against naive interval overlap), the timezone is
+   parseable, `constrain` filtering agrees with the naive overlap, and
+   `off`/`index` never filter;
+7. `recall fairness` (v1.4.0): aggregates v1.4.0 `recall` telemetry — lane
+   distribution, registerDrops, degraded, missType, guarantee summary
+   (meanPicks / highAlphaLaneShare); old telemetry without those fields is INFO,
+   degradation is WARN;
+8. `session logs` (zstd frames decoded and `surfaceOp` append/replace replayed to
+   the final surface: at most one dsh-rofm note per session — more is WARN —
+   legacy residue written before this release added the merge; `N` a positive
+   integer; appendices must not carry re-injected infrastructure; foreign
+   checkpoints counted but ignored);
+9. optionally `--with-tests` (`node --test` exits 0).
+
+Historical data shapes that older versions legitimately wrote are reported as
+**WARN, never FAIL**. Real-machine calibers (v1.4.0): with the two QQ plugins
+detected (onebot + derpyu, whitelist patched, valid `.compat-state.json`) the run
+is **10 passed, 1 warning, 0 failed** (11 check lines; the 3 extra compat lines
+are PASS); in a neutral profile it is **7 passed, 1 warning, 0 failed** (8 check
+lines). The two environments differ **only** in the compat lines — every
+non-compat check keeps the same name and status. Output: one
 `[PASS]/[WARN]/[FAIL] <check> — <detail>` line per check, final summary
 `selfcheck: X passed, Y warnings, Z failed`; `--json` emits one machine-readable
-object. The npm script `selfcheck` is the same command. It is covered by
-`test/selfcheck.test.mjs`.
+object with `platform: {os, arch, node}`. The npm script `selfcheck` is the same
+command. It is covered by `test/selfcheck.test.mjs`.
 
 ---
 
 ## 10. Tests (`node --test test/*.test.mjs`)
 
-Required coverage:
+### 10.0 v1.4.0 test matrix (plan §5.1)
+
+| layer | files | content |
+|---|---|---|
+| engine unit | `test/recall-index.test.mjs` | σ ordering, lane order/quotas, register TTL, recycle cooldown, priority trim + high-α pin, deterministic replay, pagination, `selectSigma` oracle, performance, serialization round-trip |
+| engine unit | `test/time-index.test.mjs` | granularity detection, day/month/year boundaries, time zones (DST/leap year), cross-day overlap, invalid/future/reversed input, min/max range, widening ladder, browse, old-data archive fallback, Plan A/B oracle, in-memory only, performance |
+| engine unit | `test/keyword-match.test.mjs` | bidirectional matching (no regression vs v1.3.0), phrase/title hits, opt-in `expandLatinCase`/`cjkBigram`, determinism |
+| engine unit | `test/turn-protection-engine.test.mjs` | protectSeq cut, no-legal-cut refusal, small-window/window-conflict refusal, hard-limit refusal, folder caps, event-time capture, plan field/`reason` coverage |
+| engine unit | `test/engine.test.mjs` / `test/recall.test.mjs` / `test/compress.test.mjs` / `test/stats.test.mjs` | v1.3.0 baseline + v1.4.0 additions (legacy regression, config schema, store optional fields round-trip, telemetry) |
+| property / fuzz | `test/recall-index.test.mjs` fuzz cases | random library + random queries + random arrivals: high-α first-round (rank ≤ k_H), low-α bounded, no duplicate injection, no starvation, determinism; `degraded`/`registerDrops` observability |
+| adapter | `test-adapter/recall-fairness.test.mjs`, `recall-deterministic.test.mjs`, `scoring-pressure.test.mjs`, `turn-protection.test.mjs` | fake host: fair recall path, recall-state v3 restore, block trim, multi-step turn protection, small window, task budget/backpressure/heuristic fallback, time tool wiring |
+| e2e | `test/e2e-adapter-simulate.test.mjs` | long session (≥700 turns) through real adapter path: pending → mock `memory_judge` → recall; 0 pending, retrieval hit, block budget, no self-destruction |
+| tools | `test/memory-audit.test.mjs`, `test/selfcheck.test.mjs`, `test/audit-tests-cli-tools.test.mjs` | era buckets, read-only guarantees, `--apply` only writes `pendingEra`, new selfcheck checks (era/time/fairness), report lines |
+| real data | `test/e2e-real-data-readonly.test.mjs` | read-only replication of 587 / 2180 / 2 / 0 and 74.0% / 0.54% against the local store; no file is modified |
+| config/version | `test/config-consistency.test.mjs` | `DEFAULT_CONFIG` == packaged `config.json` == documented values; `package.json` versions == 1.4.0; CHANGELOG section exists |
+
+**Case counts are intentionally not hardcoded here.** `v1.3.0` measured **493
+tests (491 pass + 2 skip, 0 fail)**; the v1.4.0 final counts (engine/adapter/tools
+split and pass/fail/skip) are recorded in `docs/VERIFICATION.md` §20 and printed
+by `npm test`. The gate is: **0 fail**; the 2 Windows symlink skips and the Node
+20 zstd skips stay skip. `node --test` (all files), `node test/simulate.mjs`,
+`node tools/selfcheck.mjs`, `node engine/cli.mjs --help`,
+`node tools/memory-audit.mjs --json` must all exit 0. `test/simulate.mjs` keeps
+running the legacy path (it must stay green as the v1.3.0 regression), while the
+real adapter semantics are covered by `test/e2e-adapter-simulate.test.mjs`
+(contract §11.14).
+
+Required coverage (v1.3.0 baseline, still enforced):
 
 1. `erf` accuracy; `p(1)=1`, `p(5)≈0.5502`, monotonic decrease, μ/σ configurable.
 2. keyword extraction: Chinese sentence repeating 部署/docker/端口 yields those
@@ -1570,15 +2617,51 @@ Required coverage:
     - R5: `test/selfcheck.test.mjs` covers `tools/selfcheck.mjs` (CLI flags,
       PASS/WARN/FAIL classification, exit codes, JSON summary).
 
+22. v1.4.0 coverage (contract §11):
+    - deterministic selector: σ ordering, lane order/quotas, register TTL,
+      recycle cooldown, priority block trim + high-α pin, 100× replay identity,
+      "no `Math.random` in the selector source / `Date.now` never influences
+      picks", pagination (`offset/limit` + `hasMore` via +1 lookahead),
+      `mode='deterministic'` equals `selectSigma` over the same exclusion set;
+    - fairness guarantees (fuzz/properties): rare-term high-α same-round 100 %,
+      low-α explicit reference same-round, rotation bounded by `ceil(L/r)` while
+      `a_low < r`, `degraded=true` when `a_low ≥ r`, register-capacity warning,
+      restart from a v3 snapshot continues the same pick sequence;
+    - time assistance: 30+ boundary cases (granularity, time zones incl. DST/leap
+      year, cross-day overlap, invalid/future/reversed input, min/max range,
+      fallback ladder, browse, old-data archive fallback, Plan A/B oracle),
+      in-memory only, performance budget (N=10⁴ build < 200 ms relaxed, 3-day
+      query < 50 ms relaxed);
+    - data eras: reproducible 587/2180/2/0 buckets and 74.0 % / 0.54 % calibers
+      (fixtures + read-only real store), `memory-audit --apply` writes only
+      `pendingEra`, selfcheck judges WARN/FAIL on the current bucket only;
+    - archive robustness: multi-step current-turn protection (0 questions
+      archived), no-legal-cut refusal, small/fake-window refusal, hard-limit
+      hard stop, commit rollback + journal cleanup + contentHash idempotency,
+      pass-0 current-turn additions protected;
+    - scoring pipeline: task-section token budget, pending backpressure,
+      heuristic fallback (`onPressure` + round thresholds), quality warnings,
+      judge telemetry, `maxItemsPerJudge`;
+    - compatibility: old index (no new fields) round-trip, old recall-state v2/v1
+      restore, old config without new keys, `recall.mode='legacy'` full green,
+      `time.mode='off'` no-op;
+    - CLI/tools: `engine/cli.mjs` new flags (`--time-from/--time-to/--granularity/
+      --offset/--limit/--mode`, `compress --allow-small-window`) and JSON output
+      fields, `tools/memory-audit.mjs` (read-only default, `--apply` scope),
+      `tools/time-view.mjs` read-only, `tools/recall-report.mjs` new lines;
+    - config consistency: `test/config-consistency.test.mjs` (engine defaults vs
+      packaged config vs documented values; both package versions = 1.4.0).
+
 As of the v1.2.1 revision the suites were **188/188 (engine)** and **115/115
-(adapter)**; the exact current counts are recorded in `docs/VERIFICATION.md` §19
-and printed by `npm test` — do not hardcode them here (they drift every release).
-Run `node --test test/*.test.mjs`,
+(adapter)**; v1.3.0 measured **493 (491 pass + 2 skip)**. The v1.4.0 final numbers
+are recorded in `docs/VERIFICATION.md` §20 and printed by `npm test` — do not
+hardcode them here (they drift every release). Run `node --test test/*.test.mjs`,
 `node --test test-adapter/*.test.mjs`, `node test/simulate.mjs`,
 `node tools/selfcheck.mjs`, `node engine/cli.mjs --help`,
-`node tools/recall-report.mjs --help` and `node tools/repair-session-log.mjs --help`
-before reporting back. Report: files, test output summary, any deviation from this
-spec, and a 10-line usage example.
+`node tools/memory-audit.mjs --json`, `node tools/recall-report.mjs --help`,
+`node tools/time-view.mjs --help` and
+`node tools/repair-session-log.mjs --help` before reporting back. Report: files,
+test output summary, any deviation from this spec, and a 10-line usage example.
 
 ## 11. Platform and path contract (v1.3.0)
 

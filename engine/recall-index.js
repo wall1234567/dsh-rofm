@@ -622,8 +622,13 @@ function scanCandidates(index, seeds, options = {}) {
 }
 
 /**
- * |C(Q)| — size of the union of the posting lists, optionally gated by
- * `minAlpha` / `timeIds`. Not on the per-turn hot path (tests/tools only).
+ * |C(Q)∩W| — deduplicated candidates matched by the seeds, after the query-time
+ * `minAlpha` gate and the optional `timeIds` window filter.
+ *
+ * The time window is part of the candidate definition for the rank bound
+ * (`rank` must be defined on C(Q)∩W, proof §3.6), so `timeIds` filters here
+ * instead of just at selection time. Not on the per-turn hot path
+ * (tests/tools/telemetry only).
  *
  * @param {object} index
  * @param {string[]} seeds
@@ -633,7 +638,7 @@ function scanCandidates(index, seeds, options = {}) {
 export function countCandidates(index, seeds, options = {}) {
   const safeIndex = normalizeIndex(index)
   const scan = scanCandidates(safeIndex, Array.isArray(seeds) ? seeds : [], options)
-  return scan.indices.length
+  return scan.windowIndices.length
 }
 
 // ---------------------------------------------------------------------------
@@ -714,10 +719,8 @@ function mergeSigma(index, seeds, context) {
   const generation = integerOr(context.generation, 1)
   const maxPops = integerOr(context.maxPops, MAX_MERGE_POPS)
   const target = Math.max(0, integerOr(context.k, 0))
-  if (target <= 0) {
-    context.hasMore = false
-    return
-  }
+  // k=0 still builds the merge so `wantHasMore` can answer "is there anything
+  // left to surface?" (pagination with limit=0 must not report hasMore=false).
   const lists = []
   const seenSeeds = new Set()
   for (const seed of Array.isArray(seeds) ? seeds : []) {
@@ -928,7 +931,7 @@ export function selectSigma(index, seeds, options = {}) {
   stats.seedCount = seedList.length
   const picked = []
   const seenIndices = new Set()
-  mergeSigma(safeIndex, seedList, {
+  const mergeContext = {
     k,
     exclude: excluded,
     sticky,
@@ -941,8 +944,9 @@ export function selectSigma(index, seeds, options = {}) {
     maxPops,
     wantHasMore: opts.wantHasMore !== false,
     stats,
-  })
-  let hasMore = stats.hasMore === true
+  }
+  mergeSigma(safeIndex, seedList, mergeContext)
+  let hasMore = mergeContext.hasMore === true
   // Optional deterministic hop expansion (cfg.recall.hops; H=0 by default).
   const hops = Math.max(0, integerOr(opts.hops, 0))
   const hopKeywordCap = Math.max(1, integerOr(opts.hopKeywordCap, 64))
@@ -959,7 +963,7 @@ export function selectSigma(index, seeds, options = {}) {
       const expansionSeeds = [...expansion].sort(idCompare).slice(0, hopKeywordCap)
       for (const keyword of expansionSeeds) seedSet.add(keyword)
       const hopPicked = []
-      mergeSigma(safeIndex, expansionSeeds, {
+      const hopContext = {
         k: k - picked.length,
         exclude: excluded,
         sticky,
@@ -972,11 +976,12 @@ export function selectSigma(index, seeds, options = {}) {
         maxPops,
         wantHasMore: false,
         stats,
-      })
+      }
+      mergeSigma(safeIndex, expansionSeeds, hopContext)
       for (const item of hopPicked) picked.push(item)
     }
-    if (picked.length >= k) hasMore = stats.hasMore === true
   }
+  stats.hasMore = hasMore
   return { picked, stats: { ...stats, hasMore } }
 }
 
@@ -1247,6 +1252,7 @@ export function deserializeLanes(raw) {
 function emptySelectStats(round, mode) {
   return {
     candidates: 0,
+    candidatesAll: 0,
     lanesPicked: { rareHigh: 0, queryBoost: 0, register: 0, hi: 0, lowProbe: 0, rotation: 0, recycle: 0 },
     pops: 0,
     frontierHits: 0,
@@ -1346,7 +1352,11 @@ export function selectRecall(index, userText, options = {}) {
     return { picks: [], stats, hasMore: stats.hasMore, lanes, warnings }
   }
   const scan = scanCandidates(safeIndex, seeds, { minAlpha, timeIds })
-  stats.candidates = scan.indices.length
+  // `candidates` is the rank domain |C(Q)∩W| (after the α/time pre-filters);
+  // `candidatesAll` additionally counts the candidates rejected by the time
+  // window (telemetry / missType='time' decisions).
+  stats.candidates = scan.windowIndices.length
+  stats.candidatesAll = scan.indices.length
   stats.filteredByAlpha = scan.filteredByAlpha
   stats.filteredByTime = scan.filteredByTime
   const windowIndices = scan.windowIndices
@@ -1380,7 +1390,10 @@ export function selectRecall(index, userText, options = {}) {
     stats.frontierHits = result.stats.frontierHits
     stats.duplicates = result.stats.duplicates
     stats.excludedSkips = result.stats.excludedSkips
-    stats.filteredByTime += result.stats.filteredByTime
+    // Merge-level time skips are a different counter (a popped entry can be
+    // reached from several posting lists); the telemetry `filteredByTime` is the
+    // deduplicated number of candidates outside the window.
+    stats.laneTimeSkips = result.stats.filteredByTime
     const picks = result.picked
       .map((item) => {
         const entry = entries[item.index]
@@ -1502,14 +1515,26 @@ export function selectRecall(index, userText, options = {}) {
   }
   lanes.pendingHigh = keptPending.map((record) => record.id)
   lanes.pendingHighRound = keptPending.map((record) => record.round)
+  // High-lane picks so far (lanes 1-3). Unused high quota flows to the rotation
+  // lane (spill) so a small k still fills every available slot.
+  const highLanePicks = picks.length
 
   // 4) σ high lane — remaining high α slots, σ k-way merge with lookahead.
+  //
+  // The lookahead is a *deferral buffer*, not a free-for-all: the register TTL
+  // (ttlRounds=2) means a deferred high-α memory must be injected within 2
+  // rounds, so the buffer is capped at one drain-round worth per TTL round
+  // (`ttlRounds * k_H`), and every round refills exactly the difference. With
+  // the default lookahead=3 this is 2·k_H ≤ 3·k_H entries, i.e. the whole
+  // lookahead window is used for "remaining slots + refill".
   const capFactor = effective.capFactor
   const registerCap = Math.max(1, capFactor * kHigh)
   const lookCount = Math.max(1, effective.lookahead * kHigh)
-  const remainingHigh = Math.max(0, kHigh - picks.length)
+  const bufferTarget = Math.min(lookCount, Math.max(1, effective.ttlRounds * kHigh))
+  const remainingHigh = Math.max(0, kHigh - highLanePicks)
   const pendingSize = lanes.pendingHigh.length
-  if (remainingHigh > 0 || pendingSize < lookCount) {
+  const popTarget = remainingHigh + Math.max(0, bufferTarget - pendingSize)
+  if (popTarget > 0) {
     const excludeHigh = new Set(excludedFromLanes)
     for (const id of pickedIds) excludeHigh.add(id)
     for (const id of lanes.pendingHigh) excludeHigh.add(id)
@@ -1517,20 +1542,29 @@ export function selectRecall(index, userText, options = {}) {
     for (const id of pickedIds) stickyHigh.add(id)
     for (const id of lanes.pendingHigh) stickyHigh.add(id)
     const lanePicked = []
+    // A separate stats object: merges are allowed to re-visit time-filtered
+    // entries on every round, while telemetry.filteredByTime is the deduplicated
+    // candidate count computed by scanCandidates.
+    const mergeStats = { pops: 0, frontierHits: 0, duplicates: 0, excludedSkips: 0, filteredByTime: 0, lists: 0 }
     mergeSigma(safeIndex, seeds, {
-      k: lookCount,
+      k: popTarget,
       exclude: excludeHigh,
       sticky: stickyHigh,
       minAlpha: Math.max(minAlpha, thetaHigh),
       timeIds,
       frontier: lanes.frontier,
       picked: lanePicked,
-      seenIndices: pickedIndices,
+      seenIndices: new Set(),
       generation: 1,
-      maxPops: Math.max(1024, lookCount * 16),
+      maxPops: Math.max(1024, popTarget * 16),
       wantHasMore: false,
-      stats,
+      stats: mergeStats,
     })
+    stats.pops += mergeStats.pops
+    stats.frontierHits += mergeStats.frontierHits
+    stats.duplicates += mergeStats.duplicates
+    stats.excludedSkips += mergeStats.excludedSkips
+    stats.laneTimeSkips = (stats.laneTimeSkips || 0) + mergeStats.filteredByTime
     let slots = remainingHigh
     const deferred = []
     for (const item of lanePicked) {
@@ -1574,7 +1608,9 @@ export function selectRecall(index, userText, options = {}) {
 
   // 6) rotation — deterministic low α round-robin over the global explore order.
   const lowProbePicked = stats.lanesPicked.lowProbe
-  const spill = Math.max(0, kHigh - picks.length)
+  // Unused high-lane quota flows into rotation; the low probe consumes one of
+  // the rotation slots (`r`), so rotation can still fill all remaining slots.
+  const spill = Math.max(0, kHigh - highLanePicks)
   const rotationSlots = Math.min(
     Math.max(0, k - picks.length),
     Math.max(1, r - lowProbePicked + spill),
@@ -1661,7 +1697,6 @@ export function selectRecall(index, userText, options = {}) {
       }
     }
     lanes.recycle = kept
-    capPool(lanes.recycle, Math.max(16, k * 4))
   }
   stats.recycleDropped = capPool(lanes.recycle, Math.max(16, k * 4))
 
@@ -1680,25 +1715,50 @@ export function selectRecall(index, userText, options = {}) {
       const expansionSeeds = [...expansion].sort(idCompare).slice(0, hopKeywordCap)
       for (const keyword of expansionSeeds) seedSet.add(keyword)
       const hopPicked = []
+      const hopStats = { pops: 0, frontierHits: 0, duplicates: 0, excludedSkips: 0, filteredByTime: 0, lists: 0 }
+      const hopExclude = new Set(excludedFromLanes)
+      for (const id of pickedIds) hopExclude.add(id)
       mergeSigma(safeIndex, expansionSeeds, {
         k: k - picks.length,
-        exclude: excludedFromLanes,
+        exclude: hopExclude,
         sticky: new Set(ledger),
         minAlpha,
         timeIds,
         frontier: lanes.frontier,
         picked: hopPicked,
-        seenIndices: pickedIndices,
+        seenIndices: new Set(),
         generation: hop + 1,
         maxPops: 4096,
         wantHasMore: false,
-        stats,
+        stats: hopStats,
       })
-      for (const item of hopPicked) {
-        const entry = entries[item.index]
-        if (entry && pushPick(item.index, 'hi', 0, item.generation)) stats.lanesPicked.hi += 0
-      }
+      stats.pops += hopStats.pops
+      stats.frontierHits += hopStats.frontierHits
+      stats.duplicates += hopStats.duplicates
+      stats.excludedSkips += hopStats.excludedSkips
+      stats.laneTimeSkips = (stats.laneTimeSkips || 0) + hopStats.filteredByTime
+      for (const item of hopPicked) pushPick(item.index, 'hi', 0, item.generation)
     }
+  }
+
+  // A lane can surface an id that is still queued in a deferral/recycle pool
+  // (e.g. rotation picks a deferred candidate). Prune those so the next round
+  // cannot inject the exact same id twice.
+  if (pickedIds.size > 0) {
+    const keptIds = []
+    const keptRounds = []
+    for (let at = 0; at < lanes.pendingHigh.length; at += 1) {
+      const id = lanes.pendingHigh[at]
+      if (pickedIds.has(id)) continue
+      keptIds.push(id)
+      keptRounds.push(lanes.pendingHighRound[at])
+    }
+    lanes.pendingHigh = keptIds
+    lanes.pendingHighRound = keptRounds
+    lanes.highRecycle = lanes.highRecycle.filter((item) => !pickedIds.has(item.id))
+    lanes.recycle = lanes.recycle.filter((item) => !pickedIds.has(item.id))
+    stats.highRecycleDropped = capPool(lanes.highRecycle, Math.max(16, k * 4))
+    stats.recycleDropped += capPool(lanes.recycle, Math.max(16, k * 4))
   }
 
   // hasMore: one more candidate under the same conditions that is not surfaced.

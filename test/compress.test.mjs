@@ -21,6 +21,9 @@ import {
   readStats,
   renderMessage,
 } from '../engine/index.js'
+// 1.4.0 pure helper; exported from engine/index.js once the Lead wires the new
+// API surface, imported from the module directly here so this file stays green.
+import { eventTimeRangeOf } from '../engine/compress.js'
 
 const tempDirs = []
 function tempDir() {
@@ -52,6 +55,11 @@ function makeCfg(patch = {}) {
       targetChunkChars: 200,
       maxFoldersPerRun: 100,
       keepRecentMessages: 2,
+      // The fixtures below use tiny synthetic windows (1k-10k tokens) to keep the
+      // token arithmetic readable. 1.4.0 refuses small windows by default (P1-6),
+      // so every legacy fixture opts in explicitly; the default-refusal path is
+      // covered by dedicated tests further down.
+      allowSmallWindow: true,
     },
   }
   return loadConfig(undefined, {
@@ -394,7 +402,7 @@ test('compress: one oversized user turn is split into multiple folders', () => {
   messages.push({ role: 'user', content: 'u2', tokens: 100 })
   for (let index = 0; index < 5; index += 1) messages.push({ role: 'assistant', content: big, tokens: 100 })
   const cfg = makeCfg({ compress: { compressPercent: 80, targetChunkChars: 250, minChunkChars: 50, maxFoldersPerRun: 100 } })
-  const plan = planCompression({ messages, usedPercent: 80, cfg, totalUsedTokens: 2600, windowTokens: 5000 })
+  const plan = planCompression({ messages, usedPercent: 80, cfg, totalUsedTokens: 2600, windowTokens: 20000 })
   assert.equal(plan.shouldCompress, true)
   assert.ok(plan.folders.length >= 2, `single huge turn produced ${plan.folders.length} folder(s)`)
   const maxChars = Math.max(...plan.folders.map((folder) => folder.meta.stats.chars))
@@ -782,4 +790,113 @@ test('compress: parseArchiveNote returns null for foreign checkpoints and non-no
   for (const value of [null, undefined, 123, {}, ['[memory] 1 段更早的对话已归档到 memory/。需要时会自动回忆。']]) {
     assert.equal(parseArchiveNote(value), null)
   }
+})
+
+// ---------------------------------------------------------------------------
+// v1.4.0 regressions — small-window sanity, folder caps, event time, and the
+// fake-window "remove Infinity tokens" degradation warning (P1-6, plan §3.5)
+// ---------------------------------------------------------------------------
+
+test('compress: small windows are refused unless allowSmallWindow is on (P1-6)', () => {
+  const messages = makeMessages(16)
+  const cfg = makeCfg({ compress: { allowSmallWindow: false } })
+
+  const refused = planCompression({ messages, usedPercent: 80, cfg, totalUsedTokens: 1600, windowTokens: 8000 })
+  assert.equal(refused.shouldCompress, false)
+  assert.equal(refused.reason, 'small-window')
+  assert.equal(refused.smallWindow, true)
+  assert.deepEqual(refused.folders, [])
+  assert.ok(refused.warnings.some((warning) => /smallWindowTokens/.test(warning)), 'the small-window refusal is explained')
+
+  // The explicit opt-in is the documented escape hatch.
+  const allowed = planCompression({ messages, usedPercent: 80, cfg, totalUsedTokens: 1600, windowTokens: 8000, allowSmallWindow: true })
+  assert.equal(allowed.shouldCompress, true)
+
+  // Boundary: exactly smallWindowTokens (20000) is not "small".
+  const boundary = planCompression({ messages, usedPercent: 80, cfg, totalUsedTokens: 1600, windowTokens: 20000 })
+  assert.equal(boundary.shouldCompress, true)
+  assert.equal(planCompression({ messages, usedPercent: 80, cfg, totalUsedTokens: 1600, windowTokens: 19999 }).reason, 'small-window')
+})
+
+test('compress: a host window contradicting compress.contextWindowTokens is refused (window sanity)', () => {
+  const messages = makeMessages(16)
+  const cfg = makeCfg({ compress: { contextWindowTokens: 400000, allowSmallWindow: false } })
+  const conflict = planCompression({ messages, usedPercent: 80, cfg, totalUsedTokens: 1600, windowTokens: 8000 })
+  assert.equal(conflict.shouldCompress, false)
+  assert.equal(conflict.reason, 'window-conflict')
+  assert.equal(conflict.windowConflict, true)
+  assert.ok(conflict.warnings.some((warning) => /contextWindowTokens/.test(warning)))
+})
+
+test('compress: maxFoldersPerStep caps one archive step (and the caller maxFolders wins when smaller)', () => {
+  const cfg = makeCfg({
+    compress: { compressPercent: 90, targetChunkChars: 50, minChunkChars: 1, maxFoldersPerRun: 100, maxFoldersPerStep: 3, keepRecentMessages: 0, minMessagesToCompress: 2 },
+  })
+  const messages = []
+  for (let index = 0; index < 12; index += 1) messages.push({ role: 'user', content: `消息 ${index} ${'q'.repeat(80)}`, tokens: 100 })
+  const plan = planCompression({ messages, usedPercent: 95, cfg, totalUsedTokens: 1200 })
+  assert.equal(plan.shouldCompress, true)
+  assert.equal(plan.maxFolders, 3)
+  assert.equal(plan.maxFoldersCapped, true)
+  assert.ok(plan.folders.length <= 3, `got ${plan.folders.length} folders`)
+  assert.ok(plan.warnings.some((warning) => /folder count capped/.test(warning)))
+
+  // The adapter's per-run cap is part of the same min().
+  const tighter = planCompression({ messages, usedPercent: 95, cfg, totalUsedTokens: 1200, maxFolders: 2 })
+  assert.equal(tighter.maxFolders, 2)
+  assert.ok(tighter.folders.length <= 2)
+
+  // maxFoldersPerRun still wins when it is the smallest limit.
+  const perRunCfg = makeCfg({
+    compress: { compressPercent: 90, targetChunkChars: 50, minChunkChars: 1, maxFoldersPerRun: 2, maxFoldersPerStep: 500, keepRecentMessages: 0, minMessagesToCompress: 2 },
+  })
+  assert.equal(planCompression({ messages, usedPercent: 95, cfg: perRunCfg, totalUsedTokens: 1200 }).maxFolders, 2)
+})
+
+test('compress: an unreachable boundary never produces an Infinity token warning (P1-6 regression)', () => {
+  // The tail is all assistant messages, so no user boundary exists at/after the
+  // raw cut. v1.3.0 computed tokensUpTo(-1) = Infinity and emitted
+  // "next user boundary would remove Infinity tokens" (a46 telemetry).
+  const messages = [
+    { role: 'assistant', content: 'a0', tokens: 100 },
+    { role: 'user', content: 'u1', tokens: 100 },
+    ...Array.from({ length: 14 }, (_value, index) => ({ role: 'assistant', content: `a${index + 1}`, tokens: 100 })),
+  ]
+  const cfg = makeCfg({ compress: { compressPercent: 80, keepRecentMessages: 2 } })
+  const plan = planCompression({ messages, usedPercent: 90, cfg, totalUsedTokens: 1600 })
+  assert.equal(plan.shouldCompress, true)
+  assert.equal(plan.keep[0].role, 'user')
+  const overflowWarning = plan.warnings.find((warning) => /next user boundary would remove/.test(warning))
+  assert.ok(overflowWarning, `expected the overshoot warning, got ${JSON.stringify(plan.warnings)}`)
+  assert.ok(!/Infinity/.test(overflowWarning), overflowWarning)
+  assert.match(overflowWarning, /would remove \d+ tokens/)
+})
+
+test('compress: eventStart/eventEnd/eventTimeSource are collected from message times', () => {
+  const cfg = makeCfg()
+  const start = 1700000000000
+  const messages = makeMessages(16).map((message, index) => ({ ...message, time: start + index * 60_000 }))
+  const plan = planCompression({ messages, usedPercent: 90, cfg, totalUsedTokens: 1600, now: 1700000500000 })
+  assert.ok(plan.folders.length > 0)
+  for (const folder of plan.folders) {
+    assert.equal(folder.meta.eventTimeSource, 'messages')
+    const source = folder.meta.source
+    const times = messages.slice(source.seqStart, source.seqEnd + 1).map((message) => message.time)
+    assert.equal(folder.meta.eventStart, Math.min(...times))
+    assert.equal(folder.meta.eventEnd, Math.max(...times) + 1, 'the interval is half-open: max + 1')
+  }
+  assert.deepEqual(plan.eventTimeSourceCounts, { messages: plan.folders.length })
+
+  // Old folders keep the old shape: no event fields when no message carries a time.
+  const legacyPlan = planCompression({ messages: makeMessages(16), usedPercent: 90, cfg, totalUsedTokens: 1600 })
+  for (const folder of legacyPlan.folders) {
+    assert.equal('eventStart' in folder.meta, false)
+    assert.equal('eventEnd' in folder.meta, false)
+    assert.equal('eventTimeSource' in folder.meta, false)
+  }
+  assert.equal(legacyPlan.eventTime, null)
+
+  // Pure helper: unordered, half-open, and null without times.
+  assert.deepEqual(eventTimeRangeOf([{ time: 30 }, { time: 10 }]), { start: 10, end: 31, source: 'messages' })
+  assert.equal(eventTimeRangeOf([{ role: 'user', content: 'no time' }]), null)
 })

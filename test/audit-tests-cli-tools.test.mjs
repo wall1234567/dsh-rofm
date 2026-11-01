@@ -194,6 +194,54 @@ test('report tool: no β telemetry prints the documented n/a line (SPEC §9)', (
   assert.match(runResult.stdout, /beta \(trust\)\s+: n\/a \(no recall telemetry with β yet\)/)
 })
 
+test('report tool: --json exposes the v1.4.0 laneStats/timeStats and pendingEra buckets (SPEC §9)', () => {
+  const dir = tempDir()
+  seedReportFixture(dir)
+  // Pending-era stats read index.json (not telemetry): one legacy pending folder
+  // and one current scored folder in a single-store layout.
+  const cutoff = Date.parse('2026-10-27T19:14:00Z')
+  fs.writeFileSync(
+    path.join(dir, 'index.json'),
+    JSON.stringify({
+      version: 1,
+      updatedAt: cutoff,
+      nextCounter: 3,
+      folders: [
+        { id: 'mem-20261025T014017Z-0001', createdAt: cutoff - 1000, alpha: 0, beta: 0, scored: false, rescorePending: false, keywords: [], chars: 1, tokens: 1, messageCount: 1, title: 'legacy' },
+        { id: 'mem-20261026T131909Z-0001', createdAt: cutoff + 1000, alpha: 0.6, beta: 1, scored: true, rescorePending: false, keywords: ['a', 'b', 'c'], chars: 1, tokens: 1, messageCount: 1, title: 'current' },
+      ],
+    }),
+    'utf8',
+  )
+  const runResult = run(REPORT, ['--dir', dir, '--json'])
+  assert.equal(runResult.status, 0, runResult.stderr)
+  const parsed = JSON.parse(runResult.stdout)
+
+  // No v1.4.0 telemetry in this fixture: the lane/time aggregates are present
+  // and empty (degraded, never an error).
+  assert.equal(parsed.laneStats.events, 0)
+  assert.equal(parsed.laneStats.picks, 0)
+  assert.equal(parsed.timeStats.events, 0)
+  assert.deepEqual(parsed.timeStats.missTypes, {})
+
+  // Pending era uses the shared engine/era.js buckets: the legacy folder is
+  // pre-1.2.0 and the other one is current, so current pending = 0.
+  assert.equal(parsed.pendingEras.totals.folders, 2)
+  assert.equal(parsed.pendingEras.totals.pending, 1)
+  assert.equal(parsed.pendingEras.buckets.legacy.folders, 1)
+  assert.equal(parsed.pendingEras.buckets.legacy.pending, 1)
+  assert.equal(parsed.pendingEras.buckets.current.folders, 1)
+  assert.equal(parsed.pendingEras.buckets.current.pending, 0)
+  assert.equal(parsed.pendingEras.calibers.C.pending, 0)
+  assert.equal(parsed.pendingEras.calibers.C.folders, 1)
+
+  const text = run(REPORT, ['--dir', dir])
+  assert.equal(text.status, 0, text.stderr)
+  assert.match(text.stdout, /pending era\s+: legacy 1 folders \/ 1 pending/)
+  assert.match(text.stdout, /lanes \(v1\.4\.0\)\s+: n\/a/)
+  assert.match(text.stdout, /time filter\s+: n\/a/)
+})
+
 // ---------------------------------------------------------------------------
 // tools/show-recall.mjs: SPEC §9 "inspection counterpart" — previously 0 tests.
 // ---------------------------------------------------------------------------

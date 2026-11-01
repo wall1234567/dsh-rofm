@@ -329,6 +329,9 @@ function overridesFor(memoryDir, patch = {}) {
       triggerPercent: 1,
       compressPercent: 20,
       contextWindowTokens: 1000,
+      // 1.4.0 small-window sanity: the 1000-token fake window is explicit here.
+      allowSmallWindow: true,
+      smallWindowTokens: 20000,
       minContextTokens: 0,
       minMessagesToCompress: 4,
       minChunkChars: 50,

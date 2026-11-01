@@ -1,21 +1,31 @@
 /**
  * Adapter-level tests for the model-triggered `memory_recall` tool.
  *
- * These tests never boot a harness or touch the disk: a fake plugin, fake
- * session, fake engine and fixtures stand in for the DSH side, so the tool's
- * pure seams (definition contract, engine call, render, consecutive-miss state
- * machine, image pass-through, validation) are pinned exactly.
+ * These tests never boot a harness or hit the real memory dir: a fake plugin,
+ * fake session, fake engine and fixtures stand in for the DSH side, so the
+ * tool's pure seams (definition contract, engine call, render, consecutive-miss
+ * state machine, v1.4.0 pagination/time/browse semantics, image pass-through,
+ * validation) are pinned exactly.
  */
 
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import { mkdtempSync, rmSync } from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
 
-import { MemoryRecallTool, MISS_DISABLE_AT, MISS_WARN_AT } from '../lib/recall-tool.js'
+import { MemoryEngine, emptyLanes, writeFolder } from '../engine/index.js'
+import {
+  DISABLED_HINT,
+  MAX_RECALL_OFFSET,
+  MemoryRecallTool,
+  MISS_DISABLE_AT,
+  MISS_WARNING,
+  MISS_WARN_AT,
+  normalizeRecallOffset,
+} from '../lib/recall-tool.js'
 
 const SESSION = { id: 'session-recall' }
-
-const MISS_WARNING = '可能关键词没有选对或目标回忆 α 值太低。建议停止继续尝试，或改用更具体的关键词再试一次。'
-const DISABLED_HINT = '目标回忆 α 值过低或运气不行，如有需要下一轮对话再尝试。'
 
 const exec = (session = SESSION) => ({ agent: { session } })
 
@@ -42,16 +52,17 @@ function makeStats(overrides = {}) {
   }
 }
 
-function successResult(additions, statsOverrides = {}) {
+function successResult(additions, statsOverrides = {}, extra = {}) {
   return {
     additions,
     stats: makeStats({ matchedFolders: additions.length, attempts: additions.length, addedFolders: additions.length, ...statsOverrides }),
     warnings: [],
+    ...extra,
   }
 }
 
-function missResult({ matchedFolders = 0, attempts = 0 } = {}) {
-  return { additions: [], stats: makeStats({ matchedFolders, attempts }), warnings: [] }
+function missResult({ matchedFolders = 0, attempts = 0 } = {}, extra = {}) {
+  return { additions: [], stats: makeStats({ matchedFolders, attempts }), warnings: [], ...extra }
 }
 
 function makeAddition({ meta: metaOverrides, ...overrides } = {}) {
@@ -95,10 +106,20 @@ function makeEngine(...results) {
 /**
  * Fake plugin exposing exactly the methods the tool is allowed to use.
  * `images` is either a Map (returned by every resolve call) or a function.
+ * `lanes`/`round`/`laneHooks` cover the v1.4.0 fair-path plugin hooks.
  */
-function makePlugin({ engine = makeEngine(), cfg = makeConfig(), enabled = true, images = null, sessionState = undefined } = {}) {
+function makePlugin({
+  engine = makeEngine(),
+  cfg = makeConfig(),
+  enabled = true,
+  images = null,
+  sessionState = undefined,
+  lanes = undefined,
+  round = undefined,
+  laneHooks = undefined,
+} = {}) {
   const plugin = {
-    calls: { currentConfig: 0, toolsSessionEnabled: 0, engineFor: 0, scopedConfig: 0, resolveImages: [] },
+    calls: { currentConfig: 0, toolsSessionEnabled: 0, engineFor: 0, scopedConfig: 0, resolveImages: [], commits: [] },
     currentConfig() {
       plugin.calls.currentConfig += 1
       return cfg
@@ -120,6 +141,13 @@ function makePlugin({ engine = makeEngine(), cfg = makeConfig(), enabled = true,
     },
   }
   if (sessionState !== undefined) plugin.sessionState = () => sessionState
+  if (laneHooks !== false && (lanes !== undefined || round !== undefined)) {
+    if (lanes !== undefined) plugin.getRecallLanes = () => lanes
+    if (round !== undefined) plugin.nextRecallRound = () => round
+    plugin.commitRecallLanes = (session, config, nextLanes) => {
+      plugin.calls.commits.push({ session, config, lanes: nextLanes })
+    }
+  }
   if (images !== null) {
     // v1.2.x: the tool asks the plugin for *file paths*, never for attachments.
     plugin.imageEntriesForAdditions = (config, additions) => {
@@ -148,7 +176,7 @@ function assertLosslessJson(value) {
 // Definition contract
 // ---------------------------------------------------------------------------
 
-test('definition exposes the memory_recall contract', () => {
+test('definition exposes the memory_recall contract (v1.4.0 schema)', () => {
   const tool = new MemoryRecallTool(makePlugin({ engine: makeEngine() }))
   const definition = tool.definition()
 
@@ -159,24 +187,49 @@ test('definition exposes the memory_recall contract', () => {
   assert.ok(definition.description.includes('β'), 'description mentions β')
   assert.ok(definition.description.includes('停用'), 'description mentions the disable escalation')
   assert.ok(definition.description.includes('关键词'), 'description mentions keywords')
+  // v1.4.0 time assistance + pagination are part of the model-facing contract.
+  for (const phrase of ['timeFrom', 'timeTo', 'granularity', '最小连续 3 天', 'offset', '纯时间浏览', '分页', '询问']) {
+    assert.ok(definition.description.includes(phrase), `description must mention ${phrase}`)
+  }
 
   assert.equal(definition.parameters.type, 'object')
-  assert.deepEqual(definition.parameters.required, ['keywords'])
-  assert.deepEqual(Object.keys(definition.parameters.properties).sort(), ['keywords', 'limit'])
-  assert.equal(definition.parameters.properties.keywords.type, 'string')
-  assert.equal(definition.parameters.properties.limit.type, 'integer')
-  assert.ok(definition.parameters.properties.limit.description.includes('1~8'))
+  // v1.4.0: keywords is optional when a time window is given (browse mode).
+  assert.deepEqual(definition.parameters.required, [])
+  const properties = definition.parameters.properties
+  assert.deepEqual(Object.keys(properties).sort(), ['granularity', 'keywords', 'limit', 'offset', 'timeFrom', 'timeTo'])
+  assert.equal(properties.keywords.type, 'string')
+  assert.ok(properties.keywords.description.includes('可省略'), 'keywords is documented as optional with a time window')
+  assert.equal(properties.limit.type, 'integer')
+  assert.ok(properties.limit.description.includes('1~8'))
+  assert.equal(properties.offset.type, 'integer')
+  assert.ok(properties.offset.description.includes('10000'), 'offset documents its cap')
+  assert.equal(properties.timeFrom.type, 'string')
+  assert.ok(properties.timeFrom.description.includes('最小连续 3 天'))
+  assert.equal(properties.timeTo.type, 'string')
+  assert.equal(properties.granularity.type, 'string')
+  for (const name of ['day', 'month', 'year']) assert.ok(properties.granularity.description.includes(name))
 
-  // The output schema is exactly the documented value shape.
+  // The output schema documents the v1.4.0 value shape (pagination + time).
   assert.equal(definition.output.schema.type, 'object')
   assert.deepEqual(Object.keys(definition.output.schema.properties).sort(), [
     'added',
     'attempted',
+    'degraded',
     'found',
+    'hasMore',
     'images',
+    'limit',
     'matchedFolders',
+    'missType',
+    'misses',
+    'mode',
+    'nextOffset',
+    'offset',
     'stopHint',
+    'timeWindow',
+    'warnings',
   ])
+  assert.equal(definition.output.schema.required, undefined, 'no output field is claimed as required')
   assert.equal(definition.output.schema.properties.images.items.properties.name.type, 'string')
   assert.equal(definition.output.schema.properties.images.items.properties.path.type, 'string')
   assert.equal(definition.output.schema.properties.images.items.properties.exists.type, 'boolean')
@@ -343,19 +396,30 @@ test('a miss with no keyword match hints at keywords and counts as miss 1', asyn
   assert.ok(text.includes('专有名词/技术名'), text)
 })
 
-test('a miss with keyword matches hints at the α probability instead of the keywords', async () => {
-  const engine = makeEngine(missResult({ matchedFolders: 2, attempts: 2 }))
-  const tool = new MemoryRecallTool(makePlugin({ engine }))
+test('a fair-mode miss with keyword matches is not a strike and hints at paging/time instead of α luck', async () => {
+  const cfg = makeConfig({ recall: { enabled: true, mode: 'fair' } })
+  const fairTool = new MemoryRecallTool(makePlugin({ engine: makeEngine(missResult({ matchedFolders: 2, attempts: 2 })), cfg }))
 
-  const value = await tool.execute({ keywords: 'docker' }, exec())
+  const value = await fairTool.execute({ keywords: 'docker' }, exec())
   assert.equal(value.matchedFolders, 2)
   assert.equal(value.attempted, 2)
-  assert.equal(value.misses, 1, 'a fresh tool starts a fresh strike run')
+  // fair/deterministic: only a true miss (no keyword candidates) counts.
+  assert.equal(value.misses, undefined, 'matched-but-excluded is not a strike in fair mode')
   assert.equal(value.stopHint, undefined)
 
-  const text = textOf(render(tool, { keywords: 'docker' }, value))
+  const text = textOf(render(fairTool, { keywords: 'docker' }, value))
   assert.ok(text.includes('匹配到 2 条记忆'), text)
-  assert.ok(text.includes('α 概率判定均未被回忆出来'), text)
+  assert.ok(text.includes('offset 翻页'), 'fair hint points at pagination')
+  assert.ok(!text.includes('α 概率判定均未被回忆出来'), 'the legacy α-probability wording is gone in fair mode')
+  assert.ok(text.includes('询问'), 'the hint may ask the user for a time range')
+
+  // legacy keeps the v1.3.0 wording and the old strike accounting.
+  const legacyCfg = makeConfig({ recall: { enabled: true, mode: 'legacy' } })
+  const legacyTool = new MemoryRecallTool(makePlugin({ engine: makeEngine(missResult({ matchedFolders: 2, attempts: 2 })), cfg: legacyCfg }))
+  const legacyValue = await legacyTool.execute({ keywords: 'docker' }, exec())
+  assert.equal(legacyValue.misses, 1, 'legacy still counts every empty result as a miss')
+  const legacyText = textOf(render(legacyTool, { keywords: 'docker' }, legacyValue))
+  assert.ok(legacyText.includes('α 概率判定均未被回忆出来'), legacyText)
 })
 
 test('matched folders that are already in the recall block are not re-injected or re-rolled', async () => {
@@ -457,13 +521,19 @@ test('resetAttempts tolerates missing/unknown sessions', () => {
 // Validation, limits, exclusions and unavailable dependencies
 // ---------------------------------------------------------------------------
 
-test('empty or non-string keywords are rejected', async () => {
+test('empty or non-string keywords are rejected; a completely empty query is rejected with a hint', async () => {
   const tool = new MemoryRecallTool(makePlugin({ engine: makeEngine() }))
-  for (const keywords of [undefined, null, '', '   ', 42, [], {}]) {
+  // A supplied but broken keyword value is still an argument error.
+  for (const keywords of ['', '   ', 42, [], {}]) {
     await assert.rejects(tool.execute({ keywords }, exec()), {
       message: 'keywords must be a non-empty string',
     })
-    await assert.rejects(tool.execute({}, exec()), { message: 'keywords must be a non-empty string' })
+  }
+  // v1.4.0: keywords may be omitted only when a time window is supplied.
+  for (const args of [{}, { keywords: undefined }, { keywords: null }]) {
+    await assert.rejects(tool.execute(args, exec()), {
+      message: 'memory_recall 需要 keywords（关键词），或 timeFrom/timeTo/granularity 时间参数（纯时间浏览）',
+    })
   }
 })
 
@@ -539,4 +609,570 @@ test('malformed engine results degrade to a miss instead of throwing', async () 
   assert.equal(value.attempted, 0)
   assert.equal(value.misses, 1)
   assertLosslessJson(value)
+})
+
+// ---------------------------------------------------------------------------
+// v1.4.0 pagination (offset / limit / hasMore)
+// ---------------------------------------------------------------------------
+
+test('offset is clamped to 0..10000 and never throws', () => {
+  assert.equal(MAX_RECALL_OFFSET, 10000)
+  assert.equal(normalizeRecallOffset(undefined), 0)
+  assert.equal(normalizeRecallOffset(null), 0)
+  assert.equal(normalizeRecallOffset(''), 0)
+  assert.equal(normalizeRecallOffset('abc'), 0)
+  assert.equal(normalizeRecallOffset(-3), 0)
+  assert.equal(normalizeRecallOffset('4.9'), 4)
+  assert.equal(normalizeRecallOffset(MAX_RECALL_OFFSET + 1), MAX_RECALL_OFFSET)
+})
+
+test('pagination passes offset/limit to the engine and renders a next-page hint', async () => {
+  const page = [makeAddition({ meta: { id: 'mem-page-1' } }), makeAddition({ meta: { id: 'mem-page-2' } })]
+  const engine = makeEngine(successResult(page, {}, { page: { offset: 2, limit: 2, hasMore: true } }))
+  const tool = new MemoryRecallTool(makePlugin({ engine }))
+
+  const value = await tool.execute({ keywords: 'docker', offset: 2, limit: 2 }, exec())
+  assert.equal(engine.calls[0].options.offset, 2)
+  assert.equal(engine.calls[0].options.limit, 2)
+  assert.equal(value.offset, 2)
+  assert.equal(value.limit, 2)
+  assert.equal(value.hasMore, true)
+  assert.equal(value.nextOffset, 4)
+  assertLosslessJson(value)
+
+  const text = textOf(render(tool, { keywords: 'docker' }, value))
+  assert.ok(text.includes('本页：第 3 ～ 4 条'), text)
+  assert.ok(text.includes('还有更多'), text)
+  assert.ok(text.includes('offset=4'), text)
+})
+
+test('the first page without more results renders no pagination chrome', async () => {
+  const engine = makeEngine(successResult([makeAddition()]))
+  const tool = new MemoryRecallTool(makePlugin({ engine }))
+  const value = await tool.execute({ keywords: 'docker' }, exec())
+  assert.equal(value.offset, 0)
+  assert.equal(value.hasMore, false)
+  const text = textOf(render(tool, { keywords: 'docker' }, value))
+  assert.ok(!text.includes('还有更多'), text)
+  assert.ok(!text.includes('本页：'), text)
+})
+
+// ---------------------------------------------------------------------------
+// v1.4.0 time assistance (timeFrom / timeTo / granularity, browse mode)
+// ---------------------------------------------------------------------------
+
+test('time arguments are passed through untouched and the widened window is rendered', async () => {
+  const window = {
+    from: Date.UTC(2026, 9, 30),
+    to: Date.UTC(2026, 10, 2),
+    level: 'day',
+    widenedTo: 'day3',
+    timezone: 'UTC',
+    requested: { from: Date.UTC(2026, 9, 31), to: Date.UTC(2026, 10, 1) },
+  }
+  const engine = makeEngine(successResult([makeAddition()], {}, { timeWindow: window }))
+  const tool = new MemoryRecallTool(makePlugin({ engine }))
+
+  const value = await tool.execute(
+    { keywords: 'docker', timeFrom: '2026-10-31', timeTo: '2026-11-01', granularity: 'day' },
+    exec(),
+  )
+  // Invalid/mis-typed values are the engine normalizer's job: pass them through.
+  assert.equal(engine.calls[0].options.timeFrom, '2026-10-31')
+  assert.equal(engine.calls[0].options.timeTo, '2026-11-01')
+  assert.equal(engine.calls[0].options.granularity, 'day')
+  assert.deepEqual(value.timeWindow, window)
+  assertLosslessJson(value)
+
+  const text = textOf(render(tool, { keywords: 'docker' }, value))
+  assert.ok(text.includes('时间范围：2026-10-30 ~ 2026-11-01'), text)
+  assert.ok(text.includes('已放宽到 ±1 天'), text)
+  assert.ok(text.includes('原查询：2026-10-31'), text)
+})
+
+test('time-only browse: no keywords, empty userText, chronological event order, mode=browse', async () => {
+  // The engine may return any order; browse mode must sort by eventStart asc.
+  const late = makeAddition({ meta: { id: 'mem-late', eventStart: 3000, createdAt: 1000 } })
+  const early = makeAddition({ meta: { id: 'mem-early', eventStart: 2000, createdAt: 2500 } })
+  const engine = makeEngine(
+    successResult([late, early], {}, { mode: 'fair', timeWindow: { from: 1000, to: 4000, level: 'day', timezone: 'UTC' } }),
+  )
+  const tool = new MemoryRecallTool(makePlugin({ engine }))
+
+  const value = await tool.execute({ timeFrom: '2026-10-31' }, exec())
+  assert.equal(engine.calls[0].userText, '', 'browse sends no keyword text to the engine')
+  assert.equal(engine.calls[0].options.timeFrom, '2026-10-31')
+  assert.equal(value.mode, 'browse')
+  assert.deepEqual(value.added, ['mem-early', 'mem-late'], 'browse is chronological by eventStart')
+  assert.deepEqual(value.entries.map((entry) => entry.eventStart), [2000, 3000])
+  assertLosslessJson(value)
+
+  const text = textOf(render(tool, { timeFrom: '2026-10-31' }, value))
+  assert.ok(text.includes('纯时间浏览'), text)
+  assert.ok(text.includes('事件：'), 'browse headings show the event time')
+  assert.ok(text.includes('时间范围：'), text)
+})
+
+test('an empty browse result is a time miss with a widening/ask-user hint', async () => {
+  const engine = makeEngine(
+    missResult({}, { mode: 'fair', timeWindow: { from: 1000, to: 2000, level: 'day', timezone: 'UTC' } }),
+  )
+  const tool = new MemoryRecallTool(makePlugin({ engine }))
+  const value = await tool.execute({ timeFrom: '2026-10-31', granularity: 'day' }, exec())
+
+  assert.equal(value.mode, 'browse')
+  assert.equal(value.missType, 'time')
+  assert.equal(value.misses, undefined, 'a browse miss never counts as a strike')
+  assertLosslessJson(value)
+  const text = textOf(render(tool, { timeFrom: '2026-10-31' }, value))
+  assert.ok(text.includes('纯时间浏览'), text)
+  assert.ok(text.includes('指定时间范围内没有找到记忆'), text)
+  assert.ok(text.includes('询问'), text)
+})
+
+test('time.mode=off drops time arguments with a warning; a time-only call is rejected', async () => {
+  const engine = makeEngine(successResult([makeAddition()]))
+  const cfg = makeConfig({ recall: { enabled: true, mode: 'fair' }, time: { mode: 'off' } })
+  const tool = new MemoryRecallTool(makePlugin({ engine, cfg }))
+
+  const value = await tool.execute({ keywords: 'docker', timeFrom: '2026-10-31' }, exec())
+  assert.equal(engine.calls[0].options.timeFrom, undefined, 'time is rolled back when time.mode=off')
+  assert.ok(value.warnings.some((warning) => warning.includes('time.mode=off')), JSON.stringify(value.warnings))
+  assert.ok(textOf(render(tool, { keywords: 'docker' }, value)).includes('time.mode=off'))
+
+  await assert.rejects(tool.execute({ timeFrom: '2026-10-31' }, exec()), {
+    message: 'memory_recall 需要 keywords（关键词），或 timeFrom/timeTo/granularity 时间参数（纯时间浏览）',
+  })
+})
+
+test('invalid time values are delegated to the engine normalizer (warnings, never a throw)', async () => {
+  const engine = makeEngine(
+    missResult({}, { missType: 'time', warnings: ["time: 无法解析查询时间 '不是时间'，已忽略时间约束，按关键词检索"] }),
+  )
+  const tool = new MemoryRecallTool(makePlugin({ engine }))
+  const value = await tool.execute({ keywords: 'docker', timeFrom: '不是时间' }, exec())
+
+  assert.equal(engine.calls[0].options.timeFrom, '不是时间')
+  assert.equal(value.missType, 'time')
+  assert.ok(value.warnings[0].includes('无法解析'))
+  assertLosslessJson(value)
+  assert.ok(textOf(render(tool, { keywords: 'docker' }, value)).includes('提示：'))
+})
+
+// ---------------------------------------------------------------------------
+// v1.4.0 miss semantics: time miss ≠ strike; fair vs legacy accounting
+// ---------------------------------------------------------------------------
+
+test('missType=time does not count a strike and returns an ask-the-user hint', async () => {
+  const engine = makeEngine(
+    missResult({ matchedFolders: 3, attempts: 0 }, { missType: 'time', mode: 'fair', timeWindow: { from: 1000, to: 2000, level: 'day' } }),
+    missResult({ matchedFolders: 3, attempts: 0 }, { missType: 'time', mode: 'fair' }),
+    missResult({ matchedFolders: 0, attempts: 0 }, { missType: 'keyword', mode: 'fair' }),
+  )
+  const tool = new MemoryRecallTool(makePlugin({ engine }))
+
+  const first = await tool.execute({ keywords: 'docker', timeFrom: '2026-10-31' }, exec())
+  assert.equal(first.found, 0)
+  assert.equal(first.missType, 'time')
+  assert.equal(first.misses, undefined, 'time miss is not a strike')
+  assert.equal(first.stopHint, undefined)
+  assertLosslessJson(first)
+  const text = textOf(render(tool, { keywords: 'docker', timeFrom: '2026-10-31' }, first))
+  assert.ok(text.includes('时间范围过滤'), text)
+  assert.ok(text.includes('询问'), text)
+
+  const second = await tool.execute({ keywords: 'docker', timeFrom: '2026-10-31' }, exec())
+  assert.equal(second.missType, 'time')
+  assert.equal(second.misses, undefined, 'repeated time misses never accumulate strikes')
+
+  const third = await tool.execute({ keywords: 'docker' }, exec())
+  assert.equal(third.misses, 1, 'a true miss starts the strike run')
+})
+
+test('the three model-visible hints all tell the model it may ask the user for a time range', () => {
+  // The 3rd-miss warning and the 6th-miss disable hint keep their v1.3.0
+  // sentences (rollback parity) and append the v1.4.0 time-assistance sentence.
+  assert.ok(MISS_WARNING.includes('可能关键词没有选对'), 'legacy warning sentence kept')
+  assert.ok(MISS_WARNING.includes('询问'), '3rd-miss warning mentions asking the user')
+  assert.ok(MISS_WARNING.includes('最小连续 3 天'), MISS_WARNING)
+  assert.ok(DISABLED_HINT.includes('目标回忆 α 值过低'), 'legacy disable sentence kept')
+  assert.ok(DISABLED_HINT.includes('询问'), '6th-miss hint mentions asking the user')
+  assert.ok(DISABLED_HINT.includes('最小连续 3 天'), DISABLED_HINT)
+
+  // The empty-result missHint is the third model-visible place.
+  const tool = new MemoryRecallTool(makePlugin({ engine: makeEngine() }))
+  const value = {
+    found: 0,
+    matchedFolders: 0,
+    attempted: 0,
+    added: [],
+    images: [],
+    entries: [],
+    misses: 1,
+    askUserHint: true,
+  }
+  const text = textOf(render(tool, { keywords: 'nothing' }, value))
+  assert.ok(text.includes('没有匹配到任何记忆'), text)
+  assert.ok(text.includes('询问'), 'empty-result hint mentions asking the user')
+  assert.ok(text.includes('最小连续 3 天'), text)
+})
+
+// ---------------------------------------------------------------------------
+// v1.4.0 lane state and legacy rollback
+// ---------------------------------------------------------------------------
+
+test('fair path passes plugin lanes/round into engine.recall and commits the updated lanes', async () => {
+  const lanes = { round: 7, pendingHigh: [] }
+  const returnedLanes = { round: 8, pendingHigh: ['mem-x'] }
+  const engine = makeEngine(successResult([makeAddition()], {}, { mode: 'fair', lanes: returnedLanes }))
+  const plugin = makePlugin({ engine, lanes, round: 8 })
+  const tool = new MemoryRecallTool(plugin)
+
+  const value = await tool.execute({ keywords: 'docker' }, exec())
+  assert.equal(engine.calls[0].options.lanes, lanes)
+  assert.equal(engine.calls[0].options.round, 8)
+  assert.equal(plugin.calls.commits.length, 1)
+  assert.equal(plugin.calls.commits[0].lanes, returnedLanes)
+  assert.equal(value.mode, 'fair')
+  assertLosslessJson(value)
+})
+
+test('throwing lane hooks never break the recall result', async () => {
+  const engine = makeEngine(successResult([makeAddition()], {}, { mode: 'fair', lanes: { round: 2 } }))
+  const plugin = makePlugin({ engine })
+  plugin.getRecallLanes = () => {
+    throw new Error('recall-state corrupt')
+  }
+  plugin.nextRecallRound = () => {
+    throw new Error('recall-state corrupt')
+  }
+  plugin.commitRecallLanes = () => {
+    throw new Error('disk full')
+  }
+  const tool = new MemoryRecallTool(plugin)
+
+  const value = await tool.execute({ keywords: 'docker' }, exec())
+  assert.equal(value.found, 1)
+  assertLosslessJson(value)
+})
+
+test('legacy rollback keeps the v1.3.0 call shape and miss accounting', async () => {
+  const engine = makeEngine(
+    missResult({ matchedFolders: 2, attempts: 2 }),
+    missResult({ matchedFolders: 0, attempts: 0 }, { missType: 'time' }),
+    successResult([makeAddition()]),
+  )
+  const plugin = makePlugin({
+    engine,
+    cfg: makeConfig({ recall: { enabled: true, mode: 'legacy' } }),
+    lanes: { round: 1 },
+    round: 5,
+  })
+  const tool = new MemoryRecallTool(plugin)
+
+  const miss = await tool.execute({ keywords: 'x' }, exec())
+  assert.equal(miss.misses, 1, 'legacy counts a matched-but-empty result as a miss')
+  assert.equal(miss.timeWindow, undefined)
+  assert.equal(miss.missType, undefined)
+  assert.equal(miss.hasMore, false)
+  assert.equal(miss.mode, 'legacy')
+  assertLosslessJson(miss)
+  assert.equal(engine.calls[0].options.lanes, undefined, 'legacy never gets lane options')
+  assert.equal(engine.calls[0].options.round, undefined)
+
+  // Even in legacy, a *time* miss is not a strike (the keywords were right).
+  const timeMiss = await tool.execute({ keywords: 'x', timeFrom: '2026-10-31' }, exec())
+  assert.equal(timeMiss.missType, 'time')
+  assert.equal(timeMiss.misses, undefined, 'time misses never advance the legacy strike run')
+
+  const found = await tool.execute({ keywords: 'docker' }, exec())
+  assert.equal(found.found, 1)
+  assert.equal(found.mode, 'legacy')
+})
+
+test('degraded lane state is surfaced as an observation hint (no latency promise)', async () => {
+  const engine = makeEngine(successResult([makeAddition()], { degraded: true }, { mode: 'fair' }))
+  const tool = new MemoryRecallTool(makePlugin({ engine }))
+  const value = await tool.execute({ keywords: 'docker' }, exec())
+
+  assert.equal(value.degraded, true)
+  assertLosslessJson(value)
+  const text = textOf(render(tool, { keywords: 'docker' }, value))
+  assert.ok(text.includes('降级观测'), text)
+  assert.ok(text.includes('exploreRatio'), 'the hint suggests tuning exploreRatio')
+  assert.ok(text.includes('offset'), 'the hint suggests pagination as a fallback')
+})
+
+test('enforced=false (time.mode=index) is labelled as "not filtered by time", never as a time filter', async () => {
+  const window = {
+    from: Date.UTC(2026, 9, 30),
+    to: Date.UTC(2026, 10, 2),
+    level: 'day',
+    enforced: false,
+    timezone: 'UTC',
+    requested: { from: Date.UTC(2026, 9, 31), to: Date.UTC(2026, 10, 1) },
+  }
+  const engine = makeEngine(successResult([makeAddition()], {}, { timeWindow: window }))
+  const tool = new MemoryRecallTool(makePlugin({ engine }))
+  const value = await tool.execute({ keywords: 'docker', timeFrom: '2026-10-31', timeTo: '2026-11-01' }, exec())
+
+  assert.equal(value.timeWindow.enforced, false)
+  assertLosslessJson(value)
+  const text = textOf(render(tool, { keywords: 'docker' }, value))
+  assert.ok(text.includes('未启用时间约束'), text)
+  assert.ok(text.includes('time.mode=index'), text)
+  assert.ok(!text.includes('时间范围：'), 'must not render as an applied time range')
+  assert.ok(!text.includes('已放宽到'), 'no widening claim when the window was not enforced')
+})
+
+test('lanes are only passed together with a round (pairing rule)', async () => {
+  const lanes = emptyLanesForTest()
+  const engine = makeEngine(successResult([makeAddition()]))
+  // A plugin that exposes lane state but no round hook (transient rollout):
+  // neither option may reach the engine, so register/TTL stays consistent.
+  const plugin = makePlugin({ engine, lanes })
+  const tool = new MemoryRecallTool(plugin)
+
+  const value = await tool.execute({ keywords: 'docker' }, exec())
+  assert.equal(value.found, 1)
+  assert.equal(engine.calls[0].options.lanes, undefined)
+  assert.equal(engine.calls[0].options.round, undefined)
+  assert.equal(plugin.calls.commits.length, 0)
+})
+
+test('browse never passes lanes/round and never commits lane state', async () => {
+  const lanes = emptyLanesForTest()
+  const engine = makeEngine(
+    successResult([makeAddition()], {}, { mode: 'fair', lanes: { round: 9 }, timeWindow: { from: 1000, to: 2000, level: 'day' } }),
+  )
+  const plugin = makePlugin({ engine, lanes, round: 9 })
+  const tool = new MemoryRecallTool(plugin)
+
+  const value = await tool.execute({ timeFrom: '2026-10-31' }, exec())
+  assert.equal(value.found, 1)
+  assert.equal(value.mode, 'browse')
+  assert.equal(engine.calls[0].options.lanes, undefined, 'browse must not advance lanes')
+  assert.equal(engine.calls[0].options.round, undefined)
+  assert.equal(plugin.calls.commits.length, 0, 'browse must not persist lane state')
+})
+
+/** Minimal JSON-safe LaneState for fake-engine tests (no engine dependency). */
+function emptyLanesForTest() {
+  return {
+    frontier: [],
+    exploreCursor: null,
+    pendingHigh: [],
+    pendingHighRound: [],
+    highRecycle: [],
+    recycle: [],
+    degraded: false,
+    round: 1,
+  }
+}
+
+// ---------------------------------------------------------------------------
+// v1.4.0 real-engine integration (temporary memory dir only, no real memory/)
+// ---------------------------------------------------------------------------
+
+function withRelMemoryDir(fn) {
+  const dir = mkdtempSync(path.join(os.tmpdir(), 'dsh-rofm-recall-tool-'))
+  const cleanup = () => rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 })
+  let result
+  try {
+    result = fn(dir)
+  } catch (error) {
+    cleanup()
+    throw error
+  }
+  if (result && typeof result.then === 'function') return result.finally(cleanup)
+  cleanup()
+  return result
+}
+
+const REAL_DAY_30 = Date.UTC(2026, 9, 30)
+const REAL_DAY_31 = Date.UTC(2026, 9, 31)
+
+/**
+ * Hermetic real-engine environment: an `engine.recall`-wired `MemoryEngine` on a
+ * temp memory dir behind a fake plugin. `withLanes` also wires the v1.4.0
+ * `getRecallLanes`/`nextRecallRound`/`commitRecallLanes` hooks to record what the
+ * tool passes through.
+ */
+function makeRealEnv(dir, { folders = [], recallMode = 'fair', timeMode = 'constrain', excludeIds = [], withLanes = false } = {}) {
+  const memoryDir = path.join(dir, 'memory')
+  const engine = new MemoryEngine({
+    memoryDir,
+    config: {
+      recall: { mode: recallMode, firstGenMax: 10 },
+      time: { mode: timeMode, timezone: 'Asia/Shanghai', judgeEventTime: false },
+    },
+  })
+  for (const folder of folders) {
+    writeFolder(memoryDir, {
+      id: folder.id,
+      meta: {
+        createdAt: folder.createdAt ?? REAL_DAY_31 + 3600_000,
+        scored: true,
+        alpha: folder.alpha ?? 0.5,
+        beta: folder.beta ?? 3,
+        keywords: folder.keywords ?? ['docker'],
+        ...(folder.eventStart === undefined
+          ? {}
+          : {
+              eventStart: folder.eventStart,
+              eventEnd: folder.eventEnd ?? folder.eventStart + 1,
+              eventTimeSource: 'messages',
+            }),
+      },
+      messages: [{ role: 'user', content: folder.text ?? `内容 ${folder.id}` }],
+    })
+  }
+  engine.load()
+  const cfg = { ...engine.config, memoryDir }
+  const laneCalls = { get: 0, round: 0, commits: [] }
+  const laneStore = { value: emptyLanes(), round: 0 }
+  const plugin = {
+    currentConfig: () => cfg,
+    toolsSessionEnabled: () => true,
+    scopedConfig: () => cfg,
+    engineFor: () => engine,
+    contextStats: () => ({ sessionId: 'session-real', chars: 200, tokens: 50, windowTokens: 1_000_000 }),
+    sessionState: () => ({ recalledIds: new Set(excludeIds) }),
+  }
+  if (withLanes) {
+    plugin.getRecallLanes = () => {
+      laneCalls.get += 1
+      return laneStore.value
+    }
+    plugin.nextRecallRound = () => {
+      laneCalls.round += 1
+      laneStore.round += 1
+      return laneStore.round
+    }
+    plugin.commitRecallLanes = (session, config, lanes) => {
+      laneCalls.commits.push(lanes)
+      laneStore.value = lanes
+    }
+  }
+  return { memoryDir, engine, cfg, plugin, laneCalls, laneStore, tool: new MemoryRecallTool(plugin) }
+}
+
+const MEMORY_FOLDERS = [
+  { id: 'mem-20260101T000000Z-0001', alpha: 0.9, keywords: ['docker', '端口'], eventStart: REAL_DAY_30, eventEnd: REAL_DAY_31, text: 'DOCKER-PORT-8080' },
+  { id: 'mem-20260101T000000Z-0002', alpha: 0.8, keywords: ['docker', '部署'], eventStart: REAL_DAY_31, eventEnd: REAL_DAY_31 + 1, text: 'DOCKER-DEPLOY' },
+  { id: 'mem-20260101T000000Z-0003', alpha: 0.7, keywords: ['docker', '灰度'], eventStart: Date.UTC(2026, 8, 1), eventEnd: Date.UTC(2026, 8, 2), text: 'DOCKER-CANARY' },
+]
+
+test('real engine: time-only browse is chronological, mode=browse, and an empty window is a time miss (no strike)', async () => {
+  await withRelMemoryDir(async (dir) => {
+    const { tool } = makeRealEnv(dir, { folders: MEMORY_FOLDERS })
+
+    const value = await tool.execute({ timeFrom: '2026-10-30', timeTo: '2026-10-31' }, exec())
+    assert.equal(value.found, 2, 'both October folders fall inside the window')
+    assert.equal(value.mode, 'browse')
+    assert.deepEqual(value.added, ['mem-20260101T000000Z-0001', 'mem-20260101T000000Z-0002'])
+    assert.deepEqual(
+      value.entries.map((entry) => entry.eventStart),
+      [REAL_DAY_30, REAL_DAY_31],
+      'browse is sorted by event start',
+    )
+    assertLosslessJson(value)
+    const text = textOf(render(tool, { timeFrom: '2026-10-30', timeTo: '2026-10-31' }, value))
+    assert.ok(text.includes('纯时间浏览'), text)
+    assert.ok(text.includes('时间范围：'), text)
+
+    // A window with nothing in it: missType='time', no strike, ask-user hint.
+    const empty = await tool.execute({ timeFrom: '2026-10-01', timeTo: '2026-10-02' }, exec())
+    assert.equal(empty.found, 0)
+    assert.equal(empty.missType, 'time')
+    assert.equal(empty.misses, undefined, 'an empty browse window must not strike the tool')
+    assert.equal(empty.stopHint, undefined)
+    assertLosslessJson(empty)
+    const emptyText = textOf(render(tool, { timeFrom: '2026-10-01', timeTo: '2026-10-02' }, empty))
+    assert.ok(emptyText.includes('询问'), emptyText)
+  })
+})
+
+test('real engine: offset/limit/hasMore paginate a deterministic fair recall', async () => {
+  await withRelMemoryDir(async (dir) => {
+    const { tool } = makeRealEnv(dir, { folders: MEMORY_FOLDERS })
+
+    const first = await tool.execute({ keywords: 'docker', limit: 1 }, exec())
+    assert.equal(first.found, 1)
+    assert.equal(first.offset, 0)
+    assert.equal(first.hasMore, true)
+    assert.equal(first.nextOffset, 1)
+    assert.deepEqual(first.added, ['mem-20260101T000000Z-0001'])
+
+    const second = await tool.execute({ keywords: 'docker', limit: 1, offset: 1 }, exec())
+    assert.equal(second.offset, 1)
+    assert.deepEqual(second.added, ['mem-20260101T000000Z-0002'])
+    assert.equal(second.hasMore, true)
+    assert.equal(second.nextOffset, 2)
+
+    const third = await tool.execute({ keywords: 'docker', limit: 1, offset: 2 }, exec())
+    assert.equal(third.offset, 2)
+    assert.deepEqual(third.added, ['mem-20260101T000000Z-0003'])
+    assert.equal(third.hasMore, false)
+    assert.equal(third.nextOffset, undefined)
+
+    const text = textOf(render(tool, { keywords: 'docker' }, third))
+    assert.ok(text.includes('本页：第 3 ～ 3 条'), text)
+    assert.ok(text.includes('已到末页'), text)
+  })
+})
+
+test('real engine: fair mode 3/6 strike escalation on true misses, time miss exempt', async () => {
+  await withRelMemoryDir(async (dir) => {
+    const { tool } = makeRealEnv(dir, { folders: MEMORY_FOLDERS })
+
+    // A time window that excludes the keyword matches is a time miss -> no strike.
+    const timeMiss = await tool.execute({ keywords: 'docker', timeFrom: '2026-10-01', timeTo: '2026-10-02' }, exec())
+    assert.equal(timeMiss.found, 0)
+    assert.equal(timeMiss.missType, 'time')
+    assert.equal(timeMiss.misses, undefined)
+
+    let last
+    for (let attempt = 0; attempt < MISS_DISABLE_AT; attempt += 1) {
+      last = await tool.execute({ keywords: `完全无关词${attempt}` }, exec())
+      assert.equal(last.found, 0)
+    }
+    assert.equal(last.misses, MISS_DISABLE_AT)
+    assert.equal(last.stopHint, DISABLED_HINT, 'the 6th true miss disables the tool')
+    await assert.rejects(tool.execute({ keywords: '再一次' }, exec()), /memory_recall 本轮已停用/)
+  })
+})
+
+test('real engine: plugin lanes/round are passed together and the updated lanes committed', async () => {
+  await withRelMemoryDir(async (dir) => {
+    const env = makeRealEnv(dir, { folders: MEMORY_FOLDERS, withLanes: true })
+    const { tool, laneCalls, laneStore } = env
+
+    const first = await tool.execute({ keywords: 'docker' }, exec())
+    assert.equal(first.found, 3)
+    assert.equal(laneCalls.get, 1, 'lanes read once from the plugin')
+    assert.equal(laneCalls.round, 1, 'round resolved once from the plugin')
+    assert.equal(laneCalls.commits.length, 1, 'updated lanes committed back')
+    assert.equal(laneStore.value.round, 1, 'the committed lane state carries the round passed to the engine')
+
+    const second = await tool.execute({ keywords: 'docker' }, exec())
+    assert.equal(second.found, 3)
+    assert.equal(laneCalls.round, 2)
+    assert.equal(laneCalls.commits.length, 2)
+    assert.equal(laneStore.value.round, 2, 'the round is monotonic and travels with the lane state')
+  })
+})
+
+test('real engine: time.mode=index records the window but does not filter (rendered as unenforced)', async () => {
+  await withRelMemoryDir(async (dir) => {
+    const { tool } = makeRealEnv(dir, { folders: MEMORY_FOLDERS, timeMode: 'index' })
+
+    const value = await tool.execute({ keywords: 'docker', timeFrom: '2026-10-01', timeTo: '2026-10-02' }, exec())
+    assert.equal(value.found, 3, 'time.mode=index does not filter by the time window')
+    assert.equal(value.timeWindow.enforced, false)
+    assertLosslessJson(value)
+    const text = textOf(render(tool, { keywords: 'docker' }, value))
+    assert.ok(text.includes('未启用时间约束'), text)
+    assert.ok(text.includes('time.mode=index'), text)
+  })
 })

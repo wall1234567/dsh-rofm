@@ -326,6 +326,34 @@ test('folderTimeRange: degenerate input is repaired and never throws', () => {
   }
 })
 
+test('failure safety: absurd timestamps degrade instead of throwing', () => {
+  const cfg = makeCfg()
+  // A JS Date cannot represent these; every helper must degrade, never throw.
+  const absurd = [1e20, -1e20, Number.MAX_VALUE]
+  for (const value of absurd) {
+    assert.equal(dayKey(value, ASIA), '')
+    assert.ok(Number.isNaN(zonedDayStart(value, ASIA)))
+    assert.ok(Number.isNaN(zonedMonthStart(value, ASIA)))
+    assert.ok(Number.isNaN(zonedYearStart(value, ASIA)))
+    assert.ok(Number.isNaN(addZonedDays(value, 1, ASIA)))
+    assert.equal(formatWindow({ from: value, to: value + 1, level: 'day' }, ASIA), '全部时间')
+  }
+  assert.ok(Number.isNaN(addZonedDays(0, 1e9, ASIA)))
+  // Corrupt folder timestamps fall back to the epoch archive range.
+  const corrupt = folderTimeRange({ id: 'mem-x', createdAt: 1e20, eventStart: 1e20, eventEnd: 1e20, eventTimeSource: 'messages' })
+  assert.deepEqual(corrupt, { start: 0, end: 1, source: 'archive' })
+  const index = buildTimeIndex([{ id: 'mem-corrupt', createdAt: 1e20 }], cfg)
+  assert.equal(index.folderCount, 1)
+  assert.deepEqual(index.byId.get('mem-corrupt'), { start: 0, end: 1, source: 'archive' })
+  // A raw (un-normalised) window outside the Date range matches nothing.
+  assert.equal(queryTimeIndex(index, { from: 1e20, to: 1e20 + 1, level: 'day' }, cfg).count, 0)
+  // Normalisation degrades the absurd endpoint to "no constraint".
+  const normalized = normalizeTimeQuery({ timeFrom: 1e20 }, cfg, NOW)
+  assert.equal(normalized.level, 'all')
+  assert.equal(normalized.from, null)
+  assert.ok(normalized.warnings.some((warning) => /timeFrom/.test(warning)))
+})
+
 // ---------------------------------------------------------------------------
 // buildTimeIndex (CSR buckets)
 // ---------------------------------------------------------------------------

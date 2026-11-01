@@ -15,6 +15,21 @@
  * `memory/sessions/<session-id>/stats.jsonl`, so by default this tool aggregates
  * every session directory (plus the legacy global `memory/stats.jsonl`).
  *
+ * v1.4.0 additions (contract §7, plan §2.2):
+ *   - lane distribution from recall telemetry (`lanesPicked`, registerDrops,
+ *     degraded, reInjections, mode);
+ *   - time-filter effectiveness (`timeFiltered`, `timeWindow`, `widenedTo`,
+ *     `missType`, `hasMore`);
+ *   - pending data-era statistics (legacy / synthetic / current) reusing
+ *     `tools/memory-audit.mjs`, whose classification delegates to the shared
+ *     `engine/era.js` truth. The era fields are reported side by side
+ *     (`era` = session level, `dominantEra` = folder bucket) and never merged:
+ *     `legacy` is a per-folder property, so a pre-1.2.0 session has
+ *     sessionEra=current + dominantEra=legacy.
+ * Old (≤1.3.0) telemetry has none of the v1.4.0 fields: those lines print
+ * `n/a` instead of failing, and the pending-era block still works because it
+ * reads the index, not telemetry.
+ *
  *   node tools/recall-report.mjs [--dir memory] [--config config.json]
  *                                [--last N] [--json] [--help]
  *
@@ -26,7 +41,12 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { defaultConfigPath, loadConfig, resolveMemoryDir } from '../engine/config.js'
 import { memoryPaths, readStats } from '../engine/store.js'
-import { formatReport, summarizeStats } from '../engine/stats.js'
+import { formatReport, roundNumber, summarizeStats } from '../engine/stats.js'
+import { invokedAsMain } from './main-module.mjs'
+import { auditMemory } from './memory-audit.mjs'
+
+/** The documented v1.4.0 recall lanes, in FAIR-DRI selection order (§5.1). */
+export const RECALL_LANES = Object.freeze(['rareHigh', 'queryBoost', 'register', 'hi', 'lowProbe', 'rotation', 'recycle'])
 
 const USAGE = `dsh-rofm report tool (zero dependencies)
 
@@ -50,7 +70,14 @@ pending (awaiting the current model's memory_judge call). When recall telemetry
 carries β it prints β (trust) statistics: how many recalled memories were
 scored, their mean β and the β≥7 / 0≤β<7 / β<0 distribution (β is metadata for
 the reading model and never affects the recall probability).
-`
+
+v1.4.0 lines (printed after the β line): \`lanes (v1.4.0)\` (lanesPicked
+distribution, registerDrops/degraded/reInjections, recall modes), \`time filter\`
+(timeFiltered, timeWindow/widenedTo, missType, hasMore) and \`pending era\`
+(legacy / synthetic / current folders+pending; current is the actionable number,
+e.g. 2/369 = 0.54%). Old ≤1.3.0 telemetry prints n/a on the time/lane lines; the
+pending-era block reads index.json so it always works. --json adds the keys
+laneStats, timeStats and pendingEras.`
 
 function parseArgs(argv) {
   const flags = {}
@@ -227,6 +254,175 @@ function formatWorkLines(stats) {
   )
 }
 
+// ---------------------------------------------------------------------------
+// v1.4.0: lane distribution / time filter / pending era (contract §7, plan §2.2)
+// ---------------------------------------------------------------------------
+
+/** `key=count` text of one counter object (sorted keys); 'none' when empty. */
+function counterText(counter) {
+  const keys = Object.keys(counter || {}).sort()
+  return keys.length === 0 ? 'none' : keys.map((key) => `${key}=${counter[key]}`).join(', ')
+}
+
+/** Lanes that count as high-α injections for the guarantee share. */
+const HIGH_ALPHA_LANES = new Set(['rareHigh', 'queryBoost', 'register', 'hi'])
+
+/**
+ * Lane distribution from v1.4.0 recall telemetry (`lanesPicked`, contract §7).
+ *
+ * Telemetry written by ≤1.3.0 carries no lane object: those events are skipped
+ * and the line prints `n/a` instead of failing (the upgrade must not break the
+ * report). `registerDrops`/`degraded` are guarantee-degradation counters and are
+ * surfaced because they signal lane/ledger pressure.
+ *
+ * @param {object[]} events telemetry events (already time-ordered/filtered)
+ */
+export function laneStats(events) {
+  const stats = {
+    events: 0,
+    lanes: Object.fromEntries(RECALL_LANES.map((lane) => [lane, 0])),
+    picks: 0,
+    meanPicks: null,
+    highAlphaLaneShare: null,
+    registerDropEvents: 0,
+    registerDrops: 0,
+    degradedEvents: 0,
+    reInjections: 0,
+    modes: {},
+  }
+  for (const event of Array.isArray(events) ? events : []) {
+    if (!event || typeof event !== 'object' || event.type !== 'recall') continue
+    if (!event.lanesPicked || typeof event.lanesPicked !== 'object') continue
+    stats.events += 1
+    for (const lane of RECALL_LANES) {
+      const value = event.lanesPicked[lane]
+      if (Number.isFinite(value) && value > 0) stats.lanes[lane] += value
+    }
+    if (Number.isFinite(event.registerDrops) && event.registerDrops > 0) {
+      stats.registerDropEvents += 1
+      stats.registerDrops += event.registerDrops
+    }
+    if (event.degraded === true) stats.degradedEvents += 1
+    if (Number.isFinite(event.reInjections) && event.reInjections > 0) stats.reInjections += event.reInjections
+    if (typeof event.mode === 'string' && event.mode) stats.modes[event.mode] = (stats.modes[event.mode] || 0) + 1
+  }
+  if (stats.events > 0) {
+    stats.picks = RECALL_LANES.reduce((sum, lane) => sum + stats.lanes[lane], 0)
+    stats.meanPicks = stats.picks > 0 ? roundNumber(stats.picks / stats.events) : null
+    if (stats.picks > 0) {
+      const highPicks = RECALL_LANES.filter((lane) => HIGH_ALPHA_LANES.has(lane)).reduce((sum, lane) => sum + stats.lanes[lane], 0)
+      stats.highAlphaLaneShare = roundNumber((highPicks / stats.picks) * 100)
+    }
+  }
+  return stats
+}
+
+/**
+ * Time-filter effectiveness from v1.4.0 recall telemetry (contract §7):
+ * how many events applied a time window, how many candidates it removed
+ * (`timeFiltered`), which fallback rung was used (`widenedTo`), and how often a
+ * miss was typed as `time` vs `keyword`.
+ *
+ * @param {object[]} events telemetry events
+ */
+export function timeStats(events) {
+  const stats = {
+    events: 0,
+    timeFilteredEvents: 0,
+    timeFilteredTotal: 0,
+    timeWindowEvents: 0,
+    widenedTo: {},
+    missTypes: {},
+    hasMoreEvents: 0,
+  }
+  for (const event of Array.isArray(events) ? events : []) {
+    if (!event || typeof event !== 'object' || event.type !== 'recall') continue
+    const hasFields =
+      event.timeFiltered !== undefined || event.timeWindow !== undefined || typeof event.missType === 'string'
+    if (!hasFields) continue
+    stats.events += 1
+    if (Number.isFinite(event.timeFiltered)) {
+      stats.timeFilteredTotal += event.timeFiltered
+      if (event.timeFiltered > 0) stats.timeFilteredEvents += 1
+    }
+    if (event.timeWindow && typeof event.timeWindow === 'object') {
+      stats.timeWindowEvents += 1
+      const widened = event.timeWindow.widenedTo
+      if (typeof widened === 'string' && widened) stats.widenedTo[widened] = (stats.widenedTo[widened] || 0) + 1
+    }
+    if (typeof event.missType === 'string' && event.missType) {
+      stats.missTypes[event.missType] = (stats.missTypes[event.missType] || 0) + 1
+    }
+    if (event.hasMore === true) stats.hasMoreEvents += 1
+  }
+  return stats
+}
+
+/**
+ * Pending data-era statistics for the memory dir, reusing `tools/memory-audit.mjs`
+ * (whose classification delegates to the shared `engine/era.js`). Both era views
+ * stay separate: the audit session entry carries `era` (session level) and
+ * `dominantEra` (folder bucket) — `legacy` is a per-folder property.
+ *
+ * @param {string} memoryDir
+ */
+export function pendingEraStats(memoryDir) {
+  const audit = auditMemory(memoryDir)
+  return {
+    memoryDir: audit.memoryDir,
+    layout: audit.layout,
+    stores: audit.totals.stores,
+    sessions: audit.totals.sessions,
+    totals: audit.totals,
+    buckets: audit.buckets,
+    calibers: { A: audit.calibers.A, B: audit.calibers.B, C: audit.calibers.C, D: audit.calibers.D },
+    currentPending: audit.currentPending,
+    warnings: audit.warnings,
+  }
+}
+
+/** Aligned lane line (v1.4.0). */
+export function formatLaneLine(stats) {
+  const label = 'lanes (v1.4.0)'.padEnd(23) + ': '
+  if (!stats || stats.events === 0) return `${label}n/a (no v1.4.0 recall telemetry yet)\n`
+  const lanes = RECALL_LANES.map((lane) => `${lane}=${stats.lanes[lane]}`).join('/')
+  return (
+    `${label}${stats.events} event(s), picks=${stats.picks} (mean ${stats.meanPicks ?? 'n/a'}), ${lanes}; ` +
+    `highAlphaLaneShare=${stats.highAlphaLaneShare ?? 'n/a'}%, registerDrops>0 ${stats.registerDropEvents} (total ${stats.registerDrops}), ` +
+    `degraded ${stats.degradedEvents}, reInjections ${stats.reInjections}, modes ${counterText(stats.modes)}\n`
+  )
+}
+
+/** Aligned time-filter line (v1.4.0). */
+export function formatTimeLine(stats) {
+  const label = 'time filter'.padEnd(23) + ': '
+  if (!stats || stats.events === 0) return `${label}n/a (no v1.4.0 recall telemetry yet)\n`
+  return (
+    `${label}${stats.events} event(s), timeFiltered>0 ${stats.timeFilteredEvents} (total ${stats.timeFilteredTotal}), ` +
+    `timeWindow ${stats.timeWindowEvents}, widenedTo ${counterText(stats.widenedTo)}, ` +
+    `missType ${counterText(stats.missTypes)}, hasMore ${stats.hasMoreEvents}\n`
+  )
+}
+
+/** Aligned pending-era lines (from the shared engine/era.js buckets). */
+export function formatPendingEraLines(pending) {
+  const label = 'pending era'.padEnd(23) + ': '
+  if (!pending || !pending.totals || pending.totals.folders === 0) {
+    return `${label}n/a (no archived folders under the memory dir)\n`
+  }
+  const b = pending.buckets
+  const pct = (value) => (Number.isFinite(value) ? `${value.toFixed(2)}%` : 'n/a')
+  return (
+    `${label}legacy ${b.legacy.folders} folders / ${b.legacy.pending} pending; ` +
+    `synthetic ${b.synthetic.folders} folders / ${b.synthetic.pending} pending; ` +
+    `current ${b.current.folders} folders / ${b.current.pending} pending = ${pct(pending.totals.currentPendingPercent)}\n` +
+    `${''.padEnd(23)}  all-stock ${pending.totals.pending}/${pending.totals.folders} = ${pct(pending.totals.pendingPercent)}; ` +
+    `C current-real ${pending.calibers.C.pending}/${pending.calibers.C.folders} = ${pct(pending.calibers.C.pendingPercent)}; ` +
+    `D normal 1.3.0+ ${pending.calibers.D.pending}/${pending.calibers.D.folders} = ${pct(pending.calibers.D.pendingPercent)} ` +
+    `(legacy is per-folder; current-real pending = ${Array.isArray(pending.currentPending) ? pending.currentPending.length : 0} id(s))\n`
+  )
+}
+
 function main() {
   let flags
   try {
@@ -267,11 +463,24 @@ function main() {
   const summary = summarizeStats(events)
   const beta = betaStats(events)
   const work = workStats(events)
+  const lanes = laneStats(events)
+  const timeFilter = timeStats(events)
+  const pendingEras = pendingEraStats(memoryDir)
 
   if (flags.json) {
     process.stdout.write(
       JSON.stringify(
-        { memoryDir, statsDirs, eventCount: events.length, summary, workStats: work, betaStats: beta },
+        {
+          memoryDir,
+          statsDirs,
+          eventCount: events.length,
+          summary,
+          workStats: work,
+          betaStats: beta,
+          laneStats: lanes,
+          timeStats: timeFilter,
+          pendingEras,
+        },
         null,
         2,
       ) + '\n',
@@ -280,6 +489,9 @@ function main() {
     process.stdout.write(formatReport(summary))
     process.stdout.write(formatWorkLines(work))
     process.stdout.write(formatBetaLine(beta))
+    process.stdout.write(formatLaneLine(lanes))
+    process.stdout.write(formatTimeLine(timeFilter))
+    process.stdout.write(formatPendingEraLines(pendingEras))
     if (events.length === 0) {
       process.stderr.write(
         `hint: no telemetry events yet in ${statsDirs.length} stats file(s) under ${memoryDir} (run the engine/simulation first)\n`,
@@ -289,4 +501,8 @@ function main() {
   return 0
 }
 
-process.exitCode = main()
+const invokedDirectly = invokedAsMain(import.meta.url)
+
+if (invokedDirectly) {
+  process.exitCode = main()
+}

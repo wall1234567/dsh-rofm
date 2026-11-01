@@ -5,6 +5,24 @@
  * runs it) against a throw-away memory/sessions fixture in `os.tmpdir()`, then
  * asserts the human/JSON output and the exit code. Nothing here imports the
  * adapter or the engine, so the tool is exercised exactly as shipped.
+ *
+ * ENVIRONMENT-DEPENDENT OUTPUT (explicitly handled here, do not "fix" by
+ * removing the pin): the v1.3.0 compat checks add three PASS/WARN-only lines
+ * only when a QQ plugin is detected (or `<memoryDir>/.compat-state.json`
+ * exists). The documented expectations are therefore:
+ *
+ *   - neutral fixture profile (no QQ plugin) — used by `runCli` for EVERY spawn
+ *     via `DSH_PROFILE_DIR=NEUTRAL_PROFILE`:
+ *       8 check lines + platform + summary
+ *       → `selfcheck: 7 passed, 1 warnings, 0 failed`, no `compat` line.
+ *   - onebot and/or Derpyu detected (compat tests override DSH_PROFILE_DIR):
+ *       + `compat`, `compat chat keys`, and (Derpyu only) `compat autopatch`
+ *       → `selfcheck: 10 passed, 1 warnings, 0 failed` with all three compat
+ *       checks PASS on a patched whitelist.
+ *
+ * The dedicated "documented environment-dependent output" test below asserts
+ * both shapes side by side, including that detection only ADDS compat lines and
+ * never changes the other checks. `--help` documents the same contract.
  */
 
 import assert from 'node:assert/strict'
@@ -28,6 +46,22 @@ const SELFCHECK = path.join(REPO_ROOT, 'tools', 'selfcheck.mjs')
 const SPAWN_TIMEOUT_MS = 180_000
 const FIXTURE_CREATED_AT = 1793000000000
 const FIXTURE_FOLDER_ID = 'mem-20261026T131909Z-0001'
+
+/**
+ * The checks every environment reports (the order is fixed by runSelfCheck).
+ * The three compat checks are appended only when QQ compatibility is relevant,
+ * so they are deliberately NOT in this list.
+ */
+const ENVIRONMENT_INDEPENDENT_CHECKS = [
+  'config',
+  'engine',
+  'memory store',
+  'recall state',
+  'pending era',
+  'time index',
+  'recall fairness',
+  'session logs',
+]
 
 const tempDirs = []
 function makeTempDir() {
@@ -265,6 +299,58 @@ function corruptStoreFixture(mutate) {
   const store = createGoodStore(root)
   mutate(store)
   return { root, store, sessionsDir: createEmptySessionsDir(root) }
+}
+
+// ---------------------------------------------------------------------------
+// v1.4.0 data-era / time-index / fairness fixtures
+// ---------------------------------------------------------------------------
+
+/** Before the v1.2.0 tag (2026-10-27T19:14:00Z) → folder era legacy. */
+const LEGACY_ERA_TS = Date.parse('2026-10-25T01:40:17Z')
+/** After the v1.2.0 tag → folder era follows the session era. */
+const CURRENT_ERA_TS = Date.parse('2026-10-31T09:00:03Z')
+
+/**
+ * Create one healthy store with `folders` index entries (meta.json written for
+ * every folder so the memory-store check stays PASS) plus optional telemetry.
+ *
+ * @param {object} root fixture root
+ * @param {{sessionId?: string, folders: Array<{id?: string, createdAt?: number,
+ *   scored?: boolean, pendingEra?: string, eventStart?: number, eventEnd?: number,
+ *   eventTimeSource?: string}>, statsEvents?: object[]}} options
+ */
+function createMultiStore(root, { sessionId = 'session-era', folders = [], statsEvents = [] } = {}) {
+  const memoryDir = path.join(root, 'memory')
+  const storeDir = path.join(memoryDir, 'sessions', sessionId)
+  const entries = []
+  folders.forEach((folder, index) => {
+    const id = folder.id ?? `mem-20261026T131909Z-${String(index + 1).padStart(4, '0')}`
+    const scored = folder.scored !== false
+    const meta = folderMeta({
+      id,
+      createdAt: folder.createdAt ?? CURRENT_ERA_TS,
+      scored,
+      alpha: scored ? 0.6 : 0,
+      beta: scored ? 1.5 : 0,
+      keywords: scored ? ['部署', 'docker', '端口'] : [],
+    })
+    writeJson(path.join(storeDir, id, 'meta.json'), meta)
+    const entry = indexEntry(meta)
+    for (const key of ['pendingEra', 'eventStart', 'eventEnd', 'eventTimeSource']) {
+      if (folder[key] !== undefined) entry[key] = folder[key]
+    }
+    entries.push(entry)
+  })
+  writeJson(path.join(storeDir, 'index.json'), {
+    version: 1,
+    updatedAt: CURRENT_ERA_TS,
+    nextCounter: entries.length + 1,
+    folders: entries,
+  })
+  if (statsEvents.length > 0) {
+    fs.writeFileSync(path.join(storeDir, 'stats.jsonl'), statsEvents.map((event) => JSON.stringify(event)).join('\n') + '\n', 'utf8')
+  }
+  return { memoryDir, storeDir, entries }
 }
 
 // ---------------------------------------------------------------------------
@@ -576,6 +662,12 @@ test('selfcheck: --help exits 0 and documents the options', () => {
   for (const option of ['--json', '--memory-dir', '--sessions-dir', '--session', '--max-sessions', '--with-tests']) {
     assert.ok(stdout.includes(option), `help mentions ${option}`)
   }
+  // v1.4.0 checks + the era policy must be documented in the help output.
+  for (const name of ['pending era', 'time index', 'recall fairness']) {
+    assert.ok(stdout.includes(name), `help mentions the ${name} check`)
+  }
+  assert.match(stdout, /legacy folders \(createdAt < 2026-10-27T19:14:00Z/)
+  assert.match(stdout, /INFO/)
 })
 
 testIfZstd('selfcheck: --session limits the session-log check to one session id', () => {
@@ -600,6 +692,242 @@ testIfZstd('selfcheck: --session limits the session-log check to one session id'
 })
 
 // ---------------------------------------------------------------------------
+// v1.4.0 checks: pending era buckets / time index / recall fairness
+// ---------------------------------------------------------------------------
+
+test('selfcheck: legacy+synthetic pending are INFO and a small current pending is PASS', () => {
+  const root = makeTempDir()
+  const sessionsDir = createEmptySessionsDir(root)
+  const memoryDir = path.join(root, 'memory')
+  // 40 pre-1.2.0 pending folders → legacy bucket (INFO, never actionable).
+  createMultiStore(root, {
+    sessionId: 'session-era-legacy',
+    folders: Array.from({ length: 40 }, () => ({ createdAt: LEGACY_ERA_TS, scored: false })),
+  })
+  // 100 pending folders (stress volume) + fake window (8000 tokens / 6764%)
+  // → synthetic bucket.
+  createMultiStore(root, {
+    sessionId: 'session-era-synthetic',
+    folders: Array.from({ length: 100 }, () => ({ createdAt: CURRENT_ERA_TS, scored: false })),
+    statsEvents: [
+      { type: 'compress', time: CURRENT_ERA_TS, windowTokens: 8000, folderIds: [] },
+      { type: 'compress-applied', time: CURRENT_ERA_TS, windowTokens: 8000, beforePercent: 6764.15, folderMetadata: [] },
+    ],
+  })
+  // 50 current folders with 1 pending = 2% → PASS/INFO.
+  createMultiStore(root, {
+    sessionId: 'session-era-current',
+    folders: Array.from({ length: 50 }, (_, index) => ({ createdAt: CURRENT_ERA_TS, scored: index !== 0 })),
+  })
+  const { status, json } = runJson(['--memory-dir', memoryDir, '--sessions-dir', sessionsDir])
+  const check = findCheck(json, 'pending era')
+  assert.equal(check.status, 'PASS', check.detail)
+  assert.match(check.detail, /INFO: legacy pending 40 \+ synthetic pending 100/)
+  assert.match(check.detail, /current pending 1\/50 = 2\.00%/)
+  assert.match(check.detail, /within threshold/)
+  assert.deepEqual(check.data.buckets.legacy, { folders: 40, scored: 0, pending: 40 })
+  assert.deepEqual(check.data.buckets.synthetic, { folders: 100, scored: 0, pending: 100 })
+  assert.deepEqual(check.data.buckets.current, { folders: 50, scored: 49, pending: 1 })
+  assert.equal(check.data.currentPendingPercent, 2)
+  assert.deepEqual(check.data.thresholds, {
+    warnPercent: 5,
+    warnMinPending: 20,
+    failPercent: 20,
+    minCurrentFolders: 20,
+  })
+  assert.equal(status, 0, 'legacy/synthetic pending must never fail the self-check')
+})
+
+test('selfcheck: current pending above 5% with >20 pending is a WARN (exit 0)', () => {
+  const root = makeTempDir()
+  const sessionsDir = createEmptySessionsDir(root)
+  // 21 pending out of 300 current folders = 7% → WARN, not FAIL.
+  createMultiStore(root, {
+    sessionId: 'session-era-warn',
+    folders: Array.from({ length: 300 }, (_, index) => ({ createdAt: CURRENT_ERA_TS, scored: index >= 21 })),
+  })
+  const { status, json } = runJson(['--memory-dir', path.join(root, 'memory'), '--sessions-dir', sessionsDir])
+  const check = findCheck(json, 'pending era')
+  assert.equal(check.status, 'WARN', check.detail)
+  assert.equal(check.data.currentPendingPercent, 7)
+  assert.match(check.detail, /above the WARN line/)
+  assert.equal(status, 0, 'a WARN must not fail the self-check')
+  assert.equal(json.summary.failed, 0)
+})
+
+test('selfcheck: current pending above 20% is a FAIL (exit 1)', () => {
+  const root = makeTempDir()
+  const sessionsDir = createEmptySessionsDir(root)
+  createMultiStore(root, {
+    sessionId: 'session-era-fail',
+    folders: Array.from({ length: 50 }, () => ({ createdAt: CURRENT_ERA_TS, scored: false })),
+  })
+  const { status, json } = runJson(['--memory-dir', path.join(root, 'memory'), '--sessions-dir', sessionsDir])
+  const check = findCheck(json, 'pending era')
+  assert.equal(check.status, 'FAIL', check.detail)
+  assert.equal(check.data.currentPendingPercent, 100)
+  assert.match(check.detail, /above the FAIL line/)
+  assert.equal(status, 1)
+  assert.equal(json.exitCode, 1)
+})
+
+test('selfcheck: index pendingEra marks win over createdAt and stale marks are counted', () => {
+  const root = makeTempDir()
+  const sessionsDir = createEmptySessionsDir(root)
+  // 30 current pending folders marked legacy: summarizeEras trusts the mark, so
+  // they leave the actionable current bucket; the mark-free classification shows
+  // all 30 are stale (createdAt says current).
+  createMultiStore(root, {
+    sessionId: 'session-era-marked',
+    folders: Array.from({ length: 30 }, () => ({ createdAt: CURRENT_ERA_TS, scored: false, pendingEra: 'legacy' })),
+  })
+  const { status, json } = runJson(['--memory-dir', path.join(root, 'memory'), '--sessions-dir', sessionsDir])
+  const check = findCheck(json, 'pending era')
+  assert.equal(check.status, 'PASS', check.detail)
+  assert.equal(check.data.markedFolders, 30)
+  assert.equal(check.data.inconsistentMarks, 30)
+  assert.deepEqual(check.data.buckets.legacy, { folders: 30, scored: 0, pending: 30 })
+  assert.deepEqual(check.data.buckets.current, { folders: 0, scored: 0, pending: 0 })
+  assert.match(check.detail, /pendingEra marks 30 \(stale 30\)/)
+  assert.match(check.detail, /current sample too small/)
+  assert.equal(status, 0)
+})
+
+test('selfcheck: time index CSR agrees with naive folder event intervals', () => {
+  const root = makeTempDir()
+  const sessionsDir = createEmptySessionsDir(root)
+  const day = 24 * 60 * 60 * 1000
+  createMultiStore(root, {
+    sessionId: 'session-time',
+    folders: [
+      // Event-time folder spanning two days (messages source).
+      { createdAt: CURRENT_ERA_TS, scored: true, eventStart: CURRENT_ERA_TS, eventEnd: CURRENT_ERA_TS + 2 * day, eventTimeSource: 'messages' },
+      // Old folder without event time → archive fallback [createdAt, createdAt+1).
+      { createdAt: CURRENT_ERA_TS + 5 * day, scored: true },
+      // Judge-sourced event range.
+      {
+        createdAt: CURRENT_ERA_TS + 9 * day,
+        scored: true,
+        eventStart: CURRENT_ERA_TS + 9 * day,
+        eventEnd: CURRENT_ERA_TS + 9 * day + 3600000,
+        eventTimeSource: 'judge',
+      },
+    ],
+  })
+  const { status, json } = runJson(['--memory-dir', path.join(root, 'memory'), '--sessions-dir', sessionsDir])
+  const check = findCheck(json, 'time index')
+  assert.equal(check.status, 'PASS', check.detail)
+  assert.equal(check.data.stores, 1)
+  assert.equal(check.data.folders, 3)
+  assert.equal(check.data.sampled, 3)
+  assert.deepEqual(check.data.issues, [])
+  assert.match(check.detail, /constrain filtering agrees with naive intervals/)
+  assert.match(check.detail, /off\/index never filter/)
+  assert.equal(status, 0)
+})
+
+test('selfcheck: recall fairness reports v1.4.0 lane/time telemetry and guarantees', () => {
+  const root = makeTempDir()
+  const sessionsDir = createEmptySessionsDir(root)
+  createMultiStore(root, {
+    sessionId: 'session-fair',
+    folders: [{ createdAt: CURRENT_ERA_TS, scored: true }],
+    statsEvents: [
+      {
+        type: 'recall',
+        time: CURRENT_ERA_TS,
+        mode: 'fair',
+        candidates: 12,
+        lanesPicked: { rareHigh: 2, queryBoost: 1, register: 0, hi: 5, lowProbe: 1, rotation: 1, recycle: 0 },
+        pops: 20,
+        registerDrops: 0,
+        reInjections: 1,
+        degraded: false,
+        timeFiltered: 0,
+        timeWindow: null,
+        offset: 0,
+        limit: 10,
+        hasMore: true,
+        missType: null,
+      },
+      {
+        type: 'recall',
+        time: CURRENT_ERA_TS + 1,
+        mode: 'fair',
+        candidates: 3,
+        lanesPicked: { rareHigh: 1, queryBoost: 0, register: 0, hi: 2, lowProbe: 0, rotation: 0, recycle: 0 },
+        pops: 4,
+        registerDrops: 0,
+        reInjections: 0,
+        degraded: false,
+        timeFiltered: 2,
+        timeWindow: { from: CURRENT_ERA_TS, to: CURRENT_ERA_TS + 1, level: 'day', widenedTo: null },
+        offset: 0,
+        limit: 10,
+        hasMore: false,
+        missType: null,
+      },
+    ],
+  })
+  const { status, json } = runJson(['--memory-dir', path.join(root, 'memory'), '--sessions-dir', sessionsDir])
+  const check = findCheck(json, 'recall fairness')
+  assert.equal(check.status, 'PASS', check.detail)
+  assert.equal(check.data.recallEvents, 2)
+  assert.equal(check.data.v14Events, 2)
+  assert.equal(check.data.lanes.hi, 7)
+  assert.equal(check.data.lanes.rareHigh, 3)
+  assert.equal(check.data.lanes.rotation, 1)
+  assert.equal(check.data.reInjections, 1)
+  assert.equal(check.data.timeFilteredEvents, 1)
+  assert.equal(check.data.timeWindowEvents, 1)
+  assert.equal(check.data.hasMoreEvents, 1)
+  assert.equal(check.data.guarantees.meanPicks, 6.5)
+  assert.equal(check.data.guarantees.highAlphaLaneShare, 84.62)
+  assert.match(check.detail, /lanes rareHigh=3\/queryBoost=1/)
+  assert.equal(status, 0)
+})
+
+test('selfcheck: degraded recall telemetry is a WARN, never a FAIL', () => {
+  const root = makeTempDir()
+  const sessionsDir = createEmptySessionsDir(root)
+  createMultiStore(root, {
+    sessionId: 'session-degraded',
+    folders: [{ createdAt: CURRENT_ERA_TS, scored: true }],
+    statsEvents: [
+      {
+        type: 'recall',
+        time: CURRENT_ERA_TS,
+        mode: 'fair',
+        lanesPicked: { rareHigh: 0, queryBoost: 0, register: 0, hi: 2, lowProbe: 0, rotation: 0, recycle: 1 },
+        registerDrops: 2,
+        degraded: true,
+        timeFiltered: 0,
+      },
+    ],
+  })
+  const { status, json } = runJson(['--memory-dir', path.join(root, 'memory'), '--sessions-dir', sessionsDir])
+  const check = findCheck(json, 'recall fairness')
+  assert.equal(check.status, 'WARN', check.detail)
+  assert.equal(check.data.registerDropEvents, 1)
+  assert.equal(check.data.registerDrops, 2)
+  assert.equal(check.data.degradedEvents, 1)
+  assert.match(check.detail, /guarantee degradation observed/)
+  assert.equal(status, 0)
+  assert.equal(json.summary.failed, 0)
+})
+
+test('selfcheck: no v1.4.0 recall telemetry is INFO (real data before the upgrade)', () => {
+  const root = makeTempDir()
+  const store = createGoodStore(root)
+  const sessionsDir = createEmptySessionsDir(root)
+  const { json } = runJson(['--memory-dir', store.memoryDir, '--sessions-dir', sessionsDir])
+  const check = findCheck(json, 'recall fairness')
+  assert.equal(check.status, 'PASS', check.detail)
+  assert.match(check.detail, /INFO: no v1\.4\.0 recall telemetry yet/)
+  assert.equal(check.data.v14Events, 0)
+})
+
+// ---------------------------------------------------------------------------
 // v1.3.0 compat checks
 // ---------------------------------------------------------------------------
 
@@ -613,19 +941,73 @@ test('selfcheck: no compat line without a QQ plugin and without compat state (v1
   assert.equal(human.status, 0)
   const output = String(human.stdout)
   const lines = output.trimEnd().split(/\r?\n/)
-  assert.equal(lines.length, 7, `expected 5 check lines + platform line + summary, got:\n${output}`)
+  assert.equal(lines.length, 10, `expected 8 check lines + platform line + summary, got:\n${output}`)
   assert.ok(!output.includes('compat'), `no compat line expected, got:\n${output}`)
   assert.match(lines.at(-2), /^platform: \S+ \S+, node \d+\.\d+\.\d+$/)
-  // config/engine/memory/recall pass, the empty fixture has no session logs (WARN).
-  assert.equal(lines.at(-1), 'selfcheck: 4 passed, 1 warnings, 0 failed')
+  // config/engine/memory/recall/era/time/fairness pass, the empty fixture has no
+  // session logs (WARN).
+  assert.equal(lines.at(-1), 'selfcheck: 7 passed, 1 warnings, 0 failed')
 
   const { json } = runJson(args)
   assert.deepEqual(
     json.checks.map((check) => check.name),
-    ['config', 'engine', 'memory store', 'recall state', 'session logs'],
+    ENVIRONMENT_INDEPENDENT_CHECKS,
   )
-  assert.deepEqual(json.summary, { passed: 4, warnings: 1, failed: 0 })
+  assert.deepEqual(json.summary, { passed: 7, warnings: 1, failed: 0 })
   assert.equal(json.exitCode, 0)
+})
+
+/**
+ * The documented environment-dependent contract in one place: the same fixture
+ * on a neutral host vs a QQ-plugin host. Detection may only APPEND compat lines
+ * and bump the passed count; every environment-independent check must keep the
+ * exact same status, and the exit code must stay 0.
+ *
+ * (G's docs describe both shapes: neutral → 7 passed/1 warning/0 failed,
+ *  QQ plugin detected → 10 passed/1 warning/0 failed.)
+ */
+test('selfcheck: documented environment-dependent output (neutral 7/1/0 vs QQ 10/1/0)', () => {
+  const root = makeTempDir()
+  const store = createGoodStore(root)
+  const sessionsDir = createEmptySessionsDir(root)
+  const args = ['--memory-dir', store.memoryDir, '--sessions-dir', sessionsDir]
+
+  // 1) Neutral environment (the pin every other test uses): no compat lines.
+  const neutral = runJson(args)
+  assert.deepEqual(neutral.json.checks.map((check) => check.name), ENVIRONMENT_INDEPENDENT_CHECKS)
+  assert.deepEqual(neutral.json.summary, { passed: 7, warnings: 1, failed: 0 })
+  assert.equal(neutral.status, 0)
+
+  // 2) QQ environment (both plugins detected + patched whitelist + valid state):
+  //    exactly the three compat checks are appended and all pass.
+  const profileDir = createQqProfile({
+    onebot: true,
+    derpyu: true,
+    toolRestrict: toolRestrictSource(['ask_user_question', 'todo_write', 'memory_judge', 'memory_recall', 'memory_image']),
+  })
+  const targetFile = path.join(profileDir, 'node_modules', 'qq-agent-presets', 'qq-tool-restrict.mjs')
+  writeJson(path.join(store.memoryDir, '.compat-state.json'), compatStatePayload(targetFile))
+  const detected = runJson(args, { DSH_PROFILE_DIR: profileDir })
+  assert.equal(detected.status, 0)
+  assert.deepEqual(detected.json.checks.map((check) => check.name), [
+    ...ENVIRONMENT_INDEPENDENT_CHECKS,
+    'compat',
+    'compat chat keys',
+    'compat autopatch',
+  ])
+  assert.deepEqual(detected.json.summary, { passed: 10, warnings: 1, failed: 0 })
+
+  // The environment only adds lines: the non-compat checks are byte-identical.
+  const statuses = (checks) => checks.filter((check) => !check.name.startsWith('compat')).map((check) => `${check.name}=${check.status}`)
+  assert.deepEqual(statuses(detected.json.checks), statuses(neutral.json.checks))
+  for (const name of ['compat', 'compat chat keys', 'compat autopatch']) {
+    assert.equal(findCheck(detected.json, name).status, 'PASS', `${name} must PASS on a patched setup`)
+  }
+
+  // Human output of the detected environment: 11 check lines + platform + summary.
+  const human = String(runCli(args, { DSH_PROFILE_DIR: profileDir }).stdout)
+  assert.equal(human.trimEnd().split(/\r?\n/).length, 13)
+  assert.equal(human.trimEnd().split(/\r?\n/).at(-1), 'selfcheck: 10 passed, 1 warnings, 0 failed')
 })
 
 test('selfcheck: a detected onebot plugin adds the compat and chat-key PASS lines', () => {
@@ -655,7 +1037,7 @@ test('selfcheck: a detected onebot plugin adds the compat and chat-key PASS line
     ['compat', 'compat chat keys'],
   )
   assert.equal(json.summary.failed, 0)
-  assert.equal(json.summary.passed, 6)
+  assert.equal(json.summary.passed, 9)
 
   const human = String(runCli(args, { DSH_PROFILE_DIR: profileDir }).stdout)
   assert.match(human, /^\[PASS\] compat — qqBots=auto; detected: dsh-onebot-qq$/m)
@@ -690,7 +1072,7 @@ test('selfcheck: a detected Derpyu with a patched whitelist and valid state pass
     COMPAT_CHECK_NAMES,
   )
   assert.equal(json.summary.failed, 0)
-  assert.equal(json.summary.passed, 7)
+  assert.equal(json.summary.passed, 10)
 })
 
 test('selfcheck: a detected Derpyu with an unpatched/broken whitelist warns but never fails', () => {

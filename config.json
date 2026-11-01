@@ -1,5 +1,5 @@
 {
-  "_readme": "这是 dsh-rofm 的主配置文件；改完保存即可，插件会在下一次用户消息/模型步骤前按文件内容自动热加载（mtime 相同也能识别；写到一半的坏 JSON 会保留上一次可用配置）。所有 *_Percent 都是百分数。注意：importance 的 α 是回忆概率乘数，调高 importance.max 或让大量文件夹拿到 0.9+ 会让它们几乎每次都被回忆，请慎重设置高重要性。归档不调用模型：新归档先以“待评分”落盘（未评分的记忆不参与回忆），由当前会话模型结合当前语境通过 memory_judge 工具提交 α（0.01~1）、β（信赖度 -10~10，不参与回忆概率，只用于提示阅读模型该回忆的可信度）与关键词。β 范围是固定常量，不提供配置项。compat 段是 QQ 渠道兼容开关（dsh-onebot-qq / Derpyu520 qq-bridge）；qqBots=auto 时按 profile 里是否安装这两个插件自动启用，未安装时本段不产生任何行为。跨平台（v1.3.0）：storage.dir 与 compat.mediaRoots 支持 `~/`（或 `~\\`）展开到当前用户 home，Windows/Linux/macOS 通用；`~user` 不展开；其余路径仍按“绝对路径原样、相对路径相对插件目录（mediaRoots 相对当前目录）”解析。",
+  "_readme": "这是 dsh-rofm 的主配置文件；改完保存即可，插件会在下一次用户消息/模型步骤前按文件内容自动热加载（mtime 相同也能识别；写到一半的坏 JSON 会保留上一次可用配置）。所有 *_Percent 都是百分数。默认值的唯一真相是 engine/config.js 的 DEFAULT_CONFIG：本文件按产品默认值覆盖它（v1.4.0 起另有 test/config-consistency.test.mjs 逐项校验两者一致，改这里的同时要改 engine/config.js）。【v1.4.0 确定性召回】α 不再只是“回忆概率乘数”：recall.mode='fair'（默认，FAIR-DRI）时 α 是确定性优先级——高 α（≥ recall.fairness.thetaHigh）记忆被查询命中后首轮必现、低 α 记忆按轮转道有界最迟召回、不丢弃；recall.mode='legacy' 才是 v1.3.0 的概率掷骰路径（一键回滚），'deterministic' 是纯 DRI 研究对照。归档阈值保持 60%。【时间辅助】memory_recall 支持 timeFrom/timeTo/granularity/offset（最小连续 3 天；未命中按 中心日→±1 天→月→年→全库 阶梯放宽；只传时间不传关键词 = 纯时间浏览）。time.mode='constrain'（随包产品默认）开启时间约束；'index' 只建内存索引不约束（engine 默认）；'off' 一键关闭（不采集/不建索引/忽略时间参数）。时区用 time.timezone（本文件 Asia/Shanghai；空 '' = 宿主本地）。重要语义：createdAt 是“归档时间”，不是事件时间；事件时间区间在 index 的 eventStart/eventEnd（可选，旧数据回退 createdAt）。时间索引只在内存里，不落盘。【遗留数据口径】本机全量 3742 folders 中 pending 2769 = 74.0%（仅描述历史现状）；排除 pre-1.2.0 遗留（587）后 69.3%；排除遗留 + a46 压测（2180）后“当前真实待评分”只有 2/369 = 0.54%（QQ 通道 2 条），1.3.0 之后正常会话 b5eeee7e 是 0/359 = 0%。pre-1.2.0 与压测遗留默认不回补（只标记 pendingEra，用 tools/memory-audit.mjs 查看），scoring.includeLegacy=false 让它们不进入评分任务区块。【回滚开关】recall.mode='legacy'（回到 v1.3.0 概率召回）/ time.mode='off'（关闭时间辅助）/ scoring.fallback='never'（关闭 heuristic 评分兜底、积压超限时暂停归档）；另 compress.protectCurrentTurn/allowSmallWindow/hardLimitStop 是 1.4.0 的归档保护，需要老行为时才调。【评分】importance 的 α 范围、memory_judge 的 α/β/keywords 口径不变：新归档先以“待评分”落盘（未评分不参与回忆），由当前会话模型结合当前语境通过 memory_judge 提交；β 是信赖度（-10~10 固定常量，不参与回忆决策，只提示阅读模型），不提供配置项。scoring 段是 v1.4.0 评分流水线：任务区块 token 预算 min(scoring.taskMaxTokens, 窗口×taskBudgetPercent%)、pending 背压 scoring.maxPending、heuristic 兜底 scoring.fallback 与 autoHeuristicAfterRounds（plain 4 / channel 2 回合）、任务列表排序 scoring.order（newest 默认，最新归档优先）。【关键词】match.expandLatinCase / match.cjkBigram 默认关（避免回归）。compat 段是 QQ 渠道兼容开关（dsh-onebot-qq / Derpyu520 qq-bridge）；qqBots=auto 时按 profile 里是否安装这两个插件自动启用，未安装时本段不产生任何行为。recall.espEmptyHint 是空召回时的低噪音提示开关，scoring.judgeTelemetry 是评分遥测开关（只记计数/比率，不含正文）。跨平台：storage.dir 与 compat.mediaRoots 支持 `~/`（或 `~\\`）展开到当前用户 home，Windows/Linux/macOS 通用；`~user` 不展开；其余路径仍按“绝对路径原样、相对路径相对插件目录（mediaRoots 相对当前目录）”解析。",
   "enabled": true,
   "compress": {
     "enabled": true,
@@ -13,6 +13,11 @@
     "maxFoldersPerRun": 500,
     "keepRecentMessages": 2,
     "maxBoundaryOvershoot": 1.25,
+    "protectCurrentTurn": true,
+    "allowSmallWindow": false,
+    "smallWindowTokens": 20000,
+    "hardLimitStop": true,
+    "maxFoldersPerStep": 500,
     "applyToSubagents": false,
     "applyToMainSessions": true,
     "preStepEnabled": true,
@@ -41,21 +46,95 @@
   },
   "recall": {
     "enabled": true,
+    "mode": "fair",
     "firstGenMax": 10,
+    "hops": 0,
+    "maxRecalledBlocks": 64,
+    "maxRecalledChars": 120000,
+    "maxWindowPercent": 10,
+    "minAlpha": 0,
+    "persistInjected": true,
+    "sort": "createdAt",
     "mu": 5,
     "sigma": 3,
     "maxGeneration": 0,
     "probabilityScale": 1,
     "seed": 0,
-    "sort": "createdAt",
+    "fairness": {
+      "thetaHigh": 0.6,
+      "exploreRatio": 0.2,
+      "specificProbeSlots": 1,
+      "rareTerm": {
+        "ratio": 0.002,
+        "minPosting": 8,
+        "scanCap": 512
+      },
+      "register": {
+        "lookahead": 3,
+        "capFactor": 8,
+        "ttlRounds": 2
+      },
+      "queryBoost": true,
+      "recycle": {
+        "enabled": true,
+        "cooldownRounds": 15,
+        "maxPerRound": 1
+      },
+      "ledger": {
+        "maxEntries": 10000,
+        "overflow": "evict-lowest-alpha-last-seen"
+      },
+      "blockTrim": {
+        "policy": "priority",
+        "protectCurrentQuery": true,
+        "pinHigh": true
+      },
+      "roundBudget": {
+        "maxChars": 20000
+      }
+    },
     "applyToSubagents": false,
     "applyToMainSessions": true,
-    "maxRecalledBlocks": 64,
-    "maxRecalledChars": 120000,
-    "persistInjected": true,
     "triggerSourceKinds": [
       "user"
-    ]
+    ],
+    "espEmptyHint": true
+  },
+  "time": {
+    "mode": "constrain",
+    "timezone": "Asia/Shanghai",
+    "minRangeDays": 3,
+    "maxRangeDays": 366,
+    "centerDayPriority": true,
+    "fallback": [
+      "day3",
+      "month",
+      "year",
+      "all"
+    ],
+    "fallbackMinResults": 1,
+    "windowScanMax": 4096,
+    "askUserHint": true,
+    "judgeEventTime": false
+  },
+  "scoring": {
+    "includeLegacy": false,
+    "maxPending": 200,
+    "fallback": "onPressure",
+    "autoHeuristicAfterRounds": {
+      "plain": 4,
+      "channel": 2
+    },
+    "taskBudgetPercent": 15,
+    "taskMaxTokens": 12000,
+    "order": "newest",
+    "warnUniformAlpha": true,
+    "maxItemsPerJudge": 100,
+    "judgeTelemetry": true
+  },
+  "match": {
+    "expandLatinCase": false,
+    "cjkBigram": false
   },
   "storage": {
     "dir": "memory",

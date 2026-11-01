@@ -23,6 +23,280 @@ The project follows a lightweight [SemVer](https://semver.org/) scheme.
 - **文档**：`docs/PUBLISHING.md` 重写为「一条命令发版（推荐）+ 首次环境准备 + 手动发版（备选/排障）+
   发布前自检清单」，补充 npm 2FA/EOTP、npm 异步发布、Windows schannel TLS、`--resume` 续发等排障说明。
 
+## [1.4.0] — 2026-11-01
+
+本版本完成四件事，**旧数据无需迁移**（旧 `index.json`、旧 `recall-state.json` v2/v1、旧 pending 全部可读；
+新字段一律 optional、有值才写）：
+
+1. **召回确定性 + 公平性（默认行为变化）**：用 FAIR-DRI 确定性选择替换 v1.3.0 的 α 概率掷骰。
+   **α 从「回忆概率乘数」变成「确定性优先级」**：高 α 记忆被查询命中后首轮必现，低 α 记忆不被丢弃、
+   有有界最迟召回；block 裁剪从 createdAt FIFO 改为优先级裁剪（高 α pin）；同一输入多次召回结果完全一致；
+   `memory_recall` 支持 `offset` 分页。保留 `recall.mode='deterministic'`（纯 DRI 研究对照）与
+   `recall.mode='legacy'`（v1.3.0 概率路径原样保留，一键回滚）。
+2. **时间辅助**：`memory_recall` 新增 `timeFrom/timeTo/granularity/offset`（日/月/年/epoch，最小连续 3 天，
+   中心日→±1 天→月→年→全库阶梯放宽，纯时间浏览）；建立**纯内存**日/月/年时间索引（不落盘、不搬动 folder）。
+   澄清语义：`createdAt` 是**归档时间**，不是事件时间；事件时间存在可选 `eventStart/eventEnd` 字段，
+   旧数据安全回退归档时间。
+3. **评分流水线与遗留数据**：新增数据时代分桶（legacy/synthetic/current）、任务区块 token 预算、pending 背压、
+   heuristic 兜底、评分质量告警与 judge 遥测；pre-1.2.0 遗留与压测遗留**只标记不重评**；
+   当前真实待评分口径 **2/369 = 0.54%**（1.3.0 后正常会话 b5eeee7e 为 0/359 = 0%）。
+4. **归档与健壮性**：修复 P0-1（自指反馈环）、P0-2（pending 永不参与召回）、P0-3（当前回合被中途归档）、
+   P0-6（评分任务 FIFO 饿死新记忆）、P1-1（再归档误删刚注入记忆）、P1-4（commit 无回滚/不幂等）、
+   P1-6（小窗口自毁/假窗口）等 1.3.0 已确认缺陷。
+
+### 确定性召回 + 公平性（FAIR-DRI）
+
+#### Added
+
+- **`engine/recall-index.js`（新）**：FAIR-DRI 确定性选择器，导出
+  `buildRecallIndex` / `querySeeds` / `countCandidates` / `selectRecall` / `selectSigma` /
+  `comparePriority` / `emptyLanes` / `serializeLanes` / `deserializeLanes` / `lanesFingerprint` /
+  `trimBlock` / `simulateTurns` / `summarizeGuarantees`。要点：
+  - 全局优先级 `σ = (alpha desc, createdAt asc, id asc)`；每个关键词 posting 按 σ 有序，查询是 k 路归并；
+  - 8 步车道（严格顺序）：`rareHigh`（稀有词即时道）→ `queryBoost`（被裁高α查询重入）→
+    `register`（上轮 defer 的高α，2 轮 TTL）→ `σ 高车道`（剩余高α名额，lookahead 溢出进寄存器）→
+    `lowProbe`（低α显式引用探针）→ `rotation`（低α全局轮转）→ `recycle`（回收道，15 轮冷却）→
+    `commit`（优先级 block 裁剪）；
+  - 配额：`k = recall.firstGenMax`（10）、`r = max(1, min(k-1, round(k×exploreRatio)))`（默认 2，低α轮转）、
+    `k_H = k - r`（默认 8，高α车道）、`θ_H = 0.6`、稀有词 `τ = max(8, ceil(0.002×N))`；
+  - **选择零随机**：模块内无 `Math.random` 参与选择，`Date.now()` 只用于缓存时间戳；
+  - Aho-Corasick 关键词匹配（contains 模式，CJK 子串 / Latin 词边界），与 `engine/tokenize.js` 语义一致；
+  - 分页：`offset/limit` 在候选集上确定性分页，`+1` lookahead 计算 `hasMore`；
+  - **block 优先级裁剪**：裁剪键 `(是否不在本轮候选集, α<θ_H, α asc, injectedRound asc, id)`，
+    高α pin（block 里同时有低α时绝不裁高α），`maxChars` 硬限至少保留 1 条。
+- **`engine/keyword-match.js`（新）**：双向关键词匹配 + 质量分（`matchKeywords` / `hasMatch`）——
+  保留 v1.3.0 方向（folder 关键词 ⊆ 用户话，无回归）并新增“用户 token 出现在多词 folder 关键词里”；
+  `match.expandLatinCase` / `match.cjkBigram` 可选（默认关，只增不减）。
+- **`recall.mode`（新配置）**：`'fair'`（默认）/ `'deterministic'` / `'legacy'`。
+- **`recall.fairness`（新配置块）**：`thetaHigh` / `exploreRatio` / `specificProbeSlots` /
+  `rareTerm{ratio,minPosting,scanCap}` / `register{lookahead,capFactor,ttlRounds}` / `queryBoost` /
+  `recycle{enabled,cooldownRounds,maxPerRound}` / `ledger{maxEntries,overflow}` /
+  `blockTrim{policy,protectCurrentQuery,pinHigh}` / `roundBudget{maxChars}`。
+- **`recall.hops` / `recall.maxWindowPercent`（新配置）**：后代扩展轮数（默认 0）与 block 的窗口比例上限（默认 10%）。
+- **`recall.minAlpha`（引擎键）**：查询期 α 下限（QQ 群成员门控由 `compat.memberMinAlpha` 覆盖）。
+- **`recall-state.json` v3**：新增 `round` / `configFingerprint` / `lanes`（frontier、exploreCursor、
+  pendingHigh、highRecycle、recycle）/ `ledger` / `counters{reInjections,registerDrops,recallTimeEvicted,timeMisses}` /
+  `degraded`；读 v2 只恢复 block（ledger/lanes 重置，允许有界重复、不丢记忆），读 v1 仍按 ids 重建；写回 v3。
+- **`memory_recall` 分页**：`offset` 参数（0..10000，默认 0）；结果渲染“本页：第 N～M 条 / 还有更多：可用 offset=… 继续翻页”。
+- **lane/保证遥测**：`recall` 事件新增 `mode/candidates/lanesPicked{…}/pops/frontierHits/registerDrops/
+  reInjections/degraded/timeFiltered/timeWindow/offset/limit/hasMore/missType`，`added[].lane` 记录来源车道。
+- **`tools/selfcheck.mjs` 新检查 `recall fairness`**：聚合 lane 分布、`registerDrops`、`degraded`、`missType`、
+  `guarantees`（meanPicks / highAlphaLaneShare）；旧遥测缺字段只 INFO。
+
+#### Changed（行为变化，务必注意）
+
+- **α 语义**：从“第一代命中后以概率 α 掷骰加回”改为“确定性优先级”——σ 排序第一位是 α，
+  α ≥ θ_H 走高α车道，高α被稀有词命中当轮必现；**α=0.1 的单次命中率不再≈10%**，低α也不会被彻底抛弃。
+- **召回结果确定性**：同一记忆库 + 会话状态 + 查询 → 结果完全一致（不再有随机重掷；要翻更多结果用 `offset` 分页）。
+- **block 裁剪**：从 createdAt FIFO 改为优先级裁剪（先裁“本轮查询没命中 + 低α + 更早注入”），
+  高α pin；被裁高α进 `highRecycle` 等 `queryBoost` 重入，被裁低α进 `recycle` 15 轮冷却后重入。
+- **每轮注入量**：`k` 条封顶（v1.3.0 第 2 代起无上限，单轮可洪泛 157–652 条 / 26–110 万字符）。
+- **`recall.fairness.rareTerm.scanCap`**：限制参与“稀有词”判定的 seed 数（默认 512），防止长文本爆炸。
+- **`deterministic` 模式**：只做纯 DRI + sticky ledger + 优先级裁剪（无 rareHigh/queryBoost/register/rotation 公平逻辑），
+  供研究对照；`legacy` 模式保留 v1.3.0 全部行为。
+
+#### Fixed
+
+- **P0-4 召回逐候选随机掷骰**：同一记忆时有时无、α=0.1 单次命中≈10%、seed>0 时每轮 RNG 相同、p(n)=0 for n≥22——
+  fair/deterministic 路径已无随机；legacy 保留公式仅用于回滚对照。
+- **低α挤掉高α**：v1.3.0 概率洪泛 + createdAt FIFO 会持续把较早的高α挤出 block；1.4.0 由 σ 高车道 +
+  优先级裁剪 + queryBoost 重入修复（block 内高α占比由仿真 ~22% 提升到 86–97%）。
+- **`memory_recall` 命中失败后无路可走**：fair 模式下低α显式引用走探针、其余可 `offset` 翻页；
+  `missType='time'` 明确告诉模型“关键词对了、时间不对”。
+
+### 时间辅助（v1.4.0 新增）
+
+#### Added
+
+- **`engine/time-index.js`（新）**：纯内存日/月/年索引 + 时间查询归一化，导出
+  `TIME_DEFAULTS` / `detectGranularity` / `normalizeTimeQuery` / `folderTimeRange` / `buildTimeIndex` /
+  `queryTimeIndex` / `timeFallbackLadder` / `zonedDayStart` / `zonedMonthStart` / `zonedYearStart` /
+  `dayKey` / `addZonedDays` / `formatWindow` / `validateTimezone` / `timeConstraintEnabled`。
+  时区用 `Intl.DateTimeFormat`（绝不 ±86400000 推日界）；匹配规则唯一：folder 半开区间
+  `[start,end)` 与查询窗口 `[from,to)` 重叠；索引只从 `index.json` 派生、**不落盘**，
+  index mtime/时区变化时惰性重建；`time.mode='off'` 时零行为。
+- **`time` 配置块（新）**：`mode` / `timezone` / `minRangeDays` / `maxRangeDays` / `centerDayPriority` /
+  `fallback` / `fallbackMinResults` / `windowScanMax` / `askUserHint` / `judgeEventTime`。
+- **`memory_recall` 时间参数**：`timeFrom` / `timeTo`（`'2026-10-31'`/`'2026-10'`/`'2026'`/epoch）与
+  `granularity`（day/month/year）；只传时间不传关键词 = **纯时间浏览（browse）**，按事件时间升序并标注；
+  最小 3 天（跨度不足以中心扩到 3 天）、最大 366 天、未来钳制、反向对调、非法降级不抛错。
+- **事件时间采集**：归档时把消息 `time` 机械采集为 `eventStart=min(time)` / `eventEnd=max(time)+1` /
+  `eventTimeSource='messages'`（`engine/compress.js` 的 `eventTimeRangeOf`；被动归档同写）；
+  旧数据无事件字段 → 回退 `[createdAt, createdAt+1)`（`eventTimeSource='archive'`），不阻断升级。
+- **index/folder 新可选字段**：`eventStart` / `eventEnd` / `eventTimeSource`（`'messages'|'judge'|'archive'`）；
+  `engine/store.js` 的 `indexEntryFromMeta` 显式拷贝，read→write→read 不丢。
+- **`engine.recall` 时间参数与返回**：返回 `timeWindow:{from,to,level,granularity,widenedTo,requested,enforced,
+  hardWindow,hits,timezone}` 与 `missType:'time'|'keyword'`；时间过滤只作用于 `C(Q)∩W`（第一代），
+  rank 定义在过滤后的候选集上（否则界不成立）。
+- **`tools/time-view.mjs`（新，只读）**：按事件时间列出某个窗口内的记忆（`--memory/--from/--to/--json`），
+  从不写任何文件。
+- **`engine/cli.mjs`**：`recall` 新增 `--time-from/--time-to/--granularity/--offset/--limit/--mode`，
+  省略 `--text` 但有时间参数 = 纯时间浏览；输出新增 `browsing/mode/page:{offset,limit,returned,candidates,hasMore}/
+  timeWindow:{…}/missType`，additions 带 `lane`；`compress` 新增 `--allow-small-window`，输出
+  `protectedTurn/smallWindow/maxFoldersCapped/eventTime`。
+- **`tools/selfcheck.mjs` 新检查 `time index`**：CSR 时间索引与 folder 事件区间一致（50 条交叉核对）、
+  时区可解析、`constrain` 过滤与朴素区间判断一致、`off/index` 永不改变召回。
+
+#### Changed
+
+- **`createdAt` 语义澄清**：它是**归档时间（archivedAt）**，不是事件时间；时间查询用事件区间，
+  旧数据回退归档时刻。文档/README/SPEC 已写明，代码不改字段名、不迁移。
+- **engine 默认 `time.mode='index'`，随包 `config.json` 默认 `'constrain'`**；`time.timezone` engine 默认
+  `''`（宿主本地）、随包 `'Asia/Shanghai'`。两处有意不同，由 `test/config-consistency.test.mjs` 钉住。
+- **`time.mode='off'`**：忽略时间参数并返回 warning；`'index'`：归一化但**不过滤**（`enforced=false`，
+  工具需提示“未启用时间约束”）；`'constrain'`：过滤。
+- **显式同时给 `timeFrom`+`timeTo` = 硬窗口**（不放宽）；单日/单月/单年 = 软窗口（走阶梯放宽）。
+
+#### Fixed
+
+- **G4 时间约束**：日/月/年/范围正确、最小 3 天归一、空白/非法/未来时间安全降级、旧数据无 eventTime 时回退；
+  30+ 条边界/时区/闰年/跨日/区间重叠用例覆盖。
+- **“时间错”与“关键词错”混淆**：过滤前有候选、过滤后为 0 → `missType='time'`，不计入 `memory_recall` 的
+  3/6 次连败，并提示可向用户询问期望时间。
+
+### 评分流水线与遗留数据
+
+#### Added
+
+- **`engine/era.js`（新）**：数据时代判定唯一真相——`LEGACY_ERA_CUTOFF_MS=Date.parse('2026-10-27T19:14:00Z')`、
+  `SYNTHETIC_WINDOW_TOKENS=32000`、`SYNTHETIC_BEFORE_PERCENT=500`、`STRESS_MIN_FOLDERS=100`、
+  `STRESS_MIN_PENDING=100`；导出 `sessionEraSignals`/`sessionEra`/`classifyFolderEra`/`summarizeEras`。
+  规则：`legacy` 按 folder（createdAt 边界或 `pendingEra` 标记优先）；`synthetic = fakeWindow && (folders>=100 || pending>=100)`；
+  其余 `current`。真实数据：legacy 593（587 pending）/ synthetic 2780（2180）/ current 369（2 pending）。
+- **`tools/memory-audit.mjs`（新）**：只读时代审计（`--json` / `--verbose` / `--limit` / `--apply` / `--help`）。
+  默认不写任何文件；`--apply` **只**在 `index.json` 的 folder 条目写 `pendingEra` 标记，不动
+  `meta.json`/`scored`/`alpha`/`keywords`/`createdAt`/遥测，不重评、不删除。
+- **`scoring` 配置块（新）**：`includeLegacy` / `maxPending` / `fallback` / `autoHeuristicAfterRounds{plain,channel}` /
+  `taskBudgetPercent` / `taskMaxTokens` / `order` / `warnUniformAlpha` / `maxItemsPerJudge`。
+- **任务区块预算**：整块 ≤ `min(scoring.taskMaxTokens=12000, 窗口×scoring.taskBudgetPercent=15%)`；
+  待评分与待复核同时存在时待评分最多占 60%（pending 60% / rescore 40%）；单条 <60 token 时截断并提示。
+- **任务区块排序与标签**：`scoring.order='newest'`（默认，最新归档先评分）、`mixed`、`oldest`（v1.3.0 FIFO 回滚）；
+  每条显示 `pendingSince` 年龄与内容类型标签（tool/decision/user）。
+- **pending 背压**：归档前 `pendingCount > scoring.maxPending`（200）→ 按 `scoring.fallback` 暂停归档或降级 heuristic；
+  `compress-applied` 记 `pendingAtArchive`/`pendingCount`/`pendingRounds`。
+- **heuristic 兜底**：`scoring.fallback='onPressure'`（默认）时，普通会话连续 4 轮 / QQ 通道连续 2 轮 pending 未消化即降级
+  heuristic 评分（`meta.scoreMode='heuristic'`，可审计）；`'always'` 强制、`'never'` 关闭。
+- **评分来源标记**：所有归档路径统一写 `meta.scoreMode='model'|'heuristic'`、`meta.archivedByVersion=<插件版本>`、
+  `meta.archivedFrom='adapter'|'passive'`、`meta.pendingSince`。
+- **`memory_judge` 批量上限**：`updates` 超过 `scoring.maxItemsPerJudge`（100）→ 拒绝并提示分批提交。
+- **评分质量告警（非阻断）**：同批 keywords 重复率 >50%、α 或 β 全同、`reason` 缺失率 >90% → `warnings`；
+  不改变已写入的评分。
+- **judge 遥测（P2-5）**：每次 `memory_judge` 写一条 `type:'judge'` 事件
+  `{sessionId,batchSize,updated,kept,rejected,elapsedMs,uniformAlphaRate,keywordRepeatRate,reasonMissingRate}`，
+  **不含正文/关键词原文**；`scoring.judgeTelemetry=false` 可关。
+- **`tools/recall-report.mjs`**：新增 `lanes (v1.4.0)` / `time filter` / `pending era` 三行。
+
+#### Changed
+
+- **`selfcheck` 时代分桶**：新增 `pending era` 检查——legacy/synthetic 只 INFO，**只对 current 判 WARN/FAIL**
+  （WARN >5% 且 >20 条；FAIL >20%；current <20 个 folder 时不判 FAIL）。
+- **`selfcheck` 真实数据口径**：本机检测到 QQ 插件时 **10 pass / 1 warn / 0 fail**；neutral profile 下
+  **4 pass / 1 warn / 0 fail**。
+- **遗留下沉**：`scoring.includeLegacy=false`（默认）时 legacy/synthetic pending **不进入**任务区块、
+  不占用模型评分轮次；当前真实待评分只有 2 条（QQ 通道）。
+
+#### Fixed
+
+- **P0-1 自指反馈环**：任务区块自身是 system prompt 的一部分，v1.3.0 会随归档增长反过来触发下一轮归档；
+  1.4.0 给任务区块加硬 token 预算，并只列 current pending。
+- **P0-2 pending 永不参与召回 / 普通 WebUI 无 heuristic 兜底**：评分兜底策略 + 背压 + 质量告警落地；
+  未评分记忆仍按契约不参与召回，但会在积压/通道不可用时自动降级 heuristic 保证可回忆。
+- **P0-6 评分任务 FIFO 饿死新记忆**：默认 `newest` 优先，最新归档先进入任务区块。
+- **P2-5 评分不可观测**：judge 遥测落地。
+- **数据口径混淆（“81.8% pending”）**：时代分桶后明确当前真实口径 2/369 = 0.54%；
+  pre-1.2.0 遗留 587 与 a46 压测 2180 **默认不回补**，只标记 `pendingEra`。
+
+### 归档与健壮性
+
+#### Added
+
+- **`compress` 新配置**：`protectCurrentTurn=true` / `allowSmallWindow=false` / `smallWindowTokens=20000` /
+  `hardLimitStop=true` / `maxFoldersPerStep=500`。
+- **`planCompression` 新可选入参**：`protectTurn` / `protectSeq` / `pendingCount` / `windowTokens` /
+  `allowSmallWindow` / `maxFolders` / `eventTimes`（全部向后兼容）。
+- **plan 只读字段**：`protectedTurn` / `protectedStart` / `smallWindow` / `maxFoldersCapped` / `maxFolders` /
+  `releaseTokens` / `releaseCapped` / `eventTime` / `eventTimeSourceCounts` / `pendingAtArchive`，
+  以及失败 `reason ∈ 'protected-turn'|'no-legal-cut'|'small-window'|'window-conflict'|'hard-limit'`。
+- **commit 事务（P1-4）**：先写 folder → 最后写 index；写 `.commit-<id>.json` journal，
+  异常时回滚已写 folder + 图片 + 内存索引并 **rethrow** 原错误（附加 `error.rolledBack=true` /
+  `error.writtenFolderIds`）；load 与每次 commit 开头清理陈旧 journal（只删 journal 文件，**绝不删 folder**）。
+- **幂等键**：`(sessionId, turn, seqStart, seqEnd, contentHash)`（取代 v1.3.0 依赖 createdAt 的弱幂等）。
+- **`engine/store.js` 新导出**：`removeFolder` / `beginCommitJournal` / `finishCommitJournal` /
+  `cleanupCommitJournals`、`PENDING_ERAS` / `SCORE_MODES` / `ARCHIVE_SOURCES` / `EVENT_TIME_SOURCES`。
+- **`compress-applied` 新遥测**：`pendingAtArchive`/`pendingCount`/`smallWindow`/`protectedTurn`/`foldersPlanned`/
+  `foldersCommitted`/`rollback`/`maxFoldersCapped`/`eventTimeSourceCounts`/`scoreMode`/`archivedByVersion`。
+
+#### Changed
+
+- **删除 v1.3.0 的 arbitrary fallback cut**：找不到合法切点（例如会切断当前回合）时**拒绝归档**，不再“随便切一刀”。
+- **hardLimit 硬停止**：连续 2 个压力 episode 仍无法降到 `hardLimitPercent` 以下 → 停止该会话自动归档并 WARN 一次
+  （不再每个 pre-step 重试、越推越高）；`hardLimitStop=false` 恢复旧行为。
+- **小窗口/假窗口 sanity**：窗口 < `smallWindowTokens`、配置窗口与宿主窗口相差 >4×、或实测上下文 >窗口 500% 且
+  `allowSmallWindow!=true` 时**跳过自动归档**（每会话只 WARN 一次）。
+- **pass-0 再归档**：本回合刚注入的 additions 受保护（`injectedTurn`），多步工具回合不再被自己删掉刚召回的记忆。
+- **单步归档上限**：`maxFoldersPerStep` 与“剩余窗口可释放量”取小，`maxFoldersCapped` 可观测。
+
+#### Fixed
+
+- **P0-3 当前回合问题被中途归档**：`protectTurnOf` 计算当前 turn 保护区间，`planCompression` 的 `protectSeq`
+  保证移除前缀不越过它；无合法切点拒绝归档。
+- **P1-1 同回合 pass-0 误删刚注入的 recall additions**：`injectedTurn` 保护。
+- **P1-4 commit 部分失败无回滚 / 重试不幂等**：事务 + journal + contentHash 幂等键。
+- **P1-6 小窗口自我增压 / hardLimit 只告警**：小窗口 sanity + 硬停止 + 单步上限 + 假窗口 guard。
+- **`tokensUpTo(-1)=Infinity` 的假窗口退化告警**：修正为有限值。
+
+### 兼容性、迁移与回滚
+
+- **无需迁移**：旧 `index.json`（version 1，无新字段）可读；新字段全部 optional（有值才写，缺省不写）；
+  旧 `recall-state.json` v2/v1 可读（v2 只恢复 block、ledger/lanes 重置；v1 按 ids 重建），写回 v3；
+  旧 config 缺新键 → 全部走默认；旧 pending 照常可被评分/召回。
+- **不重写旧数据**：1.4.0 不批量重评、不改写旧 `meta.json`；`memory-audit --apply` 也只写 `pendingEra` 标记。
+- **遗留数据处置（用户已拍板）**：pre-1.2.0 遗留 587 + a46 压测 2180 **默认不回补**；
+  `scoring.includeLegacy=false` 让它们不进入评分任务区块；当前真实待评分口径 **2/369 = 0.54%**；
+  1.3.0 之后正常会话 b5eeee7e 为 **0/359 = 0%**。
+- **回滚开关（一档一开关）**：
+  - `recall.mode='legacy'` → 回到 v1.3.0 概率召回（含随机掷骰/代数公式）；
+  - `time.mode='off'` → 关闭时间辅助（不采集/不建索引/忽略时间参数）；
+  - `scoring.fallback='never'` → 关闭 heuristic 兜底（pending > maxPending 时暂停归档）；
+  - `compress.protectCurrentTurn=false` + `allowSmallWindow=true` + `hardLimitStop=false` → 恢复 v1.3.0 归档行为（不推荐）；
+  - `scoring.order='oldest'` / `scoring.includeLegacy=true` → 恢复 v1.3.0 的任务区块排序/时代口径。
+- **QQ 通道与跨平台不变**：compat 行为、三平台矩阵与 v1.3.0 一致；`compat.memberMinAlpha` 门控在 fair 模式下
+  仍作为查询期 α 过滤。
+
+### 文档、配置与版本
+
+- **README**：新增 §1.3（确定性召回/三模式/公平性 G1–G3）、§1.10（时间辅助）、§1.11（遗留数据口径）、
+  §3.0 配置默认值表与 §3.0.6 回滚开关；α 语义、recall-state v3、小窗口限制、任务预算/背压/质量告警、
+  工具与目录结构、English summary 全部同步。
+- **docs/SPEC.md**：§2 默认值（含 v1.4.0 全部新键与产品覆盖说明）、§3 数据格式（index 新字段/recall-state v3/
+  时间索引纯内存）、§4.5 数据时代、§4.6 评分流水线、§5.7 归档保护与事务、§6.1–§6.8（legacy/FAIR-DRI/
+  lane 状态/block 裁剪/分页/关键词匹配/渲染/时间辅助）、§9 遥测、§10 测试矩阵、§11 平台契约不变。
+- **docs/VERIFICATION.md**：新增 §20「v1.4.0 验证记录」（公平性/时间/小窗口/数据时代/兼容/性能/用例数）。
+- **`config.json`**：写入全部新键的产品默认值（`recall.mode='fair'`、`time.mode='constrain'`、
+  `time.timezone='Asia/Shanghai'`、`scoring`/`time`/`match` 全量、`compress` 5 新键），
+  `compress.triggerPercent` 保持 **60**，`_readme` 增补 1.4.0 说明；保留 `compat`/`logging`/`test`/
+  `storage.perSession` 等既有键。
+- **版本**：`package.json` 与 `engine/package.json` → **1.4.0**。
+- **`test/config-consistency.test.mjs`（新）**：断言 `DEFAULT_CONFIG` == 随包 `config.json`（除两处有意的
+  `time` 产品覆盖）== 文档中的关键默认值，且两个 `package.json` 版本一致 = 1.4.0。
+
+### 已知限制
+
+- 公平性保证有前提：高α首轮保证要求稀有高α候选 ≤ k_H 且高α到达率 ≤ k_H/轮；低α轮转界要求 `a_low < r`；
+  超过时 `degraded=true` / `registerDrops>0` 会出现在遥测与日志（配额不足，不是丢记忆）。
+- 确定性选择意味着“同样条件不会自己变化”：要翻更多结果用 `memory_recall` 的 `offset` 分页。
+- 旧数据没有事件时间（本机 0/4825 消息带 time）：历史记忆的时间查询回退归档时刻，直到新归档产生事件时间。
+- heuristic 兜底质量低于模型评分（α 启发式、β=0、关键词 tokenizer），只保证可回忆、不保证准。
+- 时间辅助不建物理日/月/年目录；不要手工按日期搬 folder（会被判定为数据损坏）。
+- 1.4.0 不开放 `memory_judge` 的 eventTime 覆写（`time.judgeEventTime=false`，留 1.4.1 评估）。
+
+### Tests
+
+- v1.4.0 新增/扩展测试：`test/recall-index.test.mjs`、`test/time-index.test.mjs`、`test/keyword-match.test.mjs`、
+  `test/turn-protection-engine.test.mjs`、`test/memory-audit.test.mjs`、`test/config-consistency.test.mjs`，
+  以及 `test-adapter/` 的公平性/确定性/评分压力/时间工具适配用例；最终全量数字以
+  `docs/VERIFICATION.md` §20 为准（本条目不改写历史 v1.3.0 的 493 用例基线）。
+
 ## [1.3.0] — 2026-10-31
 
 本版本完成两件事：**QQ 渠道兼容**（`dsh-onebot-qq` 与 `Derpyu520/qq-bridge` 的「归档 → 评分 → 回忆」

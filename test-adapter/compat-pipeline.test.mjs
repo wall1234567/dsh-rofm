@@ -228,6 +228,9 @@ const BASE_OVERRIDES = {
     triggerPercent: 1,
     compressPercent: 20,
     contextWindowTokens: 1000,
+    // 1.4.0 small-window sanity: the 1000-token fake window is explicit here.
+    allowSmallWindow: true,
+    smallWindowTokens: 20000,
     minContextTokens: 0,
     minMessagesToCompress: 4,
     minChunkChars: 50,
@@ -253,6 +256,9 @@ const BASE_OVERRIDES = {
   importance: { min: 0.01, max: 1, warnAbove: 0.8 },
   keywords: { min: 3, max: 8 },
   logging: { enabled: true, verbose: true },
+  // The task-block budget/era filter are covered by scoring-pressure.test.mjs;
+  // these compat tests need the full rubric to be rendered.
+  scoring: { includeLegacy: true, taskMaxTokens: 1000000, taskBudgetPercent: 100 },
 }
 
 function withTempDir(fn) {

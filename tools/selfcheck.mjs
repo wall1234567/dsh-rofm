@@ -24,21 +24,47 @@
  *                      stats.jsonl lines are valid JSON.
  *   4. recall state  — every recall-state.json is a valid v2 snapshot with safe,
  *                      consistent ids/additions.
- *   5. session logs  — replay `surfaceOp` append/replace from the zstd frames to
+ *   5. pending era   — v1.4.0 data-era buckets via `engine/era.js` (one truth):
+ *                      legacy / synthetic / current folders+scored+pending.
+ *                      Legacy and synthetic pending are historical residue and
+ *                      are reported as INFO only; only CURRENT pending can
+ *                      WARN (>5% and >20 pending) or FAIL (>20%), judged only
+ *                      when the current bucket has >= 20 folders. Existing
+ *                      `index.pendingEra` marks are trusted (they win); stale
+ *                      marks are counted and reported.
+ *   6. time index    — engine/time-index.js CSR day/month/year buckets agree with
+ *                      the documented folder event intervals (sampled folders
+ *                      cross-checked against an independent naive interval test),
+ *                      `time.mode` is legal and `time.timezone` parses; the
+ *                      non-constraining modes ('off'/'index') must never filter.
+ *   7. recall fairness — v1.4.0 recall telemetry (`lanesPicked`, registerDrops,
+ *                      degraded, timeFiltered, missType, ...) aggregated into a
+ *                      distribution + guarantee summary. Real data from before
+ *                      1.4.0 has no such fields → PASS with an INFO note; a
+ *                      missing field degrades to INFO, never FAIL.
+ *   8. session logs  — replay `surfaceOp` append/replace from the zstd frames to
  *                      the final surface; at most one dsh-rofm checkpoint note
  *                      (more → WARN, legacy residue from before note merging), N is a positive integer,
  *                      the note appendix must not carry re-injected infrastructure
  *                      (runtime/time/skill context, in-history system copies,
  *                      recall snapshots); foreign checkpoints are counted but
  *                      never fail.
- *   6. compat        — v1.3.0 QQ channel compatibility, reported only when the
+ *   9. compat        — v1.3.0 QQ channel compatibility, reported only when the
  *                      feature is actually relevant (a QQ plugin is detected or
  *                      `<memoryDir>/.compat-state.json` exists): profile
  *                      detection, session-id → stable chat-key parsing, and the
  *                      Derpyu tool-whitelist autopatch state. These checks are
  *                      PASS/WARN only and never FAIL; with no QQ plugin and no
  *                      state file they add no line at all (v1.2.1 output parity).
- *   7. test suite    — optional (`--with-tests`): `node --test` exits 0.
+ *  10. test suite    — optional (`--with-tests`): `node --test` exits 0.
+ *
+ * v1.4.0 data-era policy (plan §3.4 / contract §5.9): `legacy` is a *per-folder*
+ * property (`createdAt < 2026-10-27T19:14:00Z` or an existing `pendingEra` mark);
+ * the session-level era is only `synthetic` | `current` (`fakeWindow &&
+ * stressBacklog`). Reports keep both views separate: `tools/memory-audit.mjs
+ * --json` exposes session `era` AND folder-bucket `dominantEra`, and never
+ * merges them. Legacy/synthetic pending is never re-judged in 1.4.0, so it is
+ * INFO — only the current-real pending percentage is actionable.
  *
  * Legacy data policy: historical shapes that older versions legitimately wrote
  * are reported as WARN, never FAIL. A session whose final surface still carries
@@ -113,6 +139,30 @@ const TEST_SUITE_TIMEOUT_MS = 10 * 60 * 1000
 /** Hard cap on collected issue records (counts are never capped). */
 const ISSUE_RECORD_LIMIT = 200
 
+/**
+ * v1.4.0 data-era bucket thresholds (plan §3.4, contract §5.9).
+ *
+ * Legacy (pre-1.2.0) and synthetic (1.2-1.3 pressure test) pending are
+ * historical residue that 1.4.0 deliberately does not re-judge: they are
+ * reported as INFO and never change the check status. Only CURRENT pending —
+ * real unjudged work on a normal session — is actionable:
+ *   - WARN when the current pending share is above 5% *and* more than 20 folders
+ *     are pending;
+ *   - FAIL when it is above 20%;
+ *   - neither is judged on a current bucket smaller than 20 folders (one pending
+ *     folder out of two is 50% but says nothing about the pipeline).
+ * The documented 2026-11-01 snapshot is 2/369 = 0.54% → INFO/PASS.
+ */
+const ERA_CURRENT_WARN_PERCENT = 5
+const ERA_CURRENT_WARN_MIN_PENDING = 20
+const ERA_CURRENT_FAIL_PERCENT = 20
+const ERA_CURRENT_MIN_FOLDERS = 20
+
+/** Max index folders cross-checked against the naive interval judgement. */
+const TIME_INDEX_SAMPLE_FOLDERS = 50
+/** Max records kept per v1.4.0 check issue/warning list (counts are exact). */
+const ERA_CHECK_RECORD_LIMIT = 50
+
 const USAGE = `dsh-rofm selfcheck (zero dependencies) — independent health check for the v1.2.0
 memory plugin. Exits 1 when at least one check fails, 0 otherwise.
 
@@ -132,9 +182,28 @@ Options:
   -h, --help              show this help
 
 Checks: config, engine defaults + planCompression smoke, memory store, recall
-state, session-log checkpoint notes, and (with --with-tests) the test suite.
+state, pending era buckets, time index, recall fairness, session-log checkpoint
+notes, and (with --with-tests) the test suite.
 When a QQ plugin is installed (or a compat autopatch state file exists) three
 PASS/WARN-only v1.3.0 compat lines are added: detection, chat keys, autopatch.
+
+Expected output depends on the detected QQ environment (this is the documented
+contract, not a bug):
+  - no QQ plugin detected      → 8 check lines  → "7 passed, 1 warnings, 0 failed"
+  - QQ plugin(s) detected      → 11 check lines → "10 passed, 1 warnings, 0 failed"
+    (with a patched whitelist; detection only ADDS compat lines and never
+    changes any other check).
+
+v1.4.0 data-era policy: legacy folders (createdAt < 2026-10-27T19:14:00Z, or an
+existing index pendingEra mark) and synthetic sessions (fake window + stress-level
+archive volume) are pre-1.4.0 residue — reported as INFO inside the "pending era"
+line and never WARN/FAIL. Only CURRENT pending is actionable: WARN above 5% with
+more than 20 pending folders, FAIL above 20% (judged only when the current bucket
+has at least 20 folders). "pending era" also shows pendingEra marks written by
+\`tools/memory-audit.mjs --apply\` and counts stale marks. legacy is a per-folder
+property: the session-level era is only synthetic|current, so the era line keeps
+both views separate (memory-audit --json exposes session era + dominantEra).
+
 PASS/WARN/FAIL lines are printed as:
   [PASS] <check> — <detail>
 followed by one platform line and the summary line:
@@ -189,6 +258,89 @@ function readJsonFile(file) {
 /** Read and parse `<memoryDir>/index.json`; never throws. */
 function readIndexFile(file) {
   return readJsonFile(file)
+}
+
+/** Round a percentage to two decimals without -0 (v1.4.0 checks). */
+function roundPercent(value) {
+  if (!Number.isFinite(value)) return null
+  const rounded = Math.round((value + Number.EPSILON) * 100) / 100
+  return Object.is(rounded, -0) ? 0 : rounded
+}
+
+/** Read one `stats.jsonl` as an event array (corrupt lines ignored; never throws). */
+function readStatsEventsFile(file) {
+  if (!isFile(file)) return []
+  let text = ''
+  try {
+    text = fs.readFileSync(file, 'utf8')
+  } catch {
+    return []
+  }
+  const events = []
+  for (const line of text.split(/\r?\n/)) {
+    const trimmed = line.trim()
+    if (!trimmed) continue
+    try {
+      const parsed = JSON.parse(trimmed)
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) events.push(parsed)
+    } catch {
+      /* best effort: the stats-line validity check owns the FAIL */
+    }
+  }
+  return events
+}
+
+/**
+ * Index folder entries of one store directory, or `null` when the index is
+ * unreadable (the memory-store check owns that FAIL; the v1.4.0 checks skip it).
+ */
+function readStoreIndexEntries(storeDir) {
+  const parsed = readIndexFile(path.join(storeDir, 'index.json'))
+  if (!parsed.ok || !parsed.value || typeof parsed.value !== 'object' || !Array.isArray(parsed.value.folders)) return null
+  return parsed.value.folders
+}
+
+/**
+ * Independent naive folder interval `[start, end)` for the time-index
+ * cross-check (selfcheck must not reuse `engine/time-index.js` for the expected
+ * value, or the check would compare the engine with itself).
+ *
+ * Documented rule (plan §3.3.2): `eventTimeSource` `messages`/`judge` uses
+ * `[eventStart, eventEnd)`, everything else falls back to
+ * `[createdAt, createdAt + 1)` (`archive`).
+ */
+function naiveFolderRange(entry) {
+  const folder = entry && typeof entry === 'object' ? entry : {}
+  const eventStart = Number(folder.eventStart)
+  const eventEnd = Number(folder.eventEnd)
+  const source = folder.eventTimeSource
+  if ((source === 'messages' || source === 'judge') && Number.isFinite(eventStart)) {
+    return {
+      start: eventStart,
+      end: Number.isFinite(eventEnd) && eventEnd > eventStart ? eventEnd : eventStart + 1,
+    }
+  }
+  const createdAt = Number(folder.createdAt)
+  const start = Number.isFinite(createdAt) ? createdAt : 0
+  return { start, end: start + 1 }
+}
+
+/** Counts helper for one era bucket. */
+function emptyEraBucket() {
+  return { folders: 0, scored: 0, pending: 0 }
+}
+
+/** Create the three era bucket counters. */
+function emptyEraBuckets() {
+  return { legacy: emptyEraBucket(), synthetic: emptyEraBucket(), current: emptyEraBucket() }
+}
+
+/** Add one bucket counter into another (in place). */
+function addEraBucket(target, source) {
+  target.folders += source.folders
+  target.scored += source.scored
+  target.pending += source.pending
+  return target
 }
 
 /** The DSH sessions root: `$DSH_HOME/sessions`, falling back to `~/.dsh/sessions`. */
@@ -322,6 +474,23 @@ export function parseArgs(argv) {
  */
 async function importEngineModule(name) {
   return import(pathToFileURL(path.join(ENGINE_DIR, name)).href)
+}
+
+/**
+ * Cached `engine/index.js` import shared by the v1.4.0 checks (era/time/fairness).
+ * A load failure is returned as `{ loadError }` instead of throwing, so a broken
+ * engine degrades those checks to WARN while the rest of the report still runs.
+ */
+let engineIndexModule = null
+async function loadEngineIndexModule() {
+  if (engineIndexModule === null) {
+    try {
+      engineIndexModule = await importEngineModule('index.js')
+    } catch (error) {
+      engineIndexModule = { loadError: error }
+    }
+  }
+  return engineIndexModule
 }
 
 /** Run the config check: engine/config.js + config.json + v1.2.0 knobs. */
@@ -1007,7 +1176,399 @@ function checkRecallState(report, memory) {
 }
 
 // ---------------------------------------------------------------------------
-// check 5 — session-log checkpoint notes
+// check 5 — v1.4.0 data-era pending buckets (engine/era.js is the only truth)
+// ---------------------------------------------------------------------------
+
+/** One `key=count` display string for a plain counter object (sorted keys). */
+function counterText(counter) {
+  const keys = Object.keys(counter).sort()
+  if (keys.length === 0) return 'none'
+  return keys.map((key) => `${key}=${counter[key]}`).join(', ')
+}
+
+/**
+ * Bucket every store's pending folders into legacy / synthetic / current using
+ * the shared `engine/era.js` rules, then judge ONLY the current bucket.
+ *
+ * Existing `index.pendingEra` marks are honoured by `summarizeEras`/
+ * `classifyFolderEra`; a second, mark-free classification of every marked folder
+ * detects stale marks (reported, and refreshable with memory-audit --apply).
+ * Legacy/synthetic pending is INFO — never WARN/FAIL.
+ *
+ * @param {ReturnType<typeof inspectMemory>} memory
+ */
+async function checkEraBuckets(report, memory) {
+  const data = {
+    memoryDir: memory.memoryDir,
+    exists: memory.exists,
+    note: 'legacy 是 folder 级属性（createdAt 或已有 pendingEra 标记）；会话级 era 只有 synthetic|current，等价 memory-audit --json 的 era / dominantEra，两者不合并',
+    thresholds: {
+      warnPercent: ERA_CURRENT_WARN_PERCENT,
+      warnMinPending: ERA_CURRENT_WARN_MIN_PENDING,
+      failPercent: ERA_CURRENT_FAIL_PERCENT,
+      minCurrentFolders: ERA_CURRENT_MIN_FOLDERS,
+    },
+    buckets: null,
+    totals: null,
+    currentPendingPercent: null,
+    stores: 0,
+    sessions: 0,
+    skipped: [],
+    markedFolders: 0,
+    inconsistentMarks: 0,
+  }
+  const engine = await loadEngineIndexModule()
+  const helpersReady =
+    !engine.loadError &&
+    typeof engine.sessionEraSignals === 'function' &&
+    typeof engine.sessionEra === 'function' &&
+    typeof engine.summarizeEras === 'function' &&
+    typeof engine.classifyFolderEra === 'function'
+  if (!helpersReady) {
+    const reason = engine.loadError ? oneLine(engine.loadError.message ?? engine.loadError) : 'missing engine/era.js exports'
+    addCheck(report, 'pending era', 'WARN', `engine/era.js helpers unavailable (${reason}); data-era bucketing skipped`, data)
+    return
+  }
+  const buckets = emptyEraBuckets()
+  const totals = { folders: 0, scored: 0, pending: 0 }
+  if (!memory.exists) {
+    data.buckets = buckets
+    data.totals = totals
+    addCheck(report, 'pending era', 'PASS', 'INFO: memory dir not found; no pending folders to bucket', data)
+    return
+  }
+  for (const store of Array.isArray(memory.stores) ? memory.stores : []) {
+    const storeDir = path.join(memory.memoryDir, store.dir)
+    const folders = readStoreIndexEntries(storeDir)
+    if (folders === null) {
+      data.skipped.push(`${store.dir}: index.json 不可读`)
+      continue
+    }
+    if (folders.length === 0) continue
+    const events = readStatsEventsFile(path.join(storeDir, 'stats.jsonl'))
+    const pending = folders.filter((entry) => entry && entry.scored === false).length
+    const session = engine.sessionEra({ folders: folders.length, pending, signals: engine.sessionEraSignals(events) })
+    const summary = engine.summarizeEras(folders, session)
+    data.stores += 1
+    data.sessions += 1
+    for (const era of ['legacy', 'synthetic', 'current']) {
+      buckets[era].folders += summary.folders[era]
+      buckets[era].scored += summary.scored[era]
+      buckets[era].pending += summary.pending[era]
+    }
+    totals.folders += summary.total
+    totals.pending += summary.pending.legacy + summary.pending.synthetic + summary.pending.current
+    totals.scored += summary.total - (summary.pending.legacy + summary.pending.synthetic + summary.pending.current)
+    // Stale-mark detection: classifyFolderEra trusts a mark, so re-classify
+    // without it to see whether the mark still matches the real data.
+    for (const entry of folders) {
+      if (!entry || typeof entry !== 'object' || entry.pendingEra === undefined) continue
+      data.markedFolders += 1
+      const freshEra = engine.classifyFolderEra({ ...entry, pendingEra: undefined }, session)
+      if (entry.pendingEra !== freshEra) data.inconsistentMarks += 1
+    }
+  }
+  data.buckets = buckets
+  data.totals = totals
+  const current = buckets.current
+  data.currentPendingPercent = current.folders > 0 ? roundPercent((current.pending / current.folders) * 100) : null
+  const currentPercent = data.currentPendingPercent === null ? 'n/a' : `${data.currentPendingPercent.toFixed(2)}%`
+  const infoText = `INFO: legacy pending ${buckets.legacy.pending} + synthetic pending ${buckets.synthetic.pending} (pre-1.4.0 residue, not re-judged)`
+  const currentText = `current pending ${current.pending}/${current.folders} = ${currentPercent} (WARN >${ERA_CURRENT_WARN_PERCENT}% with >${ERA_CURRENT_WARN_MIN_PENDING} pending, FAIL >${ERA_CURRENT_FAIL_PERCENT}%, judged only with >=${ERA_CURRENT_MIN_FOLDERS} current folders)`
+  const marksText = data.markedFolders > 0 ? `; pendingEra marks ${data.markedFolders} (stale ${data.inconsistentMarks})` : ''
+  let status = 'PASS'
+  let verdict = `within threshold${data.markedFolders > 0 ? `; marks ${data.markedFolders} (stale ${data.inconsistentMarks})` : ''}`
+  if (current.folders < ERA_CURRENT_MIN_FOLDERS) {
+    verdict = `current sample too small (${current.folders} folder(s) < ${ERA_CURRENT_MIN_FOLDERS}); thresholds not applied${data.markedFolders > 0 ? `; pendingEra marks ${data.markedFolders} (stale ${data.inconsistentMarks})` : ''}`
+  } else if (data.currentPendingPercent !== null && data.currentPendingPercent > ERA_CURRENT_FAIL_PERCENT) {
+    status = 'FAIL'
+    verdict = `current pending above the FAIL line${marksText}`
+  } else if (
+    data.currentPendingPercent !== null &&
+    data.currentPendingPercent > ERA_CURRENT_WARN_PERCENT &&
+    current.pending > ERA_CURRENT_WARN_MIN_PENDING
+  ) {
+    status = 'WARN'
+    verdict = `current pending above the WARN line${marksText}`
+  }
+  if (status === 'FAIL') addCheck(report, 'pending era', 'FAIL', `${verdict}; ${currentText}; ${infoText}`, data)
+  else if (status === 'WARN') addCheck(report, 'pending era', 'WARN', `${verdict}; ${currentText}; ${infoText}`, data)
+  else addCheck(report, 'pending era', 'PASS', `${infoText}; ${currentText}; ${verdict}`, data)
+}
+
+// ---------------------------------------------------------------------------
+// check 6 — v1.4.0 in-memory time index (CSR buckets vs folder event intervals)
+// ---------------------------------------------------------------------------
+
+/**
+ * Validate `engine/time-index.js` against the documented semantics with an
+ * independent naive interval judgement (never compare the engine with itself):
+ *
+ *   - `time.mode` is one of off/index/constrain and `time.timezone` parses;
+ *   - every sampled folder's `byId` range equals the naive
+ *     `[eventStart,eventEnd)` / `[createdAt,createdAt+1)` interval;
+ *   - a constrained `queryTimeIndex` window returns exactly the naive overlapping
+ *     id set (the real filter), while `mode !== 'constrain'`/'index' must return
+ *     `{ ids: null, count: folderCount }` (never filter);
+ *   - each folder appears in its own start-day CSR bucket.
+ *
+ * The cfg copy passed to the engine pins `time.mode='constrain'` (the shipped
+ * engine default is `'index'`, which by design never filters); the check would
+ * otherwise only ever see "no constraint" results.
+ *
+ * @param {ReturnType<typeof inspectMemory>} memory
+ * @param {object|null} config resolved config (engine/config.js loadConfig)
+ */
+async function checkTimeIndex(report, memory, config) {
+  const timeConfig = config && typeof config === 'object' && config.time && typeof config.time === 'object' ? config.time : {}
+  const data = {
+    memoryDir: memory.memoryDir,
+    mode: typeof timeConfig.mode === 'string' ? timeConfig.mode : 'index',
+    timezone: typeof timeConfig.timezone === 'string' ? timeConfig.timezone : '',
+    timezoneValid: null,
+    timezoneResolved: null,
+    sampleLimit: TIME_INDEX_SAMPLE_FOLDERS,
+    stores: 0,
+    folders: 0,
+    sampled: 0,
+    naiveRule: 'eventTimeSource=messages|judge → [eventStart,eventEnd)；否则 [createdAt,createdAt+1)',
+    issues: [],
+    warnings: [],
+  }
+  const engine = await loadEngineIndexModule()
+  const required = ['buildTimeIndex', 'queryTimeIndex', 'folderTimeRange', 'validateTimezone', 'dayKey']
+  const missing = engine.loadError ? ['engine/index.js load failed'] : required.filter((name) => typeof engine[name] !== 'function')
+  if (missing.length > 0) {
+    const reason = engine.loadError ? oneLine(engine.loadError.message ?? engine.loadError) : `missing ${missing.join('/')}`
+    addCheck(report, 'time index', 'WARN', `engine/time-index.js helpers unavailable (${reason}); time index validation skipped`, data)
+    return
+  }
+  const pushIssue = (message) => {
+    if (data.issues.length < ERA_CHECK_RECORD_LIMIT) data.issues.push(message)
+  }
+  const pushWarning = (message) => {
+    if (data.warnings.length < ERA_CHECK_RECORD_LIMIT) data.warnings.push(message)
+  }
+  const legalModes = ['off', 'index', 'constrain']
+  if (!legalModes.includes(data.mode)) pushIssue(`time.mode=${JSON.stringify(data.mode)} is not one of ${legalModes.join('/')}`)
+  const timezoneResult = engine.validateTimezone(data.timezone)
+  data.timezoneValid = timezoneResult.ok === true
+  data.timezoneResolved = typeof timezoneResult.timezone === 'string' ? timezoneResult.timezone : null
+  if (!timezoneResult.ok) pushWarning(timezoneResult.warning ?? `time.timezone=${JSON.stringify(data.timezone)} is not a parseable IANA zone`)
+  // Force constrain so queryTimeIndex actually filters (engine default is index).
+  const baseConfig = config && typeof config === 'object' ? config : {}
+  const cfgConstrain = { ...baseConfig, time: { ...timeConfig, mode: 'constrain' } }
+  const cfgUnconstrained = { ...baseConfig, time: { ...timeConfig, mode: 'off' } }
+  if (memory.exists) {
+    for (const store of Array.isArray(memory.stores) ? memory.stores : []) {
+      const storeDir = path.join(memory.memoryDir, store.dir)
+      const entries = readStoreIndexEntries(storeDir)
+      if (entries === null) continue
+      const folders = entries.filter((entry) => entry && typeof entry.id === 'string' && entry.id.length > 0)
+      if (folders.length === 0) continue
+      let timeIndex
+      try {
+        timeIndex = engine.buildTimeIndex(folders, cfgConstrain)
+      } catch (error) {
+        pushIssue(`${store.dir}: buildTimeIndex threw: ${oneLine(error && error.message ? error.message : error)}`)
+        continue
+      }
+      data.stores += 1
+      data.folders += timeIndex.folderCount
+      for (const warning of Array.isArray(timeIndex.warnings) ? timeIndex.warnings : []) pushWarning(warning)
+      const naiveRanges = folders.map((entry) => naiveFolderRange(entry))
+      const uniqueIds = new Set(folders.map((entry) => entry.id))
+      if (timeIndex.folderCount !== uniqueIds.size) {
+        pushIssue(`${store.dir}: time index folderCount=${timeIndex.folderCount} != ${uniqueIds.size} unique folder id(s)`)
+      }
+      for (let index = 0; index < folders.length && data.sampled < TIME_INDEX_SAMPLE_FOLDERS; index += 1) {
+        const entry = folders[index]
+        const naive = naiveRanges[index]
+        data.sampled += 1
+        const byIdRange = timeIndex.byId instanceof Map ? timeIndex.byId.get(entry.id) : undefined
+        if (!byIdRange) {
+          pushIssue(`${store.dir}/${entry.id}: missing from timeIndex.byId`)
+          continue
+        }
+        if (byIdRange.start !== naive.start || byIdRange.end !== naive.end) {
+          pushIssue(`${store.dir}/${entry.id}: byId [${byIdRange.start},${byIdRange.end}) != naive [${naive.start},${naive.end})`)
+          continue
+        }
+        let engineRange = null
+        try {
+          engineRange = engine.folderTimeRange(entry)
+        } catch (error) {
+          pushIssue(`${store.dir}/${entry.id}: folderTimeRange threw: ${oneLine(error && error.message ? error.message : error)}`)
+          continue
+        }
+        if (!engineRange || engineRange.start !== naive.start || engineRange.end !== naive.end) {
+          pushIssue(`${store.dir}/${entry.id}: folderTimeRange() != naive interval`)
+          continue
+        }
+        const window = { from: naive.start, to: naive.end, level: 'day' }
+        let restricted
+        try {
+          restricted = engine.queryTimeIndex(timeIndex, window, cfgConstrain)
+        } catch (error) {
+          pushIssue(`${store.dir}/${entry.id}: queryTimeIndex threw: ${oneLine(error && error.message ? error.message : error)}`)
+          continue
+        }
+        if (!(restricted.ids instanceof Set)) {
+          pushIssue(`${store.dir}/${entry.id}: constrain query returned an unconstrained result (ids=${restricted.ids === null ? 'null' : typeof restricted.ids})`)
+        } else {
+          const naiveHits = new Set()
+          for (let other = 0; other < folders.length; other += 1) {
+            const range = naiveRanges[other]
+            if (range.start < window.to && range.end > window.from) naiveHits.add(folders[other].id)
+          }
+          const missing = [...naiveHits].filter((id) => !restricted.ids.has(id)).length
+          const extra = [...restricted.ids].filter((id) => !naiveHits.has(id)).length
+          if (missing > 0 || extra > 0 || restricted.ids.size !== naiveHits.size) {
+            pushIssue(`${store.dir}/${entry.id}: constrained hit set ${restricted.ids.size} != naive ${naiveHits.size} (missing ${missing}, extra ${extra})`)
+          }
+        }
+        let unconstrained
+        try {
+          unconstrained = engine.queryTimeIndex(timeIndex, window, cfgUnconstrained)
+        } catch (error) {
+          pushIssue(`${store.dir}/${entry.id}: queryTimeIndex(mode=off) threw: ${oneLine(error && error.message ? error.message : error)}`)
+          continue
+        }
+        if (unconstrained.ids !== null || unconstrained.count !== timeIndex.folderCount) {
+          pushIssue(`${store.dir}: mode=off/index must not filter (ids=${unconstrained.ids === null ? 'null' : 'Set'}, count=${unconstrained.count}, expected count=${timeIndex.folderCount})`)
+        }
+        const startKey = engine.dayKey(naive.start, data.timezoneResolved || data.timezone)
+        const bucket = timeIndex.buckets instanceof Map ? timeIndex.buckets.get(startKey) : undefined
+        const position = Array.isArray(timeIndex.ids) ? timeIndex.ids.indexOf(entry.id) : -1
+        if (position >= 0) {
+          const contains = bucket && typeof bucket.includes === 'function' ? bucket.includes(position) : false
+          if (!contains) pushIssue(`${store.dir}/${entry.id}: not present in its own day bucket ${startKey}`)
+        }
+      }
+    }
+  }
+  const timezoneText = data.timezone === '' ? 'host local' : `${data.timezone}`
+  const summary = `${data.stores} store(s), ${data.folders} folder(s), ${data.sampled} folder(s) cross-checked against naive intervals; mode=${data.mode}, timezone=${timezoneText}` +
+    (data.timezoneResolved && data.timezoneResolved !== data.timezone ? ` (resolved ${data.timezoneResolved})` : '')
+  if (data.issues.length > 0) {
+    const more = data.issues.length >= ERA_CHECK_RECORD_LIMIT ? ' (list capped)' : ''
+    addCheck(report, 'time index', 'FAIL', `${data.issues[0]}${data.issues.length > 1 ? ` (+${data.issues.length - 1} more${more})` : ''}; ${summary}`, data)
+  } else if (data.warnings.length > 0) {
+    addCheck(report, 'time index', 'WARN', `${oneLine(data.warnings[0])}${data.warnings.length > 1 ? ` (+${data.warnings.length - 1} more)` : ''}; ${summary}`, data)
+  } else if (data.sampled === 0) {
+    addCheck(report, 'time index', 'PASS', `INFO: no indexed folders to cross-check; ${summary}`, data)
+  } else {
+    addCheck(report, 'time index', 'PASS', `time index consistent: ${summary}; constrain filtering agrees with naive intervals; off/index never filter`, data)
+  }
+}
+
+// ---------------------------------------------------------------------------
+// check 7 — v1.4.0 recall fairness / guarantee telemetry
+// ---------------------------------------------------------------------------
+
+/** The documented v1.4.0 recall lanes (contract §5.1 / §7). */
+const RECALL_LANES = Object.freeze(['rareHigh', 'queryBoost', 'register', 'hi', 'lowProbe', 'rotation', 'recycle'])
+/** Lanes that count as high-α injections for the guarantee summary. */
+const HIGH_ALPHA_LANES = new Set(['rareHigh', 'queryBoost', 'register', 'hi'])
+
+/**
+ * Aggregate v1.4.0 recall telemetry across every store's stats.jsonl.
+ *
+ * Field names follow contract §7. Older (≤1.3.0) telemetry carries none of the
+ * lane/time/guarantee fields: that is expected on a fresh upgrade and produces
+ * an INFO-only PASS, never a WARN/FAIL. When v1.4.0 telemetry exists, the line
+ * warns only when a *degradation* signal was actually recorded (`degraded` or
+ * `registerDrops > 0`) — a missing field is info, not an error.
+ *
+ * @param {ReturnType<typeof inspectMemory>} memory
+ */
+async function checkFairness(report, memory) {
+  const data = {
+    memoryDir: memory.memoryDir,
+    recallEvents: 0,
+    v14Events: 0,
+    lanes: Object.fromEntries(RECALL_LANES.map((lane) => [lane, 0])),
+    laneEvents: 0,
+    modes: {},
+    missTypes: {},
+    registerDropEvents: 0,
+    registerDrops: 0,
+    degradedEvents: 0,
+    reInjections: 0,
+    timeFilteredEvents: 0,
+    timeWindowEvents: 0,
+    hasMoreEvents: 0,
+    guarantees: { meanPicks: null, highAlphaLaneShare: null },
+  }
+  if (memory.exists) {
+    for (const store of Array.isArray(memory.stores) ? memory.stores : []) {
+      const events = readStatsEventsFile(path.join(memory.memoryDir, store.dir, 'stats.jsonl'))
+      for (const event of events) {
+        if (!event || typeof event !== 'object' || event.type !== 'recall') continue
+        data.recallEvents += 1
+        const hasV14Fields =
+          (event.lanesPicked && typeof event.lanesPicked === 'object') ||
+          typeof event.mode === 'string' ||
+          Number.isFinite(event.registerDrops) ||
+          event.degraded !== undefined ||
+          event.timeFiltered !== undefined ||
+          event.timeWindow !== undefined ||
+          Number.isFinite(event.candidates) ||
+          typeof event.missType === 'string'
+        if (!hasV14Fields) continue
+        data.v14Events += 1
+        if (typeof event.mode === 'string') data.modes[event.mode] = (data.modes[event.mode] || 0) + 1
+        if (event.lanesPicked && typeof event.lanesPicked === 'object') {
+          data.laneEvents += 1
+          for (const lane of RECALL_LANES) {
+            const value = event.lanesPicked[lane]
+            if (Number.isFinite(value) && value > 0) data.lanes[lane] += value
+          }
+        }
+        if (Number.isFinite(event.registerDrops) && event.registerDrops > 0) {
+          data.registerDropEvents += 1
+          data.registerDrops += event.registerDrops
+        }
+        if (event.degraded === true) data.degradedEvents += 1
+        if (Number.isFinite(event.reInjections) && event.reInjections > 0) data.reInjections += event.reInjections
+        if (Number.isFinite(event.timeFiltered) && event.timeFiltered > 0) data.timeFilteredEvents += 1
+        if (event.timeWindow && typeof event.timeWindow === 'object') data.timeWindowEvents += 1
+        if (event.hasMore === true) data.hasMoreEvents += 1
+        if (typeof event.missType === 'string' && event.missType) data.missTypes[event.missType] = (data.missTypes[event.missType] || 0) + 1
+      }
+    }
+  }
+  if (data.laneEvents > 0) {
+    const picks = RECALL_LANES.reduce((sum, lane) => sum + data.lanes[lane], 0)
+    data.guarantees.meanPicks = picks > 0 ? roundPercent(picks / data.laneEvents) : null
+    if (picks > 0) {
+      const highPicks = RECALL_LANES.filter((lane) => HIGH_ALPHA_LANES.has(lane)).reduce((sum, lane) => sum + data.lanes[lane], 0)
+      data.guarantees.highAlphaLaneShare = roundPercent((highPicks / picks) * 100)
+    }
+  }
+  const laneText = RECALL_LANES.map((lane) => `${lane}=${data.lanes[lane]}`).join('/')
+  if (data.v14Events === 0) {
+    addCheck(
+      report,
+      'recall fairness',
+      'PASS',
+      `INFO: no v1.4.0 recall telemetry yet (${data.recallEvents} legacy recall event(s) carry no lane/time fields; lane/guarantee metrics appear after a v1.4.0 session runs)`,
+      data,
+    )
+    return
+  }
+  const degradation = data.degradedEvents > 0 || data.registerDropEvents > 0
+  const detail =
+    `${data.v14Events}/${data.recallEvents} v1.4.0 recall event(s); modes ${counterText(data.modes)}; ` +
+    `lanes ${laneText}; registerDrops>0 ${data.registerDropEvents} (total ${data.registerDrops}), degraded ${data.degradedEvents}, ` +
+    `reInjections ${data.reInjections}, timeFiltered>0 ${data.timeFilteredEvents}, timeWindow ${data.timeWindowEvents}, hasMore ${data.hasMoreEvents}, ` +
+    `missType ${counterText(data.missTypes)}; guarantees meanPicks ${data.guarantees.meanPicks ?? 'n/a'}, highAlphaLaneShare ${data.guarantees.highAlphaLaneShare ?? 'n/a'}%`
+  const suffix = degradation ? '; guarantee degradation observed (registerDrops/degraded) — check lane quota/ledger pressure' : ''
+  addCheck(report, 'recall fairness', degradation ? 'WARN' : 'PASS', `${detail}${suffix}`, data)
+}
+
+// ---------------------------------------------------------------------------
+// check 8 — session-log checkpoint notes
 // ---------------------------------------------------------------------------
 
 /** Message payload of one surface-eligible session event. */
@@ -1699,6 +2260,9 @@ export async function runSelfCheck(options = {}) {
   const memory = inspectMemory(memoryDir)
   checkMemoryStore(report, memory)
   checkRecallState(report, memory)
+  await checkEraBuckets(report, memory)
+  await checkTimeIndex(report, memory, configResult.config)
+  await checkFairness(report, memory)
   await checkSessionLogs(report, {
     sessionsDir,
     sessionId: options.sessionId ?? null,

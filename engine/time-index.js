@@ -471,7 +471,7 @@ export function formatWindow(window, timeZone) {
   const tz = validateTimezone(timeZone).timezone
   const from = Number(window.from)
   const to = Number(window.to)
-  if (window.level === 'all' || !Number.isFinite(from) || !Number.isFinite(to)) return '全部时间'
+  if (window.level === 'all' || !isSafeTimestamp(from) || !isSafeTimestamp(to)) return '全部时间'
   if (!(to > from)) return dayKey(from, tz)
   const fromKey = dayKey(from, tz)
   const toKey = dayKey(to - 1, tz)
@@ -1144,15 +1144,17 @@ function clampSingleUnitFuture(window, nowMs, warnings) {
 }
 
 function resolveNow(input, now) {
-  if (typeof now === 'number' && Number.isFinite(now)) return now
+  if (isSafeTimestamp(now)) return now
   if (typeof now === 'string' && now.trim()) {
     const parsed = Date.parse(now.trim())
-    if (Number.isFinite(parsed)) return parsed
+    if (isSafeTimestamp(parsed)) return parsed
   }
-  if (input && typeof input === 'object' && typeof input.now === 'number' && Number.isFinite(input.now)) return input.now
-  if (input && typeof input === 'object' && typeof input.now === 'string' && input.now.trim()) {
-    const parsed = Date.parse(input.now.trim())
-    if (Number.isFinite(parsed)) return parsed
+  if (input && typeof input === 'object') {
+    if (isSafeTimestamp(input.now)) return input.now
+    if (typeof input.now === 'string' && input.now.trim()) {
+      const parsed = Date.parse(input.now.trim())
+      if (isSafeTimestamp(parsed)) return parsed
+    }
   }
   return Date.now()
 }

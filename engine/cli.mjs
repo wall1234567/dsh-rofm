@@ -4,10 +4,16 @@
  *
  *   node engine/cli.mjs init [--dir memory]
  *   node engine/cli.mjs compress --input conversation.json [--used-percent 63]
- *                                [--session-id X] [--config config.json] [--dir memory]
+ *                                [--session-id X] [--allow-small-window]
+ *                                [--config config.json] [--dir memory]
  *   node engine/cli.mjs recall --text "用户这句话"
  *                            [--context token=41000 window=128000]
+ *                            [--time-from 2026-10-31] [--time-to 2026-11-01]
+ *                            [--granularity day|month|year]
+ *                            [--offset 0] [--limit 5] [--mode fair|deterministic|legacy]
  *                            [--config config.json] [--seed 42] [--dir memory]
+ *   node engine/cli.mjs recall --time-from 2026-10-31 [--time-to 2026-11-02]
+ *                            # pure time browsing (no --text, v1.4.0 §6.8)
  *   node engine/cli.mjs list [--config config.json] [--dir memory]
  *   node engine/cli.mjs report [--config config.json] [--dir memory] [--json]
  *
@@ -27,24 +33,42 @@ const USAGE = `dsh-rofm engine CLI (standalone, zero dependencies)
 Usage:
   node engine/cli.mjs init [--dir memory]
   node engine/cli.mjs compress --input conversation.json [--used-percent 63]
-                               [--session-id X] [--config config.json] [--dir memory]
+                               [--session-id X] [--allow-small-window]
+                               [--config config.json] [--dir memory]
   node engine/cli.mjs recall --text "用户这句话"
                                [--context token=41000 window=128000]
+                               [--time-from 2026-10-31] [--time-to 2026-11-01]
+                               [--granularity day|month|year]
+                               [--offset 0] [--limit 5] [--mode fair|deterministic|legacy]
                                [--config config.json] [--seed 42] [--dir memory]
   node engine/cli.mjs list [--config config.json] [--dir memory]
   node engine/cli.mjs report [--config config.json] [--dir memory] [--json]
   node engine/cli.mjs help
 
+  Pure time browsing: omit --text and pass --time-from/--time-to (a time window
+  is a lookup, not a recall decision; needs time.mode="constrain" in the config
+  to actually filter, otherwise timeWindow.enforced=false). --time-* accept
+  "2026-10-31" (day), "2026-10" (month), "2026" (year) or an epoch ms value.
+
 conversation.json = { "messages": MemMessage[], "usedPercent": 63.2,
-                      "contextWindowTokens": 128000 }
+                      "contextWindowTokens": 128000,
+                      "totalUsedTokens": 41234 (optional), "sessionId": "..." (optional) }
+  Messages may carry "tokens" (host count) and "time" (event time, epoch ms):
+  the latter is collected into the archived folders' eventStart/eventEnd.
 Commands print JSON to stdout (report prints its text report unless --json) and
 human hints to stderr. Exit code 1 on invalid input.
 `
 
 class CliError extends Error {}
 
-/** Flags that intentionally take no value (`report --json`). */
-const BOOLEAN_FLAGS = new Set(['json'])
+/** Flags that intentionally take no value (`report --json`, compress opt-in). */
+const BOOLEAN_FLAGS = new Set(['json', 'allow-small-window'])
+
+/** Accepted `--mode` values for `recall` (legacy stays available as rollback). */
+const RECALL_MODES = new Set(['fair', 'deterministic', 'legacy'])
+/** Accepted `--granularity` values for `recall`. */
+const TIME_GRANULARITIES = new Set(['day', 'month', 'year'])
+
 
 function emitJson(value) {
   process.stdout.write(JSON.stringify(value, null, 2) + '\n')
@@ -153,6 +177,40 @@ function makeContext(flags) {
   return { cfg, memoryDir }
 }
 
+/**
+ * Validate + collect the v1.4.0 `recall` extras. Invalid enum/int values are
+ * rejected (exit 1, SPEC §8) instead of silently clamped; time inputs themselves
+ * are normalized by the engine, which reports problems in `warnings`.
+ */
+function buildRecallOptions(flags) {
+  const options = {}
+  if (flags['time-from'] !== undefined) options.timeFrom = flags['time-from']
+  if (flags['time-to'] !== undefined) options.timeTo = flags['time-to']
+  if (flags.granularity !== undefined) {
+    if (typeof flags.granularity !== 'string' || !TIME_GRANULARITIES.has(flags.granularity)) {
+      throw new CliError('--granularity must be one of day, month, year')
+    }
+    options.granularity = flags.granularity
+  }
+  if (flags.mode !== undefined) {
+    if (typeof flags.mode !== 'string' || !RECALL_MODES.has(flags.mode)) {
+      throw new CliError('--mode must be one of fair, deterministic, legacy')
+    }
+    options.mode = flags.mode
+  }
+  if (flags.offset !== undefined) {
+    const offset = Number(flags.offset)
+    if (!Number.isInteger(offset) || offset < 0) throw new CliError('--offset must be a non-negative integer')
+    options.offset = offset
+  }
+  if (flags.limit !== undefined) {
+    const limit = Number(flags.limit)
+    if (!Number.isInteger(limit) || limit < 1 || limit > 1000) throw new CliError('--limit must be an integer in [1, 1000]')
+    options.limit = limit
+  }
+  return options
+}
+
 function commandInit(flags) {
   const { cfg, memoryDir } = makeContext(flags)
   ensureMemoryDir(memoryDir)
@@ -195,6 +253,9 @@ function commandCompress(flags) {
     sessionId: typeof flags['session-id'] === 'string' ? flags['session-id'] : conversation.sessionId,
     totalUsedTokens,
     windowTokens: windowTokens > 0 ? windowTokens : undefined,
+    // v1.4.0 P1-6: the CLI is an explicit operator action, so the small-window
+    // sanity check can be overridden on purpose (mirrors compress.allowSmallWindow).
+    ...(flags['allow-small-window'] === true ? { allowSmallWindow: true } : {}),
   })
   const plan = result.plan
   const refused = result.refused === true
@@ -213,6 +274,11 @@ function commandCompress(flags) {
     removedTokens: plan.removeTokens,
     keptMessages: plan.keep.length,
     folderCount: result.folders.length,
+    // v1.4.0 archive robustness (contract §5.5 / §7).
+    protectedTurn: plan.protectedTurn === true,
+    smallWindow: plan.smallWindow === true,
+    maxFoldersCapped: plan.maxFoldersCapped === true,
+    eventTime: plan.eventTime ?? null,
     folders: result.folders.map((folder) => ({
       id: folder.id,
       alpha: folder.meta.alpha,
@@ -221,6 +287,8 @@ function commandCompress(flags) {
       chars: folder.meta.stats.chars,
       tokens: folder.meta.stats.tokens,
       messages: folder.meta.stats.messages,
+      eventStart: folder.meta.eventStart ?? null,
+      eventEnd: folder.meta.eventEnd ?? null,
     })),
     archiveNote: result.folders.length > 0 ? buildArchiveNote(plan) : '',
     warnings: result.warnings,
@@ -230,22 +298,35 @@ function commandCompress(flags) {
       ? `refused to archive (${result.reason}): memory folder cap reached; conversation left untouched`
       : plan.shouldCompress
         ? `archived ${result.folders.length} folder(s); kept ${plan.keep.length} message(s)`
-        : `nothing compressed (${plan.reason})`,
+        : `nothing compressed (${plan.reason})` +
+          (plan.reason === 'small-window' ? '; pass --allow-small-window to archive anyway' : ''),
   )
   return 0
 }
 
 function commandRecall(flags) {
-  if (typeof flags.text !== 'string' || !flags.text) throw new CliError('recall requires --text "用户这句话"')
+  const recallOptions = buildRecallOptions(flags)
+  const text = typeof flags.text === 'string' ? flags.text : ''
+  const hasTimeInput =
+    recallOptions.timeFrom !== undefined || recallOptions.timeTo !== undefined || recallOptions.granularity !== undefined
+  if (!text.trim() && !hasTimeInput) {
+    throw new CliError('recall requires --text "用户这句话" (or --time-from/--time-to for pure time browsing)')
+  }
   const { cfg, memoryDir } = makeContext(flags)
   const context = parseContext(flags.context)
   const engine = new MemoryEngine({ memoryDir, config: cfg })
   engine.load()
-  const result = engine.recall(flags.text, { chars: context.chars, windowTokens: context.windowTokens })
+  const result = engine.recall(text, { chars: context.chars, windowTokens: context.windowTokens }, recallOptions)
   const block = engine.buildRecallBlock(result.additions)
   emitJson({
     ok: true,
     block,
+    // v1.4.0: pure time browsing and the deterministic selector surface.
+    browsing: result.browse === true,
+    mode: result.mode ?? null,
+    page: result.page ?? null,
+    timeWindow: result.timeWindow ?? null,
+    missType: result.missType ?? null,
     additions: result.additions.map((addition) => ({
       id: addition.id,
       generation: addition.generation,
@@ -253,11 +334,14 @@ function commandRecall(flags) {
       probability: addition.probability,
       chars: addition.chars,
       tokens: addition.tokens,
+      ...(typeof addition.lane === 'string' ? { lane: addition.lane } : {}),
     })),
     stats: result.stats,
     warnings: result.warnings,
   })
   if (block) hint(block)
+  else if (result.browse === true) hint('no memory folder in the requested time window')
+  else if (result.missType === 'time') hint('time miss: keywords matched outside the requested window (try another window / ask the user about the time)')
   else hint('nothing recalled')
   return 0
 }

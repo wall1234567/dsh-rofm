@@ -262,6 +262,9 @@ test('handle: archives the shadowed conversation into the scoped memory dir (heu
   assert.equal(meta.keywordsSource, 'heuristic')
   assert.equal(meta.betaSource, 'default')
   assert.equal(meta.scoreMode, 'heuristic')
+  // v1.4.0 provenance (P0-2): the passive archive path is auditable too.
+  assert.equal(meta.archivedFrom, 'passive')
+  assert.match(meta.archivedByVersion, /^\d+\.\d+\.\d+/, 'archivedByVersion recorded')
   assert.equal(meta.beta, 0)
   assert.ok(meta.alpha >= cfg.importance.min && meta.alpha <= cfg.importance.max)
   assert.ok(Array.isArray(meta.keywords) && meta.keywords.length >= cfg.keywords.min)
@@ -376,6 +379,8 @@ test('handle: model scoring mode writes a pending folder for memory_judge', () =
   assert.equal(folder.meta.keywordsSource, 'pending')
   assert.equal(folder.meta.betaSource, 'pending')
   assert.equal(folder.meta.scoreMode, 'model')
+  assert.equal(folder.meta.archivedFrom, 'passive', 'v1.4.0 provenance on the model path too')
+  assert.match(folder.meta.archivedByVersion, /^\d+\.\d+\.\d+/)
   assert.ok(Number.isFinite(folder.meta.pendingSince))
   assert.equal(loadIndex(memoryDir, loadConfig(undefined, {})).folders[0].scored, false)
 })

@@ -128,7 +128,10 @@ test('compress: huge-message slicing never splits a surrogate pair', () => {
     { role: 'assistant', content: 'ok2', tokens: 5 },
   ]
   const cfg = loadConfig(undefined, {
-    compress: { compressPercent: 90, targetChunkChars: 250, minChunkChars: 50, keepRecentMessages: 2 },
+    // 1.4.0 small-window sanity (P1-6): this fixture uses a synthetic 5k window,
+    // so it must opt in explicitly; the default refusal path is covered by
+    // test/compress.test.mjs.
+    compress: { compressPercent: 90, targetChunkChars: 250, minChunkChars: 50, keepRecentMessages: 2, allowSmallWindow: true },
   })
   const plan = planCompression({ messages, usedPercent: 80, cfg, totalUsedTokens: 3000, windowTokens: 5000 })
   assert.equal(plan.shouldCompress, true)

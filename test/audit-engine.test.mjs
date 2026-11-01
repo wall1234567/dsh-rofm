@@ -290,3 +290,40 @@ test('tools/show-recall: corrupt legacy root index.json does not crash session l
 
 
 
+
+// ---------------------------------------------------------------------------
+// tools/show-recall.mjs: recall-state v2 AND v3 are both labelled correctly
+// (v1.4.0 writes v3; the display used to fall through to the "v1 ids" branch)
+// ---------------------------------------------------------------------------
+test('tools/show-recall: v2 and v3 recall-state snapshots are both recognised', () => {
+  const dir = tempDir()
+  const id = 'mem-20261025T000000Z-0009'
+  writeMemoryFolder(dir, id, { createdAt: 1, alpha: 0.5, beta: 0, keywords: ['部署'], title: 't' })
+  const addition = { id, generation: 1, alpha: 0.5, beta: 0, chars: 10, tokens: 3, keywords: ['部署'], messages: [{ role: 'user', content: 'x' }] }
+  const base = { sessionId: 's', updatedAt: 1, block: '## 记忆回忆', ids: [{ id, generation: 1 }], additions: [addition] }
+
+  fs.writeFileSync(path.join(dir, 'recall-state.json'), JSON.stringify({ version: 2, ...base }))
+  const v2 = runTool('tools/show-recall.mjs', ['--dir', dir])
+  assert.equal(v2.status, 0, v2.stderr)
+  assert.match(v2.stdout, /recall-state\.json v2/, 'v2 snapshot is labelled v2')
+
+  fs.writeFileSync(
+    path.join(dir, 'recall-state.json'),
+    JSON.stringify({
+      version: 3,
+      ...base,
+      round: 7,
+      configFingerprint: 'fairstore1|n=1',
+      ledger: [id],
+      lanes: { frontier: [], pendingHigh: [], highRecycle: [], recycle: [], degraded: false, round: 7 },
+      counters: { reInjections: 0, registerDrops: 0, recallTimeEvicted: 0 },
+    }),
+  )
+  const v3 = runTool('tools/show-recall.mjs', ['--dir', dir])
+  assert.equal(v3.status, 0, v3.stderr)
+  assert.match(v3.stdout, /recall-state\.json v3/, 'v3 snapshot is labelled v3, not v1')
+  assert.match(v3.stdout, /round=7/, 'v3 lane round is surfaced')
+  assert.match(v3.stdout, /ledger=1/, 'v3 ledger size is surfaced')
+  assert.match(v3.stdout, /lanes=yes/, 'v3 lane state is surfaced')
+  assert.doesNotMatch(v3.stdout, /recall-state\.json v1/, 'a v3 snapshot must not be reported as v1')
+})

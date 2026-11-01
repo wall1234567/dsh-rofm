@@ -257,6 +257,54 @@ function recallStatePayload(meta, overrides = {}) {
   }
 }
 
+/** A real-shaped v3 recall-state payload (what lib/plugin.js saveRecallState writes). */
+function recallStateV3Payload(meta, overrides = {}) {
+  return {
+    version: 3,
+    sessionId: 'session-fixture',
+    updatedAt: FIXTURE_CREATED_AT,
+    block: '## 记忆回忆\n\nfixture v3 block',
+    ids: [{ id: meta.id, generation: 1 }],
+    additions: [
+      {
+        id: meta.id,
+        generation: 1,
+        alpha: meta.alpha,
+        beta: meta.beta,
+        probability: meta.alpha,
+        chars: 60,
+        tokens: 30,
+        createdAt: meta.createdAt,
+        keywords: meta.keywords,
+        title: meta.title,
+        messages: [{ role: 'user', content: '讨论部署 docker 端口。' }],
+      },
+    ],
+    // --- v3 deterministic recall state (contract §6) ---
+    round: 7,
+    configFingerprint: 'cfg1|abcdef',
+    lanes: {
+      frontier: [{ seed: '部署', key: { alpha: meta.alpha, createdAt: meta.createdAt, id: meta.id }, length: 2 }],
+      exploreCursor: null,
+      pendingHigh: [],
+      pendingHighRound: [],
+      highRecycle: [],
+      recycle: [],
+      degraded: false,
+      round: 7,
+    },
+    ledger: [meta.id, 'other-id'],
+    counters: { reInjections: 2, registerDrops: 0, recallTimeEvicted: 0, timeMisses: 0 },
+    degraded: false,
+    ...overrides,
+  }
+}
+
+/** Write one recall-state.json into a store created by `createGoodStore`. */
+function writeRecallState(storeDir, payload) {
+  writeJson(path.join(storeDir, 'recall-state.json'), payload)
+}
+
 /** Create one healthy per-session memory store: `<root>/memory/sessions/<id>/`. */
 function createGoodStore(root, { sessionId = 'session-fixture', meta = folderMeta() } = {}) {
   const memoryDir = path.join(root, 'memory')
@@ -464,7 +512,10 @@ test('selfcheck: a healthy store and recall state pass and exit 0', () => {
   assert.equal(json.exitCode, 0)
   assert.equal(json.summary.failed, 0)
   assert.equal(findCheck(json, 'memory store').status, 'PASS', findCheck(json, 'memory store').detail)
-  assert.equal(findCheck(json, 'recall state').status, 'PASS', findCheck(json, 'recall state').detail)
+  const recallCheck = findCheck(json, 'recall state')
+  assert.equal(recallCheck.status, 'PASS', recallCheck.detail)
+  // The human label covers both the v2 and v3 snapshot shapes (1.4.0 writes v3).
+  assert.match(recallCheck.detail, /recall-state snapshot, v2\/v3/)
   // No session logs in the fixture: the tool warns instead of failing (§R5.5).
   assert.equal(findCheck(json, 'session logs').status, 'WARN')
 })
@@ -531,6 +582,108 @@ test('selfcheck: an inconsistent recall-state snapshot fails the recall state ch
   assert.ok(issueCodes(check).includes('recall-state-ids-mismatch'), `issues: ${JSON.stringify(issueCodes(check))}`)
   assert.equal(status, 1)
   assert.equal(json.exitCode, 1)
+})
+
+// ---------------------------------------------------------------------------
+// v1.4.0 recall-state v3 snapshots (contract §6)
+// ---------------------------------------------------------------------------
+
+test('selfcheck: a real v3 recall-state snapshot passes with zero issues', () => {
+  const root = makeTempDir()
+  const store = createGoodStore(root)
+  const sessionsDir = createEmptySessionsDir(root)
+  writeRecallState(store.storeDir, recallStateV3Payload(store.meta))
+  const { status, json } = runJson(['--memory-dir', store.memoryDir, '--sessions-dir', sessionsDir])
+  const check = findCheck(json, 'recall state')
+  assert.equal(check.status, 'PASS', check.detail)
+  assert.equal(check.data.issueTotal, 0)
+  assert.deepEqual(check.data.issues, [])
+  assert.equal(check.data.states.length, 1)
+  assert.equal(check.data.states[0].version, 3)
+  assert.match(check.detail, /recall-state snapshot, v2\/v3/)
+  assert.equal(status, 0)
+  assert.equal(json.exitCode, 0)
+})
+
+test('selfcheck: malformed v3 optional fields degrade (PASS, no issue) instead of FAIL', () => {
+  const root = makeTempDir()
+  const store = createGoodStore(root)
+  const sessionsDir = createEmptySessionsDir(root)
+  // Same shape lib/plugin.js has to tolerate: lanes/ledger/counters garbage,
+  // round not a number. They are optional v3 extras → ignored by selfcheck.
+  writeRecallState(
+    store.storeDir,
+    recallStateV3Payload(store.meta, {
+      round: 'not-a-number',
+      configFingerprint: 42,
+      lanes: 'garbage',
+      ledger: 42,
+      counters: 'nope',
+    }),
+  )
+  const { status, json } = runJson(['--memory-dir', store.memoryDir, '--sessions-dir', sessionsDir])
+  const check = findCheck(json, 'recall state')
+  assert.equal(check.status, 'PASS', check.detail)
+  assert.equal(check.data.issueTotal, 0, 'optional v3 extras are not validated by selfcheck')
+  assert.deepEqual(check.data.issues, [])
+  assert.equal(status, 0, 'a degraded optional field must not fail the self-check')
+  assert.equal(json.summary.failed, 0)
+})
+
+test('selfcheck: v3 snapshots still validate the shared core fields', () => {
+  const root = makeTempDir()
+  const store = createGoodStore(root)
+  const sessionsDir = createEmptySessionsDir(root)
+  // v3 keeps v2's block/ids/additions: a core mismatch is still a FAIL.
+  writeRecallState(store.storeDir, recallStateV3Payload(store.meta, { ids: [] }))
+  const { status, json } = runJson(['--memory-dir', store.memoryDir, '--sessions-dir', sessionsDir])
+  const check = findCheck(json, 'recall state')
+  assert.equal(check.status, 'FAIL', check.detail)
+  assert.ok(issueCodes(check).includes('recall-state-ids-mismatch'), `issues: ${JSON.stringify(issueCodes(check))}`)
+  assert.equal(status, 1)
+})
+
+test('selfcheck: v1 / missing / completely broken recall-state snapshots keep their existing severities', () => {
+  const sessionsDir = createEmptySessionsDir(makeTempDir())
+  // v1 → legacy WARN (upgraded on the next injection), exit 0.
+  const v1Root = makeTempDir()
+  const v1Store = createGoodStore(v1Root)
+  writeRecallState(v1Store.storeDir, { version: 1 })
+  const v1 = runJson(['--memory-dir', v1Store.memoryDir, '--sessions-dir', sessionsDir])
+  const v1Check = findCheck(v1.json, 'recall state')
+  assert.equal(v1Check.status, 'WARN', v1Check.detail)
+  assert.ok(issueCodes(v1Check).includes('recall-state-v1'))
+  assert.equal(v1.status, 0)
+
+  // Completely broken shape (JSON scalar) → FAIL.
+  const shapeRoot = makeTempDir()
+  const shapeStore = createGoodStore(shapeRoot)
+  writeRecallState(shapeStore.storeDir, 'not-a-snapshot')
+  const shape = runJson(['--memory-dir', shapeStore.memoryDir, '--sessions-dir', sessionsDir])
+  const shapeCheck = findCheck(shape.json, 'recall state')
+  assert.equal(shapeCheck.status, 'FAIL', shapeCheck.detail)
+  assert.ok(issueCodes(shapeCheck).includes('recall-state-shape'))
+  assert.equal(shape.status, 1)
+
+  // Unparsable JSON → FAIL.
+  const jsonRoot = makeTempDir()
+  const jsonStore = createGoodStore(jsonRoot)
+  fs.writeFileSync(path.join(jsonStore.storeDir, 'recall-state.json'), '{ broken json', 'utf8')
+  const broken = runJson(['--memory-dir', jsonStore.memoryDir, '--sessions-dir', sessionsDir])
+  const brokenCheck = findCheck(broken.json, 'recall state')
+  assert.equal(brokenCheck.status, 'FAIL', brokenCheck.detail)
+  assert.ok(issueCodes(brokenCheck).includes('recall-state-invalid-json'))
+  assert.equal(broken.status, 1)
+
+  // Unsupported version (e.g. 4) → FAIL with the v2/v3 wording.
+  const versionRoot = makeTempDir()
+  const versionStore = createGoodStore(versionRoot)
+  writeRecallState(versionStore.storeDir, recallStateV3Payload(versionStore.meta, { version: 4 }))
+  const unsupported = runJson(['--memory-dir', versionStore.memoryDir, '--sessions-dir', sessionsDir])
+  const versionCheck = findCheck(unsupported.json, 'recall state')
+  assert.equal(versionCheck.status, 'FAIL', versionCheck.detail)
+  assert.match(versionCheck.detail, /expected 2 or 3/)
+  assert.equal(unsupported.status, 1)
 })
 
 testIfZstd('selfcheck: two dsh-rofm checkpoint notes on one final surface are a WARN (legacy)', () => {

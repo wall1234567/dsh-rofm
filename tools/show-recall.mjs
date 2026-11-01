@@ -353,13 +353,17 @@ if (result.recallState) {
   const state = result.recallState
   const updatedAt = Number(state.updatedAt)
   const updatedText = Number.isFinite(updatedAt) ? new Date(updatedAt).toISOString() : 'n/a'
-  if (state.version === 2) {
-    // v2 snapshot: the injected block plus the content of every memorised
+  if (state.version === 2 || state.version === 3) {
+    // v2/v3 snapshot: the injected block plus the content of every memorised
     // folder. Print a summary only (the full block is printed below as
     // `wouldInject` / `--live`), never the whole snapshot twice.
     const additions = Array.isArray(state.additions) ? state.additions : []
     const blockChars = typeof state.block === 'string' ? state.block.length : 0
-    console.log(`\n已注入回忆快照（recall-state.json v2）: version=2  block=${blockChars} 字  additions=${additions.length} 条  updatedAt=${updatedText}`)
+    // v1.4.0 adds the FAIR-DRI lane state / ledger / round to the same snapshot.
+    const v3Extra = state.version === 3
+      ? `  round=${state.round ?? 0}  ledger=${Array.isArray(state.ledger) ? state.ledger.length : 0} 条  lanes=${state.lanes && typeof state.lanes === 'object' ? 'yes' : 'no'}`
+      : ''
+    console.log(`\n已注入回忆快照（recall-state.json v${state.version}）: version=${state.version}  block=${blockChars} 字  additions=${additions.length} 条  updatedAt=${updatedText}${v3Extra}`)
     for (const entry of additions) {
       const messages = Array.isArray(entry.messages) ? entry.messages.length : 0
       console.log(`  - ${entry.id}  第${entry.generation ?? 1}代  α=${entry.alpha}  β=${formatBeta(entry.beta)}  ${entry.chars ?? 0} 字  messages=${messages}  keywords=${(entry.keywords ?? []).join('、') || 'n/a'}`)

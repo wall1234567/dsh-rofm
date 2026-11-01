@@ -22,8 +22,8 @@
  *                      schema (id/createdAt/α/β/scored/keywords/rescorePending),
  *                      unsafe folder ids, images/index.json files exist,
  *                      stats.jsonl lines are valid JSON.
- *   4. recall state  — every recall-state.json is a valid v2 snapshot with safe,
- *                      consistent ids/additions.
+ *   4. recall state  — every recall-state.json is a valid recall-state snapshot
+ *                      (v2/v3) with safe, consistent ids/additions.
  *   5. pending era   — v1.4.0 data-era buckets via `engine/era.js` (one truth):
  *                      legacy / synthetic / current folders+scored+pending.
  *                      Legacy and synthetic pending are historical residue and
@@ -1082,7 +1082,18 @@ function validateRecallState(state, label) {
     warn('recall-state-v1', `${label}: legacy v1 recall state (no restorable block; next injection upgrades it)`)
     return issues
   }
-  if (state.version !== 2) fail('recall-state-version', `${label}: version=${JSON.stringify(state.version)} (expected 2)`)
+  // v1.4.0 writes recall-state **v3** (contract §6). It keeps every v2 field
+  // byte-compatible (`block` / `ids` / `additions` — all validated below) and
+  // adds the deterministic recall state: `round` (number), `configFingerprint`
+  // (string), `lanes` (serialized LaneState object), `ledger` (id string array),
+  // `counters` (object) and `degraded` (boolean). Those extras are known
+  // optional fields and are deliberately NOT validated here: a bad optional
+  // field degrades inside the adapter (the "坏字段逐项降级不 throw" contract), so
+  // selfcheck must not FAIL or even warn on them — unknown fields are ignored.
+  // Only the shared core fields decide the check for both versions.
+  if (state.version !== 2 && state.version !== 3) {
+    fail('recall-state-version', `${label}: version=${JSON.stringify(state.version)} (expected 2 or 3)`)
+  }
   if (typeof state.block !== 'string') fail('recall-state-block', `${label}: block is not a string`)
   if (state.sessionId !== undefined && typeof state.sessionId !== 'string') warn('recall-state-session', `${label}: sessionId is not a string`)
   if (typeof state.updatedAt !== 'number' || !Number.isFinite(state.updatedAt)) warn('recall-state-updated-at', `${label}: updatedAt is not a finite number`)
@@ -1165,7 +1176,7 @@ function checkRecallState(report, memory) {
       report,
       'recall state',
       'PASS',
-      states.length === 0 ? 'no recall-state.json found (no recall block injected yet)' : `${states.length} recall-state.json file(s) valid (v2 snapshot)`,
+      states.length === 0 ? 'no recall-state.json found (no recall block injected yet)' : `${states.length} recall-state.json file(s) valid (recall-state snapshot, v2/v3)`,
       data,
     )
     return

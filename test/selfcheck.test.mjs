@@ -13,11 +13,11 @@
  *
  *   - neutral fixture profile (no QQ plugin) — used by `runCli` for EVERY spawn
  *     via `DSH_PROFILE_DIR=NEUTRAL_PROFILE`:
- *       8 check lines + platform + summary
- *       → `selfcheck: 7 passed, 1 warnings, 0 failed`, no `compat` line.
+ *       9 check lines + platform + summary
+ *       → `selfcheck: 8 passed, 1 warnings, 0 failed`, no `compat` line.
  *   - onebot and/or Derpyu detected (compat tests override DSH_PROFILE_DIR):
  *       + `compat`, `compat chat keys`, and (Derpyu only) `compat autopatch`
- *       → `selfcheck: 10 passed, 1 warnings, 0 failed` with all three compat
+ *       → `selfcheck: 11 passed, 1 warnings, 0 failed` with all three compat
  *       checks PASS on a patched whitelist.
  *
  * The dedicated "documented environment-dependent output" test below asserts
@@ -60,6 +60,7 @@ const ENVIRONMENT_INDEPENDENT_CHECKS = [
   'pending era',
   'time index',
   'recall fairness',
+  'event tags',
   'session logs',
 ]
 
@@ -384,7 +385,7 @@ function createMultiStore(root, { sessionId = 'session-era', folders = [], stats
     })
     writeJson(path.join(storeDir, id, 'meta.json'), meta)
     const entry = indexEntry(meta)
-    for (const key of ['pendingEra', 'eventStart', 'eventEnd', 'eventTimeSource']) {
+    for (const key of ['pendingEra', 'eventStart', 'eventEnd', 'eventTimeSource', 'event', 'eventSource', 'eventAt']) {
       if (folder[key] !== undefined) entry[key] = folder[key]
     }
     entries.push(entry)
@@ -1081,6 +1082,85 @@ test('selfcheck: no v1.4.0 recall telemetry is INFO (real data before the upgrad
 })
 
 // ---------------------------------------------------------------------------
+// v1.4.0 event tag audit (INFO-only)
+// ---------------------------------------------------------------------------
+
+test('selfcheck: event tags reports INFO and never warns when nothing is tagged', () => {
+  const root = makeTempDir()
+  const store = createGoodStore(root)
+  const sessionsDir = createEmptySessionsDir(root)
+  const { status, json } = runJson(['--memory-dir', store.memoryDir, '--sessions-dir', sessionsDir])
+  const check = findCheck(json, 'event tags')
+  assert.equal(check.status, 'PASS', check.detail)
+  assert.match(check.detail, /INFO: no event-tagged memories yet \(0\/1 folder\(s\)/)
+  assert.equal(check.data.foldersWithEvent, 0)
+  assert.equal(check.data.distinctEvents, 0)
+  assert.deepEqual(check.data.top, [])
+  // event.mode consistency hint: engine default index vs packaged config
+  // constrain (the packaged product enables the constraint).
+  assert.equal(check.data.eventMode.engineDefault, 'index')
+  assert.equal(check.data.eventMode.packaged, 'constrain')
+  assert.equal(check.data.eventMode.effective, 'constrain')
+  assert.equal(check.data.eventMode.packagedMatchesEffective, true)
+  // It is a non-compat check placed right after `recall fairness`.
+  const names = json.checks.map((entry) => entry.name)
+  assert.equal(names.indexOf('event tags'), names.indexOf('recall fairness') + 1)
+  assert.equal(status, 0)
+})
+
+test('selfcheck: event tags counts tagged folders, distinct events and the top events', () => {
+  const root = makeTempDir()
+  const sessionsDir = createEmptySessionsDir(root)
+  createMultiStore(root, {
+    sessionId: 'session-events',
+    folders: [
+      { createdAt: CURRENT_ERA_TS, scored: true, event: '日本旅行' },
+      { createdAt: CURRENT_ERA_TS, scored: true, event: '日本旅行' },
+      { createdAt: CURRENT_ERA_TS, scored: true, event: '登录重构项目' },
+      { createdAt: CURRENT_ERA_TS, scored: true }, // untagged
+    ],
+  })
+  const { status, json } = runJson(['--memory-dir', path.join(root, 'memory'), '--sessions-dir', sessionsDir])
+  const check = findCheck(json, 'event tags')
+  assert.equal(check.status, 'PASS', check.detail)
+  assert.equal(check.data.folders, 4)
+  assert.equal(check.data.foldersWithEvent, 3)
+  assert.equal(check.data.distinctEvents, 2)
+  assert.deepEqual(check.data.top, [
+    { label: '日本旅行', count: 2 },
+    { label: '登录重构项目', count: 1 },
+  ])
+  assert.match(check.detail, /3\/4 folder\(s\) event-tagged; 2 distinct event\(s\); top: 日本旅行=2, 登录重构项目=1/)
+  assert.match(check.detail, /suspected unmerged pairs: 0/)
+  assert.equal(status, 0)
+})
+
+test('selfcheck: event tags audits suspected unmerged labels but stays INFO (no WARN/FAIL)', () => {
+  const root = makeTempDir()
+  const sessionsDir = createEmptySessionsDir(root)
+  // "日本旅行" and "日本旅行计划" are bidirectionally similar (dice 0.875 >= 0.72)
+  // but have different canonical keys: the scoring path would have merged them,
+  // so this pair is exactly the "same event, different label" audit finding.
+  createMultiStore(root, {
+    sessionId: 'session-unmerged',
+    folders: [
+      { createdAt: CURRENT_ERA_TS, scored: true, event: '日本旅行' },
+      { createdAt: CURRENT_ERA_TS, scored: true, event: '日本旅行计划' },
+    ],
+  })
+  const { status, json } = runJson(['--memory-dir', path.join(root, 'memory'), '--sessions-dir', sessionsDir])
+  const check = findCheck(json, 'event tags')
+  assert.equal(check.status, 'PASS', 'the unmerged-pair audit must never WARN or FAIL')
+  assert.equal(check.data.suspiciousPairTotal, 1)
+  assert.equal(check.data.suspiciousPairs.length, 1)
+  assert.equal(check.data.suspiciousPairs[0].score >= 0.72, true)
+  assert.match(check.detail, /suspected unmerged pairs: 1/)
+  assert.match(check.detail, /日本旅行/)
+  assert.equal(status, 0)
+  assert.equal(json.summary.failed, 0)
+})
+
+// ---------------------------------------------------------------------------
 // v1.3.0 compat checks
 // ---------------------------------------------------------------------------
 
@@ -1094,19 +1174,19 @@ test('selfcheck: no compat line without a QQ plugin and without compat state (v1
   assert.equal(human.status, 0)
   const output = String(human.stdout)
   const lines = output.trimEnd().split(/\r?\n/)
-  assert.equal(lines.length, 10, `expected 8 check lines + platform line + summary, got:\n${output}`)
+  assert.equal(lines.length, 11, `expected 9 check lines + platform line + summary, got:\n${output}`)
   assert.ok(!output.includes('compat'), `no compat line expected, got:\n${output}`)
   assert.match(lines.at(-2), /^platform: \S+ \S+, node \d+\.\d+\.\d+$/)
-  // config/engine/memory/recall/era/time/fairness pass, the empty fixture has no
-  // session logs (WARN).
-  assert.equal(lines.at(-1), 'selfcheck: 7 passed, 1 warnings, 0 failed')
+  // config/engine/memory/recall/era/time/fairness/event-tags pass, the empty
+  // fixture has no session logs (WARN).
+  assert.equal(lines.at(-1), 'selfcheck: 8 passed, 1 warnings, 0 failed')
 
   const { json } = runJson(args)
   assert.deepEqual(
     json.checks.map((check) => check.name),
     ENVIRONMENT_INDEPENDENT_CHECKS,
   )
-  assert.deepEqual(json.summary, { passed: 7, warnings: 1, failed: 0 })
+  assert.deepEqual(json.summary, { passed: 8, warnings: 1, failed: 0 })
   assert.equal(json.exitCode, 0)
 })
 
@@ -1116,10 +1196,10 @@ test('selfcheck: no compat line without a QQ plugin and without compat state (v1
  * and bump the passed count; every environment-independent check must keep the
  * exact same status, and the exit code must stay 0.
  *
- * (G's docs describe both shapes: neutral → 7 passed/1 warning/0 failed,
- *  QQ plugin detected → 10 passed/1 warning/0 failed.)
+ * (G's docs describe both shapes: neutral → 8 passed/1 warning/0 failed,
+ *  QQ plugin detected → 11 passed/1 warning/0 failed.)
  */
-test('selfcheck: documented environment-dependent output (neutral 7/1/0 vs QQ 10/1/0)', () => {
+test('selfcheck: documented environment-dependent output (neutral 8/1/0 vs QQ 11/1/0)', () => {
   const root = makeTempDir()
   const store = createGoodStore(root)
   const sessionsDir = createEmptySessionsDir(root)
@@ -1128,7 +1208,7 @@ test('selfcheck: documented environment-dependent output (neutral 7/1/0 vs QQ 10
   // 1) Neutral environment (the pin every other test uses): no compat lines.
   const neutral = runJson(args)
   assert.deepEqual(neutral.json.checks.map((check) => check.name), ENVIRONMENT_INDEPENDENT_CHECKS)
-  assert.deepEqual(neutral.json.summary, { passed: 7, warnings: 1, failed: 0 })
+  assert.deepEqual(neutral.json.summary, { passed: 8, warnings: 1, failed: 0 })
   assert.equal(neutral.status, 0)
 
   // 2) QQ environment (both plugins detected + patched whitelist + valid state):
@@ -1148,19 +1228,23 @@ test('selfcheck: documented environment-dependent output (neutral 7/1/0 vs QQ 10
     'compat chat keys',
     'compat autopatch',
   ])
-  assert.deepEqual(detected.json.summary, { passed: 10, warnings: 1, failed: 0 })
+  assert.deepEqual(detected.json.summary, { passed: 11, warnings: 1, failed: 0 })
 
-  // The environment only adds lines: the non-compat checks are byte-identical.
+  // The environment only adds lines: the non-compat checks are byte-identical,
+  // and the INFO-only `event tags` line exists in BOTH environments with the
+  // same status (it is not a compat line).
   const statuses = (checks) => checks.filter((check) => !check.name.startsWith('compat')).map((check) => `${check.name}=${check.status}`)
   assert.deepEqual(statuses(detected.json.checks), statuses(neutral.json.checks))
+  assert.equal(findCheck(neutral.json, 'event tags').status, 'PASS', findCheck(neutral.json, 'event tags').detail)
+  assert.equal(findCheck(detected.json, 'event tags').status, findCheck(neutral.json, 'event tags').status)
   for (const name of ['compat', 'compat chat keys', 'compat autopatch']) {
     assert.equal(findCheck(detected.json, name).status, 'PASS', `${name} must PASS on a patched setup`)
   }
 
-  // Human output of the detected environment: 11 check lines + platform + summary.
+  // Human output of the detected environment: 12 check lines + platform + summary.
   const human = String(runCli(args, { DSH_PROFILE_DIR: profileDir }).stdout)
-  assert.equal(human.trimEnd().split(/\r?\n/).length, 13)
-  assert.equal(human.trimEnd().split(/\r?\n/).at(-1), 'selfcheck: 10 passed, 1 warnings, 0 failed')
+  assert.equal(human.trimEnd().split(/\r?\n/).length, 14)
+  assert.equal(human.trimEnd().split(/\r?\n/).at(-1), 'selfcheck: 11 passed, 1 warnings, 0 failed')
 })
 
 test('selfcheck: a detected onebot plugin adds the compat and chat-key PASS lines', () => {
@@ -1190,7 +1274,7 @@ test('selfcheck: a detected onebot plugin adds the compat and chat-key PASS line
     ['compat', 'compat chat keys'],
   )
   assert.equal(json.summary.failed, 0)
-  assert.equal(json.summary.passed, 9)
+  assert.equal(json.summary.passed, 10)
 
   const human = String(runCli(args, { DSH_PROFILE_DIR: profileDir }).stdout)
   assert.match(human, /^\[PASS\] compat — qqBots=auto; detected: dsh-onebot-qq$/m)
@@ -1225,7 +1309,7 @@ test('selfcheck: a detected Derpyu with a patched whitelist and valid state pass
     COMPAT_CHECK_NAMES,
   )
   assert.equal(json.summary.failed, 0)
-  assert.equal(json.summary.passed, 10)
+  assert.equal(json.summary.passed, 11)
 })
 
 test('selfcheck: a detected Derpyu with an unpatched/broken whitelist warns but never fails', () => {

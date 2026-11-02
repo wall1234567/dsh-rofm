@@ -44,8 +44,12 @@ test('memory_judge: registered name, required arguments and output wiring', () =
 
 test('memory_judge: α rubric weighs user preferences, β/keywords rubric intact', () => {
   const { description } = definition()
-  // α semantics: importance decides how often the memory is recalled automatically.
-  assert.ok(description.includes('α（0.01~1）决定该记忆以后被自动回忆的概率'), 'α semantics missing')
+  // α semantics (v1.4.0 wording): α is importance/priority + fairness lanes; it
+  // is a probability multiplier only in the legacy rollback mode.
+  assert.ok(description.includes('α（0.01~1）表示该记忆对未来对话的重要度，决定召回优先级与车道'), 'α semantics missing')
+  for (const phrase of ['高 α 记忆被查询命中后首轮必现', '低 α 记忆按轮转道有界最迟召回', '回滚模式 legacy 才把 α 当概率乘数']) {
+    assert.ok(description.includes(phrase), `description must mention ${phrase}`)
+  }
   // I1: explicit user preferences/flavours must raise α.
   for (const phrase of ['用户明确表达的喜好', '厌恶', '习惯', '长期偏好', '应给较高 α', '闲聊', '过程性日志']) {
     assert.ok(description.includes(phrase), `description must mention ${phrase}`)
@@ -58,6 +62,10 @@ test('memory_judge: α rubric weighs user preferences, β/keywords rubric intact
   assert.ok(description.includes('可信的事实/决定/约定为正分'))
   assert.ok(description.includes('新归档的待评分记忆需要同时给出 3~8 个关键词'))
   assert.ok(description.includes('keep=true 表示保持原值'))
+  // v1.4.0 event rubric is part of the model-facing description.
+  for (const phrase of ['event 表示这条记忆所属的事件', '一次旅行', '工作项目', '方案评审', '给「空」', '省略表示本次不修改']) {
+    assert.ok(description.includes(phrase), `description must mention event rubric: ${phrase}`)
+  }
 })
 
 test('memory_judge: alpha parameter carries the preference rule; other parameters unchanged', () => {
@@ -81,12 +89,12 @@ test('memory_judge: alpha parameter carries the preference rule; other parameter
 // judge telemetry and the reserved eventTime parameter (contract §5.8)
 // ---------------------------------------------------------------------------
 
-test('memory_judge: β rubric pins tool-output β=0 and recall-probability independence', () => {
+test('memory_judge: β rubric pins tool-output β=0 and recall-priority independence', () => {
   const { description } = definition()
   for (const phrase of [
     'β 只影响这条记忆被回忆出来后能否当作事实或指令使用的可信度',
-    '不影响它被回忆的概率',
-    '召回概率只看 α',
+    '不影响它被回忆的优先级',
+    '召回优先级只看 α',
     '工具输出、过程日志、系统或插件生成的机械内容不是用户表态',
     '默认取 β=0',
     '不要因为内容机械、重复或像日志就给负分',
@@ -261,11 +269,12 @@ test('memory_judge: uniform α/β + repeated keywords + missing reasons warn but
 
     assert.deepEqual(result.updated, ids, 'the submitted values are always honored')
     assert.deepEqual(result.rejected, [])
-    assert.equal(result.warnings.length, 4)
+    assert.equal(result.warnings.length, 5, '4 quality warnings + 1 untagged-new-memory reminder')
     assert.ok(result.warnings.some((warning) => warning.includes('关键词') && warning.includes('重复')))
     assert.ok(result.warnings.some((warning) => warning.includes('α 全部相同')))
     assert.ok(result.warnings.some((warning) => warning.includes('β 全部相同')))
     assert.ok(result.warnings.some((warning) => warning.includes('reason')))
+    assert.ok(result.warnings.some((warning) => warning.includes('没有 event 标签')), 'untagged new memories get a non-blocking reminder')
     // Quality warnings never block the write.
     assert.equal(readMeta(memoryDir, ids[0]).scored, true)
     assert.equal(readMeta(memoryDir, ids[0]).alpha, 0.1)
@@ -302,7 +311,7 @@ test('memory_judge: uniform α/β + repeated keywords + missing reasons warn but
   })
 })
 
-test('memory_judge: a single normal update produces no quality warnings (no false positives)', async () => {
+test('memory_judge: a single normal update makes no quality warnings (no false positives)', async () => {
   await withTempDir(async (dir) => {
     const { plugin, events } = makeJudgeEnv(dir)
     const tool = new MemoryJudgeTool(plugin)
@@ -311,7 +320,14 @@ test('memory_judge: a single normal update produces no quality warnings (no fals
       { agent: { session: { id: 'session-judge-one' } } },
     )
     assert.deepEqual(result.updated, [pendingFolderId(1)])
-    assert.deepEqual(result.warnings, [])
+    // The only warning is the "new memory has no event" reminder — never a
+    // quality/template warning for one normal update.
+    assert.equal(result.warnings.length, 1)
+    assert.ok(result.warnings[0].includes('没有 event 标签'), result.warnings[0])
+    for (const phrase of ['关键词有', 'α 全部相同', 'β 全部相同', 'reason']) {
+      assert.ok(!result.warnings[0].includes(phrase), `no quality warning for one update: ${phrase}`)
+    }
+    assert.deepEqual(result.eventStats, { assigned: 0, merged: 0, cleared: 0 })
     assert.equal(events.length, 1)
     assert.equal(events[0].event.batchSize, 1)
     assert.equal(events[0].event.updated, 1)
@@ -358,9 +374,9 @@ test('memory_judge: the reserved eventTime override is ignored with a 1.4.1 hint
       { agent: { session: { id: 'session-judge-time' } } },
     )
     assert.deepEqual(result.updated, [pendingFolderId(1)])
-    assert.equal(result.warnings.length, 1)
-    const hint = result.warnings[0]
-    assert.ok(hint.includes('eventTime'), hint)
+    assert.equal(result.warnings.length, 2, 'eventTime hint + untagged-new-memory reminder')
+    const hint = result.warnings.find((warning) => warning.includes('eventTime'))
+    assert.ok(hint, JSON.stringify(result.warnings))
     assert.ok(hint.includes('1.4.1'), 'the hint points at 1.4.1')
     assert.ok(hint.includes('已忽略'), 'the hint says the value was ignored')
 

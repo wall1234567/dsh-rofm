@@ -42,21 +42,28 @@
  *                      distribution + guarantee summary. Real data from before
  *                      1.4.0 has no such fields → PASS with an INFO note; a
  *                      missing field degrades to INFO, never FAIL.
- *   8. session logs  — replay `surfaceOp` append/replace from the zstd frames to
+ *   8. event tags    — v1.4.0 event-tag observability (INFO-only, never
+ *                      WARN/FAIL): folders carrying an `event` label vs all
+ *                      folders, distinct event count, top 5 events, the
+ *                      `event.mode` consistency hint (engine default vs packaged
+ *                      config vs effective), and a pairwise
+ *                      `eventSimilarity` scan for "same event, different
+ *                      canonical label" (suspected unmerged labels; normally 0).
+ *   9. session logs  — replay `surfaceOp` append/replace from the zstd frames to
  *                      the final surface; at most one dsh-rofm checkpoint note
  *                      (more → WARN, legacy residue from before note merging), N is a positive integer,
  *                      the note appendix must not carry re-injected infrastructure
  *                      (runtime/time/skill context, in-history system copies,
  *                      recall snapshots); foreign checkpoints are counted but
  *                      never fail.
- *   9. compat        — v1.3.0 QQ channel compatibility, reported only when the
+ *  10. compat        — v1.3.0 QQ channel compatibility, reported only when the
  *                      feature is actually relevant (a QQ plugin is detected or
  *                      `<memoryDir>/.compat-state.json` exists): profile
  *                      detection, session-id → stable chat-key parsing, and the
  *                      Derpyu tool-whitelist autopatch state. These checks are
  *                      PASS/WARN only and never FAIL; with no QQ plugin and no
  *                      state file they add no line at all (v1.2.1 output parity).
- *  10. test suite    — optional (`--with-tests`): `node --test` exits 0.
+ *  11. test suite    — optional (`--with-tests`): `node --test` exits 0.
  *
  * v1.4.0 data-era policy (plan §3.4 / contract §5.9): `legacy` is a *per-folder*
  * property (`createdAt < 2026-10-27T19:14:00Z` or an existing `pendingEra` mark);
@@ -182,17 +189,22 @@ Options:
   -h, --help              show this help
 
 Checks: config, engine defaults + planCompression smoke, memory store, recall
-state, pending era buckets, time index, recall fairness, session-log checkpoint
-notes, and (with --with-tests) the test suite.
+state, pending era buckets, time index, recall fairness, event tags,
+session-log checkpoint notes, and (with --with-tests) the test suite.
 When a QQ plugin is installed (or a compat autopatch state file exists) three
 PASS/WARN-only v1.3.0 compat lines are added: detection, chat keys, autopatch.
 
 Expected output depends on the detected QQ environment (this is the documented
 contract, not a bug):
-  - no QQ plugin detected      → 8 check lines  → "7 passed, 1 warnings, 0 failed"
-  - QQ plugin(s) detected      → 11 check lines → "10 passed, 1 warnings, 0 failed"
+  - no QQ plugin detected      → 9 check lines  → "8 passed, 1 warnings, 0 failed"
+  - QQ plugin(s) detected      → 12 check lines → "11 passed, 1 warnings, 0 failed"
     (with a patched whitelist; detection only ADDS compat lines and never
     changes any other check).
+
+"event tags" is INFO-only: folders carrying an optional event label are counted
+(with the top 5 events and the event.mode consistency hint) and a pairwise
+eventSimilarity scan lists "same event, different canonical label" pairs for
+audit. It never WARNs or FAILs.
 
 v1.4.0 data-era policy: legacy folders (createdAt < 2026-10-27T19:14:00Z, or an
 existing index pendingEra mark) and synthetic sessions (fake window + stress-level
@@ -1579,7 +1591,154 @@ async function checkFairness(report, memory) {
 }
 
 // ---------------------------------------------------------------------------
-// check 8 — session-log checkpoint notes
+// check 8 — v1.4.0 event tag audit (INFO-only; never WARN/FAIL)
+// ---------------------------------------------------------------------------
+
+/** Event label audit limits (the pairwise similarity scan is O(L²)). */
+const EVENT_AUDIT_TOP_LIMIT = 5
+const EVENT_AUDIT_SCAN_MAX = 200
+const EVENT_AUDIT_PAIR_LIMIT = 20
+
+/**
+ * Audit the optional `event` tag on memory folders (v1.4.0 event constraint).
+ *
+ * This is an **observability-only** check: event tags are metadata, so nothing
+ * here may ever WARN or FAIL. It reports:
+ *  - how many folders carry a tag vs the whole store, the distinct event count
+ *    and the top 5 events (label + folder count);
+ *  - the event config consistency hint (`engine/config.js` default vs the
+ *    packaged `config.json`, and the effective value the engine resolves);
+ *  - suspected **unmerged** events: two distinct canonical labels whose
+ *    `eventSimilarity` score is >= `event.similarity.threshold`. Scoring-time
+ *    `assignEventLabel` merges those automatically, so a non-empty list means
+ *    old data (pre-merge) or an event submitted outside the merge path — audit
+ *    information, never a defect signal. The scan is skipped above
+ *    EVENT_AUDIT_SCAN_MAX labels (INFO explains why).
+ *
+ * @param {ReturnType<typeof inspectMemory>} memory
+ * @param {object|null} config resolved config (engine/config.js loadConfig)
+ */
+async function checkEventTags(report, memory, config) {
+  const data = {
+    memoryDir: memory.memoryDir,
+    stores: 0,
+    folders: 0,
+    foldersWithEvent: 0,
+    distinctEvents: 0,
+    top: [],
+    eventMode: { engineDefault: null, packaged: null, effective: null, packagedMatchesEffective: null },
+    similarity: { metric: null, threshold: null, labelsScanned: 0, pairsChecked: 0, skipped: false },
+    suspiciousPairs: [],
+    suspiciousPairTotal: 0,
+    note: 'INFO only: event tags are observability metadata; nothing on this line can WARN/FAIL',
+  }
+  const engine = await loadEngineIndexModule()
+  const helpersReady =
+    !engine.loadError &&
+    typeof engine.buildEventIndex === 'function' &&
+    typeof engine.eventSimilarity === 'function' &&
+    typeof engine.eventConfig === 'function' &&
+    engine.EVENT_DEFAULTS !== undefined
+  if (!helpersReady) {
+    const reason = engine.loadError ? oneLine(engine.loadError.message ?? engine.loadError) : 'missing engine/event-index.js exports'
+    addCheck(report, 'event tags', 'PASS', `INFO: event tag audit skipped (${reason})`, data)
+    return
+  }
+  const effective = engine.eventConfig(config)
+  const packaged = readJsonFile(path.join(REPO_ROOT, 'config.json'))
+  const packagedEvent =
+    packaged.ok && packaged.value && typeof packaged.value === 'object' && packaged.value.event && typeof packaged.value.event === 'object'
+      ? packaged.value.event
+      : null
+  data.eventMode = {
+    engineDefault: typeof engine.EVENT_DEFAULTS.mode === 'string' ? engine.EVENT_DEFAULTS.mode : null,
+    packaged: packagedEvent && typeof packagedEvent.mode === 'string' ? packagedEvent.mode : null,
+    effective: effective.mode,
+    packagedMatchesEffective: packagedEvent ? packagedEvent.mode === effective.mode : null,
+  }
+  data.similarity = {
+    metric: effective.metric,
+    threshold: effective.threshold,
+    labelsScanned: 0,
+    pairsChecked: 0,
+    skipped: false,
+  }
+
+  const merged = new Map() // normalised key -> { label, count }
+  if (memory.exists) {
+    for (const store of Array.isArray(memory.stores) ? memory.stores : []) {
+      const folders = readStoreIndexEntries(path.join(memory.memoryDir, store.dir))
+      if (folders === null) continue
+      const valid = folders.filter((entry) => entry && typeof entry.id === 'string' && entry.id.length > 0)
+      if (valid.length === 0) continue
+      data.stores += 1
+      data.folders += valid.length
+      const eventIndex = engine.buildEventIndex(valid, config)
+      data.foldersWithEvent += eventIndex.byId.size
+      for (const bucket of eventIndex.labels) {
+        const existing = merged.get(bucket.key)
+        if (existing) existing.count += bucket.count
+        else merged.set(bucket.key, { label: bucket.label, count: bucket.count })
+      }
+    }
+  }
+  const events = [...merged.values()].sort(
+    (left, right) => right.count - left.count || (left.label < right.label ? -1 : left.label > right.label ? 1 : 0),
+  )
+  data.distinctEvents = events.length
+  data.top = events.slice(0, EVENT_AUDIT_TOP_LIMIT).map((event) => ({ label: event.label, count: event.count }))
+  data.similarity.labelsScanned = events.length
+  const modeText =
+    `event.mode engineDefault=${data.eventMode.engineDefault}, packaged=${data.eventMode.packaged ?? 'missing'}, ` +
+    `effective=${data.eventMode.effective}` +
+    (data.eventMode.packagedMatchesEffective === false ? ' (packaged config != effective value; check config.json)' : '')
+  const metricsText = `similarity metric=${effective.metric} threshold=${effective.threshold}`
+  if (data.foldersWithEvent === 0) {
+    addCheck(
+      report,
+      'event tags',
+      'PASS',
+      `INFO: no event-tagged memories yet (0/${data.folders} folder(s) carry an event label); ${modeText}; ${metricsText}`,
+      data,
+    )
+    return
+  }
+  // Pairwise "same event, different canonical label" audit (O(L²), L is tiny).
+  if (events.length > EVENT_AUDIT_SCAN_MAX) {
+    data.similarity.skipped = true
+  } else {
+    for (let left = 0; left < events.length; left += 1) {
+      for (let right = left + 1; right < events.length; right += 1) {
+        data.similarity.pairsChecked += 1
+        const similarity = engine.eventSimilarity(events[left].label, events[right].label, config)
+        if (similarity.keyA === similarity.keyB) continue
+        if (similarity.score < effective.threshold) continue
+        data.suspiciousPairTotal += 1
+        if (data.suspiciousPairs.length < EVENT_AUDIT_PAIR_LIMIT) {
+          data.suspiciousPairs.push({ a: similarity.keyA, b: similarity.keyB, score: roundPercent(similarity.score) })
+        }
+      }
+    }
+  }
+  const topText = data.top.map((event) => `${event.label}=${event.count}`).join(', ')
+  const pairText = data.similarity.skipped
+    ? `unmerged-pair scan skipped (${events.length} labels > ${EVENT_AUDIT_SCAN_MAX})`
+    : `suspected unmerged pairs: ${data.suspiciousPairTotal}` +
+      (data.suspiciousPairs.length > 0
+        ? ` (e.g. "${data.suspiciousPairs[0].a}" ≈ "${data.suspiciousPairs[0].b}" score=${data.suspiciousPairs[0].score})`
+        : '')
+  const offNote = effective.mode === 'off' ? '; note: event.mode=off (labels stay recorded but are never enforced)' : ''
+  addCheck(
+    report,
+    'event tags',
+    'PASS',
+    `INFO: ${data.foldersWithEvent}/${data.folders} folder(s) event-tagged; ${data.distinctEvents} distinct event(s); top: ${topText}; ${modeText}; ${metricsText}; ${pairText}${offNote}`,
+    data,
+  )
+}
+
+// ---------------------------------------------------------------------------
+// check 9 — session-log checkpoint notes
 // ---------------------------------------------------------------------------
 
 /** Message payload of one surface-eligible session event. */
@@ -1944,7 +2103,7 @@ async function checkSessionLogs(report, options) {
 }
 
 // ---------------------------------------------------------------------------
-// check 6 — optional test suite
+// check 11 — optional test suite
 // ---------------------------------------------------------------------------
 
 /** Run `node --test` in the repository (only with `--with-tests`). */
@@ -1990,7 +2149,7 @@ function checkTestSuite(report) {
 }
 
 // ---------------------------------------------------------------------------
-// check 6 — v1.3.0 QQ channel compatibility (PASS/WARN only, never FAIL)
+// check 10 — v1.3.0 QQ channel compatibility (PASS/WARN only, never FAIL)
 // ---------------------------------------------------------------------------
 
 /** Dynamic import of one adapter module (`lib/compat.js` / `lib/compat-autopatch.js`). */
@@ -2274,6 +2433,7 @@ export async function runSelfCheck(options = {}) {
   await checkEraBuckets(report, memory)
   await checkTimeIndex(report, memory, configResult.config)
   await checkFairness(report, memory)
+  await checkEventTags(report, memory, configResult.config)
   await checkSessionLogs(report, {
     sessionsDir,
     sessionId: options.sessionId ?? null,

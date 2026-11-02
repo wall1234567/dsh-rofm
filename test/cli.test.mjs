@@ -9,6 +9,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { after, test } from 'node:test'
+import * as engineApi from '../engine/index.js'
 
 const REPO_ROOT = path.resolve(fileURLToPath(new URL('..', import.meta.url)))
 const CLI = path.join(REPO_ROOT, 'engine', 'cli.mjs')
@@ -336,4 +337,117 @@ test('cli: invalid new recall flags exit 1 with a clear error', () => {
     assert.equal(result.status, 1, `expected exit 1 for "${args.join(' ')}" (stdout=${result.stdout})`)
     assert.match(result.stderr, pattern)
   }
+})
+
+// ---------------------------------------------------------------------------
+// v1.4.0 event constraint via the CLI (--event)
+// ---------------------------------------------------------------------------
+
+/** Seed folders with canonical event labels through the engine API. */
+function seedEventFolders(memoryDir, configPath, specs) {
+  const cfg = engineApi.loadConfig(configPath)
+  for (const spec of specs) {
+    const id = spec.id
+    engineApi.writeFolder(memoryDir, {
+      id,
+      meta: {
+        version: 1,
+        id,
+        createdAt: spec.createdAt,
+        alpha: spec.alpha ?? 0.9,
+        keywords: spec.keywords,
+        title: spec.keywords.join(' '),
+        stats: { messages: 1, chars: 40, tokens: 12 },
+        ...(spec.event ? { event: spec.event, eventSource: 'llm' } : {}),
+      },
+      messages: [{ role: 'user', content: `内容 ${id}` }],
+    })
+  }
+  // writeFolder does not create index.json: the engine rebuilds it lazily.
+  return cfg
+}
+
+function writeEventConfig(dir) {
+  const configPath = path.join(dir, 'config-event.json')
+  fs.writeFileSync(configPath, JSON.stringify({ event: { mode: 'constrain' }, time: { mode: 'constrain', timezone: 'Asia/Shanghai' } }))
+  return configPath
+}
+
+function prepareEventStore() {
+  const root = tempDir()
+  const memoryDir = path.join(root, 'memory')
+  fs.mkdirSync(memoryDir, { recursive: true })
+  const configPath = writeEventConfig(root)
+  seedEventFolders(memoryDir, configPath, [
+    { id: 'mem-20261030T100000Z-0001', createdAt: Date.parse('2026-10-30T10:00:00+08:00'), keywords: ['旅行', '住宿', '行程'], event: '日本旅行' },
+    { id: 'mem-20261031T100000Z-0001', createdAt: Date.parse('2026-10-31T10:00:00+08:00'), keywords: ['旅行', '计划'], event: '日本旅行' },
+    { id: 'mem-20261031T100000Z-0002', createdAt: Date.parse('2026-10-31T11:00:00+08:00'), keywords: ['旅行', '登录', '重构'], event: '登录重构项目' },
+    { id: 'mem-20261031T100000Z-0003', createdAt: Date.parse('2026-10-31T12:00:00+08:00'), keywords: ['旅行', '闲聊'] },
+  ])
+  return { root, memoryDir, configPath }
+}
+
+test('cli: --event constrains the recall to one event', () => {
+  const { memoryDir, configPath } = prepareEventStore()
+  const constrained = runCli([
+    'recall',
+    '--text', '旅行 计划 住宿',
+    '--event', '日本旅行',
+    '--dir', memoryDir,
+    '--config', configPath,
+  ])
+  assert.equal(constrained.status, 0, constrained.stderr)
+  const parsed = JSON.parse(constrained.stdout)
+  assert.equal(parsed.eventInfo.status, 'exact')
+  assert.equal(parsed.eventInfo.label, '日本旅行')
+  assert.equal(parsed.eventInfo.count, 2)
+  assert.equal(parsed.eventInfo.enforced, true)
+  assert.deepEqual(parsed.additions.map((entry) => entry.id).sort(), ['mem-20261030T100000Z-0001', 'mem-20261031T100000Z-0001'])
+  // 空 = no event constraint
+  const unconstrained = runCli(['recall', '--text', '旅行', '--event', '空', '--dir', memoryDir, '--config', configPath])
+  assert.equal(unconstrained.status, 0, unconstrained.stderr)
+  const openJson = JSON.parse(unconstrained.stdout)
+  assert.equal(openJson.eventInfo.status, 'empty')
+  assert.ok(openJson.additions.length >= 3)
+})
+
+test('cli: pure event browsing without --text', () => {
+  const { memoryDir, configPath } = prepareEventStore()
+  const browsed = runCli(['recall', '--event', '日本旅行', '--dir', memoryDir, '--config', configPath])
+  assert.equal(browsed.status, 0, browsed.stderr)
+  const parsed = JSON.parse(browsed.stdout)
+  assert.equal(parsed.browsing, true)
+  assert.equal(parsed.eventInfo.status, 'exact')
+  assert.deepEqual(parsed.additions.map((entry) => entry.id).sort(), ['mem-20261030T100000Z-0001', 'mem-20261031T100000Z-0001'])
+  assert.equal(parsed.missType, null)
+})
+
+test('cli: ambiguous / unknown events are reported, not guessed', () => {
+  const { memoryDir, configPath } = prepareEventStore()
+  const ambiguous = runCli(['recall', '--text', '旅行', '--event', '日本旅行计划', '--dir', memoryDir, '--config', configPath])
+  assert.equal(ambiguous.status, 0, ambiguous.stderr)
+  const ambiguousJson = JSON.parse(ambiguous.stdout)
+  assert.equal(ambiguousJson.eventInfo.status, 'similar')
+  assert.equal(ambiguousJson.missType, 'event-ambiguous')
+  assert.ok(ambiguousJson.eventInfo.candidates.length >= 1)
+  assert.equal(ambiguousJson.eventInfo.candidates[0].label, '日本旅行')
+  assert.ok(ambiguousJson.eventInfo.candidates[0].score >= 0.72)
+  assert.deepEqual(ambiguousJson.additions, [], 'ambiguous submissions never recall silently')
+  assert.match(ambiguous.stderr, /ambiguous|--event/)
+
+  const unknown = runCli(['recall', '--text', '旅行', '--event', '欧洲蜜月', '--dir', memoryDir, '--config', configPath])
+  assert.equal(unknown.status, 0, unknown.stderr)
+  const unknownJson = JSON.parse(unknown.stdout)
+  assert.equal(unknownJson.eventInfo.status, 'unknown')
+  assert.equal(unknownJson.eventInfo.count, 0)
+  assert.equal(unknownJson.missType, 'event')
+  assert.deepEqual(unknownJson.additions, [])
+  assert.match(unknown.stderr, /event miss/)
+})
+
+test('cli: --event rejects an over-long label', () => {
+  const root = tempDir()
+  const bad = runCli(['recall', '--text', '旅行', '--event', 'x'.repeat(201), '--dir', path.join(root, 'memory')])
+  assert.equal(bad.status, 1)
+  assert.match(bad.stderr, /--event/)
 })

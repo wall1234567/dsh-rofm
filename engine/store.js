@@ -138,6 +138,15 @@ function copyOptionalIndexFields(target, source) {
   if (typeof source.idempotencyKey === 'string' && source.idempotencyKey && source.idempotencyKey.length <= 400) {
     target.idempotencyKey = source.idempotencyKey
   }
+  // v1.4.0 event constraint: canonical event label (a trip / project / thread…)
+  // plus provenance. An empty label means "not part of any event" and is never
+  // written, so old indexes stay byte-compatible.
+  if (typeof source.event === 'string') {
+    const event = source.event.trim()
+    if (event && event.length <= 200) target.event = event
+  }
+  if (source.eventSource === 'llm' || source.eventSource === 'heuristic') target.eventSource = source.eventSource
+  if (Number.isFinite(source.eventAt)) target.eventAt = source.eventAt
   if (Number.isFinite(source.eventStart)) target.eventStart = source.eventStart
   if (Number.isFinite(source.eventEnd)) target.eventEnd = source.eventEnd
   if (Number.isFinite(source.pendingSince)) target.pendingSince = source.pendingSince

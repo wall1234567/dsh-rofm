@@ -25,7 +25,8 @@ The project follows a lightweight [SemVer](https://semver.org/) scheme.
 
 ## [1.4.0] — 2026-11-01
 
-本版本完成四件事，**旧数据无需迁移**（旧 `index.json`、旧 `recall-state.json` v2/v1、旧 pending 全部可读；
+本版本完成四件事 + 一项增补（**1.4.0 增补：事件约束**，见后文专节；版本号保持 1.4.0 不变），
+**旧数据无需迁移**（旧 `index.json`、旧 `recall-state.json` v2/v1、旧 pending 全部可读；
 新字段一律 optional、有值才写）：
 
 1. **召回确定性 + 公平性（默认行为变化）**：用 FAIR-DRI 确定性选择替换 v1.3.0 的 α 概率掷骰。
@@ -292,6 +293,71 @@ The project follows a lightweight [SemVer](https://semver.org/) scheme.
 - **`package.json` scripts**：`check` 追加 `memory-audit --json` 与 `time-view --help`；新增
   `verify` = `node tools/verify-1.4.0.mjs`（保留 `release`/`release:status`/`test`/`simulate`/`selfcheck`/`cli`）。
 
+### 事件约束（1.4.0 增补）
+
+给记忆增加一层可选的**事件约束**：评分时由当前会话模型判断一段记忆属于哪个**事件**（一次旅行、
+一个工作项目、一次方案评审/决定线程、一段持续排查的故障等），召回时可把检索范围限定在该事件内。
+事件标签**全库唯一**，事件索引**纯内存派生**（不建事件文件夹、不搬记忆、不落盘第二份真相）。
+
+#### Added
+
+- **`engine/event-index.js`（新，零依赖）**：事件约束的唯一实现。导出
+  `EVENT_DEFAULTS` / `EVENT_MODES` / `EVENT_METRICS` / `normalizeEventLabel` / `eventSimilarity` /
+  `eventKeyOf` / `buildEventIndex` / `resolveEventQuery` / `assignEventLabel` / `eventIdsFor` /
+  `eventConfig`。归一化：trim → NFKC → 折叠空白 → Latin 小写 → 去首尾成对引号/括号 →
+  截断到 `event.maxLabelLength=60`；空占位词（空/无/不约束/无事件/none/null/n-a/-）→ “不属于任何事件”。
+  相似度 = token 集合（Latin 词 len≥2 + CJK bigram + CJK 单字）上的 **Dice 系数**：
+  `metric='dice'`（默认）`score = 2·|A∩B| / (|A|+|B|)`（对称、惩罚长度失衡：`项目` 吞不掉`登录重构项目`，
+  `日本旅行`≈`日本旅行计划` 仍相似；实测 0.778），另可选 `avg` / `min` 做实验。
+  “双向高度相似” = `score ≥ event.similarity.threshold=0.72`。
+- **`event` 配置段（新）**：`mode`（`off` 忽略事件参数 / `index` 只建内存索引不约束（engine 默认）/
+  `constrain` 真正过滤（随包 config.json 默认））、`maxLabelLength:60`、
+  `similarity:{metric:'dice', threshold:0.72, maxCandidates:5}`、`askUserHint:true`；
+  `validateConfig` 的 group/键校验同步（metric 枚举、threshold 0..1、maxCandidates 1..10）。
+- **数据字段（可选，旧数据没有属正常）**：folder meta / index entry 新增 `event`（canonical 标签）、
+  `eventSource`（`llm`）、`eventAt`（最近写入时间）；`indexEntryFromMeta` **有值才写**，旧 index 字节兼容。
+  **不建事件文件夹、不新增落盘事件索引**：事件索引只从 `index.folders` 内存派生（缓存键 = index
+  mtime/size/folderCount + 配置指纹）。
+- **`memory_judge` 新参 `event`**：评分模型给记忆打事件标签（同一事件始终用同一标签；寒暄/一次性闲聊/
+  纯过程日志给「空」= 删除 `meta.event`）。**评分期自动归并**：与已有 canonical 标签高度相似的标签
+  静默归并到后者并返回 warning（稳定前缀 `event-merged:`），保证同一事件在全库只有一个标签。
+  新记忆不强制 event（α+β+keywords 三元组必填不变），缺失时只加非阻断提示；judge 摘要含
+  assigned/merged/cleared 计数（不含正文）。
+- **`memory_recall` 新参 `event`**：可选；省略或给「空」= 不约束事件；与 `timeFrom/timeTo` 同时给时
+  **AND**（`C(Q) ∩ W ∩ E`）。回忆期四态：`exact`（限定到该事件并标注条数）、
+  `similar`（歧义：不自动合并，返回候选事件让模型判断；无法判断则提示询问用户）、
+  `unknown`（该事件没有记忆：提示补标签 / `event:"空"` / 问用户）、`empty/disabled`（不约束）。
+  `missType` 新增 `'event'` / `'event-ambiguous'`，**均不计 3/6 连败**。
+- **`engine/recall-index.js` 事件过滤**：`scanCandidates`/`countCandidates`/`selectRecall`/
+  `selectSigma` 支持 `eventIds`，在时间过滤之后过滤（只约束第一代；`hops` 后代沿用同一集合）；
+  `stats.filteredByEvent` 按去重口径计数（与 `filteredByTime` 同规则）。
+- **遥测**：`recall` 事件新增 `eventStatus` / `eventLabel` / `eventFiltered`（旧遥测缺字段按“缺失”
+  处理，不当作 0 丢失）。
+- **`engine/cli.mjs`**：`recall` 新增 `--event <name>`；省略 `--text` 但给 `--event` = **纯事件浏览**
+  （按 eventStart 升序）；输出新增 `eventInfo` / `eventStatus` 相关字段与歧义/未知提示。
+- **`test/event-index.test.mjs`（新，28 例）**：归一化/空词/长度、Dice/avg/min 相似度、
+  exact/similar/unknown/disabled 四态、评分归并（`event-merged:`）、索引构建与缓存、真实标签实测。
+- **`test/recall-index.test.mjs` +8 事件用例**：`C(Q)∩W∩E`、时间+事件 AND、`filteredByEvent`。
+
+#### Changed
+
+- **自动召回不加事件约束**：自动召回（`agent/inbox/inserted`）发生在模型思考**之前**，没有事件判断者；
+  事件约束只用于**模型主动检索**（`memory_recall`）。空召回提示可补一句“可用 memory_recall 的 event
+  参数限定”，不新增常驻提示。
+- **召回过滤顺序**：`α/minAlpha → 时间 → 事件`；显式双端点时间仍是硬窗口；事件约束与时间一样只约束
+  第一代。`stats.candidates` 语义保持“全部过滤后（α∩时间∩事件）的候选数”。
+- **旧文案修正**：`memory_judge` 工具描述与回忆块前言里的 “α 影响回忆概率” 改为
+  “α 决定召回优先级与车道（回滚模式 legacy 下才是概率乘数）”；`memory_recall` 描述里的
+  “α 概率规则” 改为 “α 优先级规则”。README/SPEC 的原文镜像同步。
+
+#### 兼容与回滚
+
+- **无需迁移**：旧记忆没有 `event` → 不参与事件约束召回（仍可按关键词/时间正常回忆）；
+  用 `memory_judge` 复核时补标签即可，**不批量回填、不改写旧 meta**。
+- **回滚**：`event.mode='off'` 一键关闭（忽略事件参数、不建索引；已写入的 `event` 标签保留，重开即恢复）。
+- **明确不做**：不做独立事件进程/约束器服务、不建物理事件文件夹、不新增落盘事件索引、
+  不做语义向量相似（零依赖 token 相似度）、不自动给历史数据打标签。
+
 ### 已知限制
 
 - 公平性保证有前提：高α首轮保证要求稀有高α候选 ≤ k_H 且高α到达率 ≤ k_H/轮；低α轮转界要求 `a_low < r`；
@@ -303,6 +369,10 @@ The project follows a lightweight [SemVer](https://semver.org/) scheme.
 - 1.4.0 不开放 `memory_judge` 的 eventTime 覆写（`time.judgeEventTime=false`，留 1.4.1 评估）。
 - 时间阶梯 `day3 → month → year → all` 是平级放宽序列（不是 day3 内再嵌套 month）。
 - 重启后首轮 block 裁剪没有 `candidateIds`，退化为纯 α 裁剪（仍保证高α pin 与至少保留 1 条）。
+- **事件相似是 token（Dice）相似、不是语义向量**：同义改写、缩写/全称混用可能低于 0.72 阈值，
+  此时按 `similar` 返回候选让模型/用户判断，而不是自动合并；阈值/指标可配。
+- **旧数据没有 event**：1.4.0 之前的记忆不参与事件约束召回（仍可按关键词/时间回忆），复核评分时补标签即可。
+- **自动召回不做事件约束**：发生在模型思考之前，没有事件判断者；事件约束只在 `memory_recall` 生效。
 
 ### Tests
 
@@ -310,8 +380,8 @@ The project follows a lightweight [SemVer](https://semver.org/) scheme.
   `test/turn-protection-engine.test.mjs`、`test/memory-audit.test.mjs`、`test/config-consistency.test.mjs`、
   `test/e2e-adapter-simulate.test.mjs`、`test/e2e-real-data-readonly.test.mjs`，以及 `test-adapter/` 的
   公平性/确定性/评分压力/时间工具适配用例。
-- 发布门禁 `node tools/verify-1.4.0.mjs` = **8/8 PASS**；`node --test` = **836 tests / 834 pass / 0 fail / 2 skip**
-  （2 skip = Node zstd 平台条件跳过，非缺陷）+ e2e **8 + 6 = 14** → 门禁汇总 **850 / 848 pass / 0 fail**。
+- 发布门禁 `node tools/verify-1.4.0.mjs` = **8/8 PASS**；`node --test` = **916 tests / 914 pass / 0 fail / 2 skip**
+  （2 skip = Node zstd 平台条件跳过，非缺陷）+ e2e **12 + 7 = 19** → 门禁汇总 **935 / 933 pass / 0 fail**。
   最终数字以 `docs/VERIFICATION.md` §20 与门禁输出为准（本条目不改写历史 v1.3.0 的 493 用例基线）。
 
 ## [1.3.0] — 2026-10-31

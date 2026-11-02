@@ -22,6 +22,7 @@ import {
     validateConfig,
 } from './config.js'
 import { commitCompression, planCompression } from './compress.js'
+import { buildEventIndex, resolveEventQuery } from './event-index.js'
 import { buildRecallBlock, loadRecallAdditions, recall as runRecall } from './recall.js'
 import {
     buildRecallIndex,
@@ -73,6 +74,37 @@ function round2(value) {
   return Object.is(rounded, -0) ? 0 : rounded
 }
 
+/** Zeroed recall stats for early-return paths (event ambiguity, browsing, …). */
+function emptyRecallStats(context) {
+  const ctx = context && typeof context === 'object' ? context : {}
+  return {
+    userKeywords: [],
+    matchedFolders: 0,
+    excludedFolders: 0,
+    timeFiltered: 0,
+    eventFiltered: 0,
+    attempts: 0,
+    addedFolders: 0,
+    addedChars: 0,
+    addedTokens: 0,
+    contextChars: Number.isFinite(ctx.chars) ? ctx.chars : null,
+    windowTokens: Number.isFinite(ctx.windowTokens) ? ctx.windowTokens : null,
+    addedPercentOfContext: null,
+    addedPercentOfWindow: null,
+    byGeneration: {},
+    elapsedMs: 0,
+    candidates: 0,
+    candidatesAll: 0,
+    lanesPicked: null,
+    pops: 0,
+    frontierHits: 0,
+    registerDrops: 0,
+    reInjections: 0,
+    degraded: false,
+    filteredByAlpha: 0,
+  }
+}
+
 /** Same ordering rules as the v1.3.0 recall renderer (`recall.sort`). */
 function sortRecallAdditions(additions, sortMode) {
   const list = Array.isArray(additions) ? additions.slice() : []
@@ -98,9 +130,11 @@ function uniqueCandidateCounts(index, seeds, options = {}) {
   const minAlpha = Number(options.minAlpha)
   const alphaFloor = Number.isFinite(minAlpha) ? Math.min(1, Math.max(0, minAlpha)) : 0
   const timeIds = options.timeIds instanceof Set ? options.timeIds : null
+  const eventIds = options.eventIds instanceof Set ? options.eventIds : null
   const seen = new Set()
   let all = 0
   let inWindow = 0
+  let inEvent = 0
   for (const seed of Array.isArray(seeds) ? seeds : []) {
     const posting = postings.get(seed)
     if (!Array.isArray(posting)) continue
@@ -113,9 +147,11 @@ function uniqueCandidateCounts(index, seeds, options = {}) {
       all += 1
       if (timeIds && !timeIds.has(entry.id)) continue
       inWindow += 1
+      if (eventIds && !eventIds.has(entry.id)) continue
+      inEvent += 1
     }
   }
-  return { all, inWindow }
+  return { all, inWindow, inEvent }
 }
 
 export class MemoryEngine {
@@ -149,6 +185,8 @@ export class MemoryEngine {
     this._cache = { index: null, mtimeMs: -1, size: -1 }
     /** v1.4.0 in-memory time index (never persisted; plan §3.3.1). */
     this._timeIndexCache = undefined
+    /** v1.4.0 in-memory event index (never persisted; plan §3.4 event constraint). */
+    this._eventIndexCache = undefined
     /** v1.4.0 deterministic recall index (wave-2). */
     this._recallIndexCache = undefined
     /** v1.4.0 in-memory FAIR-DRI lane state when the caller does not pass one. */
@@ -224,6 +262,7 @@ export class MemoryEngine {
     this._cache = { index: null, mtimeMs: -1, size: -1 }
     // v1.4.0 derived caches are config-fingerprint keyed; drop them eagerly.
     this._timeIndexCache = undefined
+    this._eventIndexCache = undefined
     this._recallIndexCache = undefined
     this._lanes = undefined
     this._round = 0
@@ -326,35 +365,58 @@ export class MemoryEngine {
     const refreshed = this._refresh()
     const mode = this.recallMode(opts)
     const timePlan = this._recallTimePlan(opts)
-    // Pure time browsing works in every mode (it is a lookup, not a recall
-    // decision): `memory_recall` without keywords returns the folders inside the
-    // requested window, ordered by event start. Legacy mode keeps it too.
-    const browsing = typeof userText === 'string' && userText.trim().length === 0 && timePlan.active === true
-    let result = browsing
-      ? this._browseRecall({
-          index: this.recallIndex(),
-          opts,
-          timePlan,
-          context: ctx,
-          offset: clampInt(opts.offset, 0, 1_000_000, 0),
-          take: Number.isFinite(Number(opts.limit)) && Number(opts.limit) > 0
-            ? Math.min(1000, Math.floor(Number(opts.limit)))
-            : Number.isFinite(Number(this.cfg?.recall?.firstGenMax))
-              ? Math.max(1, Math.floor(Number(this.cfg.recall.firstGenMax)))
-              : 10,
-          warnings: [],
-        })
-      : mode === 'legacy'
-        ? null
-        : this._deterministicRecall({
-            userText,
-            context: ctx,
-            options: opts,
-            index: refreshed.index,
-            mode,
-            timePlan,
-            startedAt: typeof performance !== 'undefined' && performance && typeof performance.now === 'function' ? performance.now() : undefined,
-          })
+    const eventPlan = this._recallEventPlan(opts)
+    // Pure browsing works in every mode (it is a lookup, not a recall decision):
+    // `memory_recall` without keywords returns the folders inside the requested
+    // time window and/or event, ordered by event start.
+    // Browsing needs an *enforced* filter: an `event.mode='index'`/explicit "空"
+    // argument alone must not turn into an unconstrained "browse the whole library".
+    const browsing =
+      typeof userText === 'string' &&
+      userText.trim().length === 0 &&
+      (timePlan.active === true || (eventPlan.active === true && eventPlan.enforced === true))
+    // Event ambiguity: never guess. Return BOTH events so the model can decide
+    // whether they are the same event (and ask the user when it cannot tell).
+    const ambiguous = eventPlan.active === true && eventPlan.status === 'similar'
+    let result
+    if (ambiguous) {
+      result = {
+        additions: [],
+        stats: emptyRecallStats(ctx),
+        warnings: [],
+        paginated: true,
+        ambiguous: true,
+        page: { offset: clampInt(opts.offset, 0, 1_000_000, 0), limit: 0, returned: 0, candidates: 0, hasMore: false },
+      }
+    } else if (browsing) {
+      result = this._browseRecall({
+        index: this.recallIndex(),
+        opts,
+        timePlan,
+        eventPlan,
+        context: ctx,
+        offset: clampInt(opts.offset, 0, 1_000_000, 0),
+        take: Number.isFinite(Number(opts.limit)) && Number(opts.limit) > 0
+          ? Math.min(1000, Math.floor(Number(opts.limit)))
+          : Number.isFinite(Number(this.cfg?.recall?.firstGenMax))
+            ? Math.max(1, Math.floor(Number(this.cfg.recall.firstGenMax)))
+            : 10,
+        warnings: [],
+      })
+    } else if (mode === 'legacy') {
+      result = null
+    } else {
+      result = this._deterministicRecall({
+        userText,
+        context: ctx,
+        options: opts,
+        index: refreshed.index,
+        mode,
+        timePlan,
+        eventPlan,
+        startedAt: typeof performance !== 'undefined' && performance && typeof performance.now === 'function' ? performance.now() : undefined,
+      })
+    }
     if (!result) {
       result = runRecall({
         userText,
@@ -366,16 +428,19 @@ export class MemoryEngine {
         excludeIds: opts.excludeIds,
         // v1.3.0: α floor for QQ channel recalls (non-owner group member, D4).
         minAlpha: opts.minAlpha,
-        // v1.4.0: first-generation time filter (C(Q) ∩ W).
+        // v1.4.0: first-generation filters (C(Q) ∩ W ∩ E).
         timeIds: timePlan.ids,
+        eventIds: eventPlan.ids,
       })
     }
     const stats = result.stats || {}
     const additions = Array.isArray(result.additions) ? result.additions : []
-    // Time-input warnings (ignored/failed/normalized) are part of the result the
-    // adapter and the model tool surface; never drop them.
-    if (Array.isArray(timePlan.warnings) && timePlan.warnings.length > 0) {
-      result.warnings = [...(Array.isArray(result.warnings) ? result.warnings : []), ...timePlan.warnings]
+    // Time/event input warnings (ignored/failed/normalized) are part of the result
+    // the adapter and the model tool surface; never drop them.
+    for (const plan of [timePlan, eventPlan]) {
+      if (Array.isArray(plan.warnings) && plan.warnings.length > 0) {
+        result.warnings = [...(Array.isArray(result.warnings) ? result.warnings : []), ...plan.warnings]
+      }
     }
 
     // --- v1.4.0 pagination ---------------------------------------------------
@@ -404,13 +469,30 @@ export class MemoryEngine {
     }
 
     // --- v1.4.0 miss classification (drives the memory_recall strike logic) --
-    const preFilterCandidates = (Number(stats.matchedFolders) || 0) + (Number(stats.timeFiltered) || 0)
+    const matchedFolders = Number(stats.matchedFolders) || 0
+    const timeFiltered = Number(stats.timeFiltered) || 0
+    const eventFiltered = Number(stats.eventFiltered) || 0
+    const preFilterCandidates = matchedFolders + timeFiltered + eventFiltered
+    const afterTimeFilter = matchedFolders + eventFiltered
     let missType = null
     if (pageItems.length === 0) {
-      if (result.browse === true) missType = 'time'
-      else if (timePlan.active && preFilterCandidates > 0 && (Number(stats.matchedFolders) || 0) === 0) missType = 'time'
+      if (ambiguous) missType = 'event-ambiguous'
+      else if (result.browse === true) missType = timePlan.active ? 'time' : eventPlan.active ? 'event' : 'keyword'
       else if (preFilterCandidates === 0) missType = 'keyword'
+      else if (timePlan.active && afterTimeFilter === 0) missType = 'time'
+      else if (eventPlan.active && eventPlan.enforced && matchedFolders === 0) missType = 'event'
     }
+
+    const eventInfo = eventPlan.active && eventPlan.visible !== false
+      ? {
+          status: eventPlan.status,
+          requested: eventPlan.requested,
+          label: eventPlan.label,
+          count: eventPlan.count,
+          candidates: eventPlan.candidates,
+          enforced: eventPlan.enforced,
+        }
+      : null
 
     const timeWindow = timePlan.active
       ? {
@@ -453,7 +535,11 @@ export class MemoryEngine {
       registerDrops: Number.isFinite(stats.registerDrops) ? stats.registerDrops : null,
       reInjections: Number.isFinite(stats.reInjections) ? stats.reInjections : null,
       degraded: stats.degraded === true,
-      timeFiltered: Number.isFinite(stats.timeFiltered) ? stats.timeFiltered : 0,
+      timeFiltered,
+      // --- v1.4.0 event constraint telemetry ---
+      eventStatus: eventInfo ? eventInfo.status : 'absent',
+      eventLabel: eventInfo ? eventInfo.label : null,
+      eventFiltered,
       timeWindow: timeWindow ? { from: timeWindow.from, to: timeWindow.to, level: timeWindow.level, widenedTo: timeWindow.widenedTo } : null,
       offset,
       limit,
@@ -476,6 +562,7 @@ export class MemoryEngine {
       additions: pageItems,
       page,
       timeWindow,
+      eventInfo,
       missType,
       mode,
       lanes: result.lanes,
@@ -576,6 +663,88 @@ export class MemoryEngine {
   }
 
   /**
+   * The in-memory event index, rebuilt lazily when the loaded index or the event
+   * settings change (never persisted; the canonical label lives in folder meta).
+   */
+  eventIndex() {
+    const refreshed = this._refresh()
+    const folders = Array.isArray(refreshed.index.folders) ? refreshed.index.folders : []
+    const eventCfg = this.cfg && typeof this.cfg.event === 'object' && this.cfg.event ? this.cfg.event : {}
+    const similarity = eventCfg.similarity && typeof eventCfg.similarity === 'object' ? eventCfg.similarity : {}
+    const key = `${refreshed.mtimeMs}|${refreshed.size ?? -1}|${folders.length}|${eventCfg.maxLabelLength ?? ''}|${similarity.metric ?? ''}|${similarity.threshold ?? ''}`
+    if (this._eventIndexCache && this._eventIndexCache.key === key) return this._eventIndexCache.value
+    const value = buildEventIndex(folders, this.cfg)
+    this._eventIndexCache = { key, value }
+    return value
+  }
+
+  /**
+   * v1.4.0 event constraint: resolve the model-submitted `event` argument into a
+   * folder-id filter (ANDed with any time window). Never throws; a bad value
+   * degrades to "no constraint" + warning.
+   *
+   * Statuses: absent (no `event` argument) | empty (explicit "空") | exact |
+   * similar (ambiguous — the caller must return both events to the model) |
+   * unknown (no memory carries that event) | disabled (`event.mode` is not
+   * 'constrain').
+   */
+  _recallEventPlan(options) {
+    const opts = options && typeof options === 'object' ? options : {}
+    const hasInput = Object.prototype.hasOwnProperty.call(opts, 'event') && opts.event !== undefined && opts.event !== null
+    const eventCfg = this.cfg?.event && typeof this.cfg.event === 'object' ? this.cfg.event : {}
+    const inactive = {
+      active: false,
+      status: 'absent',
+      requested: '',
+      label: null,
+      ids: null,
+      candidates: [],
+      count: null,
+      enforced: false,
+      warnings: [],
+    }
+    if (!hasInput) return inactive
+    if (eventCfg.mode === 'off') {
+      return { ...inactive, active: true, status: 'off', visible: false, warnings: ['recall: event arguments ignored because event.mode is "off"'] }
+    }
+    const submitted = typeof opts.event === 'string' ? opts.event : String(opts.event)
+    try {
+      const resolved = resolveEventQuery(this.eventIndex(), submitted, this.cfg)
+      const constrained = eventCfg.mode === 'constrain' && (resolved.status === 'exact' || resolved.status === 'unknown')
+      let count = null
+      if (resolved.status === 'exact' && resolved.ids instanceof Set) count = resolved.ids.size
+      else if (resolved.status === 'unknown') count = 0
+      return {
+        active: true,
+        visible: true,
+        status: resolved.status,
+        requested: resolved.requested,
+        label: resolved.label || null,
+        // `ids === null` means "not constrained" (empty/similar/disabled).
+        ids: constrained ? resolved.ids : null,
+        candidates: Array.isArray(resolved.candidates) ? resolved.candidates : [],
+        count,
+        enforced: constrained,
+        warnings: Array.isArray(resolved.warnings) ? resolved.warnings : [],
+      }
+    } catch (error) {
+      return {
+        ...inactive,
+        active: true,
+        status: 'disabled',
+        warnings: [`recall: event query failed (${error && error.message ? error.message : error}); ignored`],
+      }
+    }
+  }
+
+  /**
+   * Public helper for tools/tests: resolve one raw event submission.
+   */
+  eventQueryFor(event) {
+    return this._recallEventPlan({ event })
+  }
+
+  /**
    * v1.4.0 FAIR-DRI recall (engine/recall-index.js): deterministic selection with
    * the rare-term / high-α / register / probe / rotation / recycle lanes.
    *
@@ -590,6 +759,8 @@ export class MemoryEngine {
     const recallCfg = cfg && typeof cfg.recall === 'object' && cfg.recall ? cfg.recall : {}
     const timeCfg = cfg && typeof cfg.time === 'object' && cfg.time ? cfg.time : {}
     const timePlan = request.timePlan || { active: false, ids: null, enforced: false, normalized: null }
+    const eventPlan = request.eventPlan || { active: false, ids: null, enforced: false }
+    const eventIds = eventPlan.ids instanceof Set ? eventPlan.ids : null
     const mode = request.mode === 'deterministic' ? 'deterministic' : 'fair'
     const userText = typeof request.userText === 'string' ? request.userText : ''
 
@@ -660,6 +831,7 @@ export class MemoryEngine {
         excludeIds: opts.excludeIds,
         minAlpha: opts.minAlpha,
         timeIds: attempt.ids,
+        eventIds,
         k,
         hops,
       })
@@ -710,15 +882,18 @@ export class MemoryEngine {
     let candidatesInWindow = Number(selectStats.candidates) || 0
     let candidatesAll = candidatesInWindow
     let timeFiltered = Number(selectStats.filteredByTime) || 0
+    let eventFiltered = Number(selectStats.filteredByEvent) || 0
     try {
       const seedList = querySeeds(index, userText, cfg).seeds
       const counts = uniqueCandidateCounts(index, seedList, {
         minAlpha: opts.minAlpha,
         timeIds: timePlan.active && timePlan.enforced ? timePlan.ids : null,
+        eventIds,
       })
       candidatesAll = counts.all
-      candidatesInWindow = counts.inWindow
       timeFiltered = Math.max(0, counts.all - counts.inWindow)
+      eventFiltered = Math.max(0, counts.inWindow - counts.inEvent)
+      candidatesInWindow = counts.inEvent
     } catch {
       /* keep the selector counters when the recount fails */
     }
@@ -772,6 +947,7 @@ export class MemoryEngine {
       reInjections: Number(selectStats.reInjections) || 0,
       degraded: selectStats.degraded === true,
       timeFiltered,
+      eventFiltered,
       filteredByAlpha: Number(selectStats.filteredByAlpha) || 0,
       round,
     }
@@ -816,12 +992,14 @@ export class MemoryEngine {
     const request = input && typeof input === 'object' ? input : {}
     const opts = request.opts && typeof request.opts === 'object' ? request.opts : {}
     const timePlan = request.timePlan || {}
+    const eventPlan = request.eventPlan || {}
     const ctx = request.context && typeof request.context === 'object' ? request.context : {}
     const index = request.index || this.recallIndex()
     const offset = clampInt(request.offset, 0, 1_000_000, 0)
     const take = Number.isFinite(request.take) && request.take > 0 ? Math.floor(request.take) : 10
     const warnings = Array.isArray(request.warnings) ? request.warnings : []
     const windowIds = timePlan.ids instanceof Set ? timePlan.ids : null
+    const eventIds = eventPlan.ids instanceof Set ? eventPlan.ids : null
     const excluded = toIdSet(opts.excludeIds)
     const minAlphaRaw = Number(opts.minAlpha)
     const alphaFloor = Number.isFinite(minAlphaRaw) ? Math.min(1, Math.max(0, minAlphaRaw)) : 0
@@ -829,6 +1007,7 @@ export class MemoryEngine {
     const candidates = []
     for (const entry of index.entries) {
       if (windowIds && !windowIds.has(entry.id)) continue
+      if (eventIds && !eventIds.has(entry.id)) continue
       if (alphaFloor > 0 && entry.alpha < alphaFloor) continue
       if (excluded.has(entry.id)) continue
       const folder = entry.folder && typeof entry.folder === 'object' ? entry.folder : {}

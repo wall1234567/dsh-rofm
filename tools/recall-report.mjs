@@ -73,11 +73,13 @@ the reading model and never affects the recall probability).
 
 v1.4.0 lines (printed after the β line): \`lanes (v1.4.0)\` (lanesPicked
 distribution, registerDrops/degraded/reInjections, recall modes), \`time filter\`
-(timeFiltered, timeWindow/widenedTo, missType, hasMore) and \`pending era\`
-(legacy / synthetic / current folders+pending; current is the actionable number,
-e.g. 2/369 = 0.54%). Old ≤1.3.0 telemetry prints n/a on the time/lane lines; the
-pending-era block reads index.json so it always works. --json adds the keys
-laneStats, timeStats and pendingEras.`
+(timeFiltered, timeWindow/widenedTo, missType, hasMore), \`event filter\` (the
+event-constraint telemetry: eventStatus distribution, eventFiltered total and the
+most frequent eventLabel) and \`pending era\` (legacy / synthetic / current
+folders+pending; current is the actionable number, e.g. 2/369 = 0.54%). Old
+≤1.3.0 telemetry prints n/a on the lane/time/event lines; the pending-era block
+reads index.json so it always works. --json adds the keys laneStats, timeStats,
+eventStats and pendingEras.`
 
 function parseArgs(argv) {
   const flags = {}
@@ -359,6 +361,52 @@ export function timeStats(events) {
 }
 
 /**
+ * Event-constraint telemetry from v1.4.0 recall events (contract §7 / §6.9):
+ * the `eventStatus` distribution (`absent`/`empty`/`exact`/`similar`/`unknown`/
+ * `disabled`), how many candidates the event constraint removed
+ * (`eventFiltered`), and the most frequent `eventLabel` (the canonical event the
+ * recall was scoped to). Telemetry from ≤1.3.0 has none of these fields → the
+ * line prints n/a.
+ *
+ * @param {object[]} events telemetry events (already time-ordered/filtered)
+ */
+export function eventStats(events) {
+  const stats = {
+    events: 0,
+    statuses: {},
+    filteredEvents: 0,
+    filteredTotal: 0,
+    labels: {},
+    topLabel: null,
+  }
+  for (const event of Array.isArray(events) ? events : []) {
+    if (!event || typeof event !== 'object' || event.type !== 'recall') continue
+    const hasFields =
+      event.eventStatus !== undefined || event.eventFiltered !== undefined || event.eventLabel !== undefined
+    if (!hasFields) continue
+    stats.events += 1
+    if (typeof event.eventStatus === 'string' && event.eventStatus) {
+      stats.statuses[event.eventStatus] = (stats.statuses[event.eventStatus] || 0) + 1
+    }
+    if (Number.isFinite(event.eventFiltered)) {
+      stats.filteredTotal += event.eventFiltered
+      if (event.eventFiltered > 0) stats.filteredEvents += 1
+    }
+    if (typeof event.eventLabel === 'string' && event.eventLabel) {
+      stats.labels[event.eventLabel] = (stats.labels[event.eventLabel] || 0) + 1
+    }
+  }
+  let topLabel = null
+  for (const [label, count] of Object.entries(stats.labels)) {
+    if (topLabel === null || count > topLabel.count || (count === topLabel.count && label < topLabel.label)) {
+      topLabel = { label, count }
+    }
+  }
+  stats.topLabel = topLabel
+  return stats
+}
+
+/**
  * Pending data-era statistics for the memory dir, reusing `tools/memory-audit.mjs`
  * (whose classification delegates to the shared `engine/era.js`). Both era views
  * stay separate: the audit session entry carries `era` (session level) and
@@ -401,6 +449,17 @@ export function formatTimeLine(stats) {
     `${label}${stats.events} event(s), timeFiltered>0 ${stats.timeFilteredEvents} (total ${stats.timeFilteredTotal}), ` +
     `timeWindow ${stats.timeWindowEvents}, widenedTo ${counterText(stats.widenedTo)}, ` +
     `missType ${counterText(stats.missTypes)}, hasMore ${stats.hasMoreEvents}\n`
+  )
+}
+
+/** Aligned event-filter line (v1.4.0 event constraint). */
+export function formatEventLine(stats) {
+  const label = 'event filter'.padEnd(23) + ': '
+  if (!stats || stats.events === 0) return `${label}n/a (no v1.4.0 event telemetry yet)\n`
+  const top = stats.topLabel ? `${stats.topLabel.label}=${stats.topLabel.count}` : 'none'
+  return (
+    `${label}${stats.events} event(s), eventStatus ${counterText(stats.statuses)}, ` +
+    `eventFiltered>0 ${stats.filteredEvents} (total ${stats.filteredTotal}), top eventLabel ${top}\n`
   )
 }
 
@@ -465,6 +524,7 @@ function main() {
   const work = workStats(events)
   const lanes = laneStats(events)
   const timeFilter = timeStats(events)
+  const eventFilter = eventStats(events)
   const pendingEras = pendingEraStats(memoryDir)
 
   if (flags.json) {
@@ -479,6 +539,7 @@ function main() {
           betaStats: beta,
           laneStats: lanes,
           timeStats: timeFilter,
+          eventStats: eventFilter,
           pendingEras,
         },
         null,
@@ -491,6 +552,7 @@ function main() {
     process.stdout.write(formatBetaLine(beta))
     process.stdout.write(formatLaneLine(lanes))
     process.stdout.write(formatTimeLine(timeFilter))
+    process.stdout.write(formatEventLine(eventFilter))
     process.stdout.write(formatPendingEraLines(pendingEras))
     if (events.length === 0) {
       process.stderr.write(

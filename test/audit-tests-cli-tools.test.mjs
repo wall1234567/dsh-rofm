@@ -21,6 +21,7 @@ import * as engine from '../engine/index.js'
 const REPO_ROOT = path.resolve(fileURLToPath(new URL('..', import.meta.url)))
 const CLI = path.join(REPO_ROOT, 'engine', 'cli.mjs')
 const REPORT = path.join(REPO_ROOT, 'tools', 'recall-report.mjs')
+const MEMORY_AUDIT = path.join(REPO_ROOT, 'tools', 'memory-audit.mjs')
 const SHOW_RECALL = path.join(REPO_ROOT, 'tools', 'show-recall.mjs')
 
 const tempDirs = []
@@ -192,6 +193,36 @@ test('report tool: no β telemetry prints the documented n/a line (SPEC §9)', (
   const runResult = run(REPORT, ['--dir', dir])
   assert.equal(runResult.status, 0, runResult.stderr)
   assert.match(runResult.stdout, /beta \(trust\)\s+: n\/a \(no recall telemetry with β yet\)/)
+})
+
+test('memory-audit --json: events section counts event-tagged folders (SPEC §9 / §6.9)', () => {
+  // The event tag is an optional v1.4.0 metadata field mirrored from meta.json
+  // into index.folders; the audit tool reports it read-only.
+  const dir = tempDir()
+  const createdAt = 1_700_000_000_000
+  fs.writeFileSync(
+    path.join(dir, 'index.json'),
+    JSON.stringify({
+      version: 1,
+      updatedAt: createdAt,
+      nextCounter: 4,
+      folders: [
+        { id: 'mem-20261026T131909Z-0001', createdAt, alpha: 0.6, beta: 1, scored: true, rescorePending: false, keywords: ['a', 'b', 'c'], chars: 1, tokens: 1, messageCount: 1, title: 'a', event: '日本旅行' },
+        { id: 'mem-20261026T131909Z-0002', createdAt, alpha: 0.6, beta: 1, scored: true, rescorePending: false, keywords: ['a', 'b', 'c'], chars: 1, tokens: 1, messageCount: 1, title: 'b', event: '日本旅行' },
+        { id: 'mem-20261026T131909Z-0003', createdAt, alpha: 0.6, beta: 1, scored: true, rescorePending: false, keywords: ['a', 'b', 'c'], chars: 1, tokens: 1, messageCount: 1, title: 'c' },
+      ],
+    }),
+    'utf8',
+  )
+  const runResult = run(MEMORY_AUDIT, ['--memory', dir, '--json'])
+  assert.equal(runResult.status, 0, runResult.stderr)
+  const parsed = JSON.parse(runResult.stdout)
+  assert.equal(parsed.readOnly, true)
+  assert.equal(parsed.events.foldersWithEvent, 2)
+  assert.equal(parsed.events.distinctEvents, 1)
+  assert.deepEqual(parsed.events.top, [{ label: '日本旅行', count: 2 }])
+  // The human report documents the events section via --help.
+  assert.match(run(MEMORY_AUDIT, ['--help']).stdout, /events = v1\.4\.0 事件标签统计/)
 })
 
 test('report tool: --json exposes the v1.4.0 laneStats/timeStats and pendingEra buckets (SPEC §9)', () => {

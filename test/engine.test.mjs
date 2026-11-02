@@ -1307,3 +1307,84 @@ test('store: v1.4.0 commit idempotency key round-trips through the index', () =>
   const plain = indexEntryFromMeta({ id, createdAt: 1, alpha: 0.5 })
   assert.equal('idempotencyKey' in plain, false)
 })
+
+// ---------------------------------------------------------------------------
+// v1.4.0 event constraint: config + index fields
+// ---------------------------------------------------------------------------
+
+test('config: v1.4.0 event block defaults and validation', () => {
+  const cfg = loadConfig()
+  assert.equal(cfg.event.mode, 'index', 'engine default is index-only (never filters)')
+  assert.equal(cfg.event.maxLabelLength, 60)
+  assert.deepEqual(cfg.event.similarity, { metric: 'dice', threshold: 0.72, maxCandidates: 5 })
+  assert.equal(cfg.event.askUserHint, true)
+  // explicit product values are accepted without warnings
+  const constrain = loadConfig(undefined, { event: { mode: 'constrain' } })
+  assert.deepEqual(constrain.warnings, [])
+  assert.equal(constrain.event.mode, 'constrain')
+  // invalid values are replaced with warnings, never thrown
+  const bad = loadConfig(undefined, {
+    event: { mode: 'always', maxLabelLength: 0, similarity: { threshold: 2, maxCandidates: 0 }, askUserHint: 'yes' },
+  })
+  assert.ok(bad.warnings.some((warning) => warning.includes('event.mode')), 'event.mode warns')
+  assert.ok(bad.warnings.some((warning) => warning.includes('event.maxLabelLength')), 'event.maxLabelLength warns')
+  assert.ok(bad.warnings.some((warning) => warning.includes('event.similarity.threshold')), 'threshold warns')
+  assert.ok(bad.warnings.some((warning) => warning.includes('event.similarity.maxCandidates')), 'maxCandidates warns')
+  assert.ok(bad.warnings.some((warning) => warning.includes('event.askUserHint')), 'askUserHint warns')
+  assert.equal(bad.event.mode, 'index')
+  assert.equal(bad.event.maxLabelLength, 60)
+  assert.deepEqual(bad.event.similarity, { metric: 'dice', threshold: 0.72, maxCandidates: 5 })
+  assert.equal(bad.event.askUserHint, true)
+  // a non-object event block falls back to the defaults
+  const broken = validateConfig({ event: 'nope' })
+  assert.equal(broken.event.mode, 'index')
+  assert.equal(broken.event.similarity.threshold, 0.72)
+})
+
+test('store: v1.4.0 event label fields are copied explicitly and only when valid', () => {
+  const full = indexEntryFromMeta({
+    id: 'mem-20260101T000000Z-0001',
+    createdAt: 5,
+    alpha: 0.4,
+    event: '日本旅行',
+    eventSource: 'llm',
+    eventAt: 1762000000000,
+  })
+  assert.equal(full.event, '日本旅行')
+  assert.equal(full.eventSource, 'llm')
+  assert.equal(full.eventAt, 1762000000000)
+  // empty / oversized / invalid values are dropped instead of poisoning the index
+  for (const event of ['', '   ', 42, 'x'.repeat(201)]) {
+    const entry = indexEntryFromMeta({ id: 'mem-20260101T000000Z-0002', createdAt: 5, event })
+    assert.equal('event' in entry, false, `invalid event ${JSON.stringify(String(event)).slice(0, 12)} must be dropped`)
+  }
+  assert.equal('eventSource' in indexEntryFromMeta({ id: 'mem-x', eventSource: 'guess' }), false)
+  assert.equal('eventAt' in indexEntryFromMeta({ id: 'mem-x', eventAt: NaN }), false)
+  // old folders keep exactly the v1.3.0 entry shape (no event fields invented)
+  const plain = indexEntryFromMeta({ id: 'mem-20260101T000000Z-0003', createdAt: 1, alpha: 0.5 })
+  assert.equal('event' in plain, false)
+  assert.equal('eventSource' in plain, false)
+  assert.equal('eventAt' in plain, false)
+})
+
+test('store: v1.4.0 event label survives writeIndex/readIndex round-trip', () => {
+  const cfg = loadConfig()
+  const dir = tempDir()
+  ensureMemoryDir(dir)
+  const id = formatFolderId(1700000000000, 11)
+  writeIndex(dir, cfg, {
+    version: 1,
+    nextCounter: 2,
+    folders: [{ id, createdAt: 5, alpha: 0.4, keywords: ['旅行'], event: '日本旅行', eventSource: 'llm', eventAt: 123 }],
+  })
+  const read = readIndex(dir, cfg).folders[0]
+  assert.equal(read.event, '日本旅行')
+  assert.equal(read.eventSource, 'llm')
+  assert.equal(read.eventAt, 123)
+  // rebuild from meta keeps it too, and an explicit empty event stays absent
+  writeFolder(dir, { id, meta: { createdAt: 5, alpha: 0.4, event: '登录重构项目', eventSource: 'llm' }, messages: [] })
+  fs.rmSync(path.join(dir, 'index.json'), { force: true })
+  const rebuilt = loadIndex(dir, cfg).folders[0]
+  assert.equal(rebuilt.event, '登录重构项目')
+  assert.equal(rebuilt.eventSource, 'llm')
+})

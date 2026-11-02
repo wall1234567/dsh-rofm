@@ -945,17 +945,17 @@ macOS 专项处理：APFS 大小写不敏感由 **`realpath` 归一化**吸收�
 > 一键门禁 `node tools/verify-1.4.0.mjs` 是最终可复现的发布口径（8 步全部 exit 0 才算 PASS）。
 > 所有对真实 `memory/` 的操作**只读**，写盘测试全部使用 `os.tmpdir()` 临时目录。
 >
-> **测试数（v1.4.0 最终版）**：`node --test` = **836 tests / 834 pass / 0 fail / 2 skip**
+> **测试数（v1.4.0 最终版，含事件约束增补）**：`node --test` = **916 tests / 914 pass / 0 fail / 2 skip**
 > （2 skip = Node zstd 平台条件跳过，非缺陷；不是 Windows 符号链接用例；engine 层 622 / adapter 层 213）；
-> 另有 2 个 e2e 文件 **8 + 6 = 14 用例**全绿 → 一键门禁汇总 **850 / 848 pass / 0 fail**。
+> 另有 2 个 e2e 文件 **12 + 7 = 19 用例**全绿 → 一键门禁汇总 **935 / 933 pass / 0 fail**。
 
 ### 20.1 门禁命令与实测结果（8 步全部 exit 0）
 
 | # | 命令 | 结果（实测） | 耗时 |
 |---|---|---|---|
-| 1 | `node --test`（全量，= verify 第 1 步） | **836 tests / 834 pass / 0 fail / 2 skip** | ~20 s |
+| 1 | `node --test`（全量，= verify 第 1 步） | **916 tests / 914 pass / 0 fail / 2 skip**（事件约束增补后，见 §21） | ~27 s |
 | 2 | `node test/simulate.mjs` | exit 0（`context added back 11.98 %`；legacy 路径，v1.3.0 回归口径） | ~0.3 s |
-| 3 | `node tools/selfcheck.mjs` | exit 0；检测到 QQ 插件 **10 passed / 1 warning / 0 failed**（11 条 check）；neutral profile **7 / 1 / 0**（8 条） | ~1–2 s |
+| 3 | `node tools/selfcheck.mjs` | exit 0；检测到 QQ 插件 **11 passed / 1 warning / 0 failed**（12 条 check）；neutral profile **8 / 1 / 0**（9 条） | ~1–2 s |
 | 4 | `node engine/cli.mjs --help` | exit 0 | ~0.1 s |
 | 5 | `node tools/memory-audit.mjs --json` | exit 0（真实库只读；四套口径见 §20.5） | ~0.1 s |
 | 6 | `node tools/time-view.mjs --help` | exit 0（只读时间视图） | ~0.1 s |
@@ -1195,6 +1195,96 @@ v1.4.0 新增/扩展测试文件（当前用例数，`node --test <file>` 实测
 - **CLI 没有 turn 语义**：`engine/cli.mjs` 不暴露 `protectSeq`（文档已写明）；
   `compress --allow-small-window` 只是逐 plan 覆盖，不改变产品默认；
 - **Linux/macOS**：仍以 CI 三平台矩阵为准（本机无真机，同 §19.4）；
-- **数字口径**：本节测试数为 v1.4.0 最终版（836 / 834 pass / 0 fail / 2 skip + e2e 14 →
-  门禁 850 / 848 / 0），发布门禁以 `node tools/verify-1.4.0.mjs` 输出为准。
+- **数字口径**：§20 为 v1.4.0 主功能验证；事件约束增补后全量为 916 / 914 pass / 0 fail / 2 skip（+ e2e 19），见 §21；
+  **§21 为「事件约束」增补验证**（最终 916 / 914 pass / 2 skip，门禁 935 / 933）；
+  发布门禁以 `node tools/verify-1.4.0.mjs` 输出为准。
+
+## 21. 1.4.0 增补：事件约束验证记录（2026-11-02）
+
+> **口径说明**：本节是 v1.4.0 **未发布增补「事件约束」**的验证记录（版本号仍为 1.4.0）。
+> 数字为收尾实测；`node --test` 全量在 Lead 最终门禁前仍可能新增用例（收尾前快照
+> **916 tests / 914 pass / 0 fail / 2 skip**），门禁结论 **0 fail**。
+> 环境同 §20：Windows 11 / Node v24.21.0；真实 `memory/` 全程只读。
+
+### 21.1 测试与门禁
+
+| 项 | 实测 |
+|---|---|
+| `test/event-index.test.mjs`（新） | **28 / 28 pass**：归一化/空词/长度、Dice/avg/min 相似度、exact/similar/unknown/disabled、评分归并（`event-merged:`）、索引构建与缓存、真实标签 |
+| `test/recall-index.test.mjs` | **52 / 52 pass**（+8 事件用例：`C(Q)∩W∩E`、时间+事件 AND、`filteredByEvent`） |
+| `test/recall.test.mjs` 的 `events:*` | **10 条**：事件索引分组、exact 过滤、省略/「空」不约束、unknown 事件 miss、similar 歧义不猜、time+event AND、AND 下窗外/事件外 miss 分类、`mode=index/off`、纯事件浏览、遥测字段 |
+| `test/cli.test.mjs` 事件用例 | **4 条**：`--event` 约束、纯事件浏览、`--event 空`、ambiguous/unknown 提示 |
+| `test-adapter/plugin-mock.test.mjs` | **58 条**，其中事件相关 3 条：任务区块含 event rubric、空召回提示含 event 用法、**自动召回不传 `event`**；`memory_recall` 四态渲染与 `memory_judge` 打标签/归并/清空 |
+| `test/config-consistency.test.mjs` + `test/release.test.mjs` | **30 / 30 pass**（event 段与 DEFAULT_CONFIG/文档一致；CHANGELOG 段含「事件约束」） |
+| `node tools/selfcheck.mjs` 的 `event tags` 检查（新） | **纯 INFO 观测项**：带 event 的 folder 数 / 去重事件数 / 主要事件 / `event.mode`（engine 默认 vs 随包 vs 生效）/ similarity metric+threshold / 相似标签抽查。真实库输出 `no event-tagged memories yet (0/3742 folder(s) carry an event label); event.mode engineDefault=index, packaged=constrain, effective=constrain; similarity metric=dice threshold=0.72`。两种环境口径：检测到 QQ 插件 **11 passed / 1 warning / 0 failed**（12 条 check 行）；neutral **8 passed / 1 warning / 0 failed**（9 条）——唯一 WARN 仍是 a46 旧会话遗留 checkpoint note |
+| 全量 `node --test` | **916 / 914 pass / 0 fail / 2 skip**（2 skip = Node zstd 平台条件跳过） |
+
+### 21.2 相似度实测（Dice 默认指标）
+
+`eventSimilarity()` 默认 `metric='dice'`：`score = 2·|A∩B| / (|A|+|B|)`（token = Latin 词 len≥2 +
+CJK bigram + CJK 单字），`≥ event.similarity.threshold=0.72` 视为“双向高度相似”。实测（当前代码）：
+
+| A | B | Dice | 含义 |
+|---|---|---|---|
+| 日本旅行 | 日本旅行计划 | **0.778** | ≥0.72 → 视为同一事件（评分期自动归并；回忆期返回 similar 候选让模型判断） |
+| 日本旅行 | 日本美食 | **0.429** | <0.72 → 不同事件，不合并 |
+| 项目 | 登录重构项目 | **0.429** | <0.72 → 短标签不会吞掉更长事件（长度失衡被惩罚） |
+
+`metric='avg'`（`(containA+containB)/2`）与 `'min'`（严格：`日本旅行` vs `日本旅行计划` 仅 0.636）
+为可选实验指标；默认产品行为固定 Dice。单测还覆盖：完全相同 =1、无共享 token =0、空标签 =0。
+
+### 21.3 回忆期四态与 AND
+
+- **exact**：`events: recall constrained to one event returns only that event (exact)` 通过——
+  `C(Q)∩W∩E` 只返回该事件记忆；跨事件同关键词不串（不同事件即使关键词相同也不会混入）。
+- **empty/disabled**：`events: omitted / explicit "空" both mean "no event constraint"` 与
+  `events: event.mode=index never filters but reports disabled; mode=off ignores the argument` 通过——
+  省略/「空」= 不约束；`event.mode='index'`（engine 默认）只建索引不约束且 `enforced=false`；
+  `'off'` 忽略参数并 warning。
+- **unknown**：`events: an unknown event constrains to nothing and reports missType=event` 通过——
+  返回空结果 + `missType='event'` + 提示（补标签 / `event:"空"` / 问用户），**不计 3/6 strike**。
+- **similar（歧义）**：`events: a bidirectionally similar submission returns ambiguity instead of guessing` 通过——
+  不自动合并、不选路、`additions: []`、返回候选事件（label/count/score，最多 5 个），
+  `missType='event-ambiguous'`，**不计 strike**；模型可重试候选标签、`event:"空"` 或询问用户。
+- **AND**：`events: time and event constraints are ANDed` 与
+  `events: under AND, an in-window candidate outside the event is an event miss` 通过——
+  `C(Q)∩W∩E` 同时生效；时间硬窗口不会被事件放宽；只约束第一代。
+- **纯事件浏览**：`events: browsing by event works without keywords (event start order)` 通过——
+  无 keywords 只给 `event` 时按 eventStart 升序浏览该事件记忆，不消费/推进 lane 状态。
+- **遥测**：`events: recall telemetry records eventStatus/eventLabel/eventFiltered` 通过——
+  `recall` 事件出现 `eventStatus` / `eventLabel` / `eventFiltered`，缺失字段的旧遥测按“缺失”处理。
+
+### 21.4 事件标签一致性（全库唯一标签）
+
+- **评分期自动归并**：`assignEventLabel()` 对“双向高度相似”的已有 canonical 标签静默归并，
+  返回 warning（稳定前缀 **`event-merged:`**，如
+  `event-merged: 事件「旅行经历」与已有事件「日本旅行」高度相似（0.83），已归并到后者，保证同一事件标签一致`）；
+  `memory_judge` 摘要只统计 assigned/merged/cleared 计数（不含正文）。
+- **回忆期不自动合并**：相似但不同的事件返回候选让模型判断（见 21.3 similar），不静默合并。
+- **清空语义**：`event:'空'` 删除 `meta.event`（不写空字符串）；写入时同步
+  `eventSource='llm'`、`eventAt`；**新记忆不强制 event**（α+β+keywords 三元组必填不变），
+  缺失时只追加非阻断提示。
+- 单测：`event-index.test.mjs` 的归并/清空/exact 用例 + `plugin-mock` 的 judge 打标签/归并/清空用例通过。
+
+### 21.5 旧数据回退与真实数据只读
+
+- **旧数据无 event**：本机真实库 **21 store / 3742 folders**，其中 `event` 字段 **0 个**
+  （只读统计，2026-11-02）——这些记忆**不参与**事件约束召回（仍可按关键词/时间正常回忆），
+  复核评分时补标签即可；**不批量回填、不改写旧 meta**。
+- **迁移零要求**：旧 `index.json`（无 event 字段）可读；新字段 optional、有值才写；
+  `engine/store.js` 的 `indexEntryFromMeta` 显式拷贝（有值才写）。
+- **真实数据只读**：事件索引从 `index.json` 纯内存派生（不建事件文件夹、不落盘第二份真相）；
+  `memory-audit` / `selfcheck` / `recall-report` / CLI 只读运行，本次验证未写真实 `memory/`
+  （与 §20.6 的 7533 文件 `path→size:mtimeMs` 前后 0 变化同一约束）。
+- **回滚**：`event.mode='off'` 一键关闭（忽略参数、不建索引；已写 `event` 标签保留）。
+
+### 21.6 残余风险与限制
+
+- 事件相似是 **token Dice 相似、不是语义向量**：同义改写/缩写全称可能 <0.72，此时走 similar
+  歧义流程让模型/用户判断，不自动合并；阈值/指标可配（dice/avg/min）。
+- 事件标签质量取决于评分模型（`memory_judge`）；同一事件应始终用同一个标签，评分期自动归并兜底。
+- **自动召回不加事件约束**（发生在模型思考前，没有判断者）；事件约束只用于模型主动检索
+  （`memory_recall` / CLI `--event`）。
+- CLI `--event` 有 200 字符长度上限（超长报参数错误）；工具侧超长同样按参数错误处理。
+- 与时间约束一致：事件约束只作用于第一代候选，`hops` 后代沿用同一约束集。
 

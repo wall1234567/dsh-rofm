@@ -301,7 +301,7 @@ test('report tool: v1.4.0 lane and time-filter lines aggregate recall telemetry'
   )
 })
 
-test('report tool: old telemetry prints n/a on the v1.4.0 lane/time lines', () => {
+test('report tool: old telemetry prints n/a on the v1.4.0 lane/time/event lines', () => {
   const cfg = loadConfig()
   const dir = tempDir()
   appendStats(dir, cfg, { type: 'recall', contextChars: 1000, addedChars: 10, latencyMs: 1 })
@@ -309,6 +309,60 @@ test('report tool: old telemetry prints n/a on the v1.4.0 lane/time lines', () =
   assert.equal(run.status, 0, run.stderr)
   assert.match(run.stdout, /lanes \(v1\.4\.0\)\s+: n\/a \(no v1\.4\.0 recall telemetry yet\)/)
   assert.match(run.stdout, /time filter\s+: n\/a \(no v1\.4\.0 recall telemetry yet\)/)
+  assert.match(run.stdout, /event filter\s+: n\/a \(no v1\.4\.0 event telemetry yet\)/)
+  const parsed = JSON.parse(runReportTool(['--dir', dir, '--json']).stdout)
+  assert.equal(parsed.eventStats.events, 0)
+  assert.equal(parsed.eventStats.filteredTotal, 0)
+  assert.equal(parsed.eventStats.topLabel, null)
+})
+
+test('report tool: event filter line aggregates eventStatus/eventFiltered/eventLabel telemetry', () => {
+  const cfg = loadConfig()
+  const dir = tempDir()
+  appendStats(dir, cfg, {
+    type: 'recall',
+    contextChars: 1000,
+    addedChars: 10,
+    latencyMs: 1,
+    eventStatus: 'exact',
+    eventLabel: '日本旅行',
+    eventFiltered: 7,
+  })
+  appendStats(dir, cfg, {
+    type: 'recall',
+    contextChars: 1000,
+    addedChars: 10,
+    latencyMs: 1,
+    eventStatus: 'absent',
+    eventLabel: null,
+    eventFiltered: 0,
+  })
+  appendStats(dir, cfg, {
+    type: 'recall',
+    contextChars: 1000,
+    addedChars: 10,
+    latencyMs: 1,
+    eventStatus: 'unknown',
+    eventLabel: '登录重构项目',
+    eventFiltered: 2,
+  })
+
+  const jsonRun = runReportTool(['--dir', dir, '--json'])
+  assert.equal(jsonRun.status, 0, jsonRun.stderr)
+  const parsed = JSON.parse(jsonRun.stdout)
+  assert.equal(parsed.eventStats.events, 3)
+  assert.deepEqual(parsed.eventStats.statuses, { absent: 1, exact: 1, unknown: 1 })
+  assert.equal(parsed.eventStats.filteredEvents, 2)
+  assert.equal(parsed.eventStats.filteredTotal, 9)
+  // Both labels occur once; the tie is broken by label order.
+  assert.equal(parsed.eventStats.topLabel.count, 1)
+  assert.ok(['日本旅行', '登录重构项目'].includes(parsed.eventStats.topLabel.label))
+
+  const text = runReportTool(['--dir', dir])
+  assert.equal(text.status, 0, text.stderr)
+  assert.match(text.stdout, /event filter\s+: 3 event\(s\), eventStatus absent=1, exact=1, unknown=1/)
+  assert.match(text.stdout, /eventFiltered>0 2 \(total 9\)/)
+  assert.match(text.stdout, /top eventLabel (日本旅行|登录重构项目)=1/)
 })
 
 test('report tool: pending era block reads index.json via the shared engine/era.js rules', () => {

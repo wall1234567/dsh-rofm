@@ -1,8 +1,9 @@
 /**
  * FAIR-DRI selector tests — σ ordering, k-way merge / oracle, fairness lanes
  * (G1/G2/G3/G4/G5), register / queryBoost / recycle, block trimming,
- * pagination, time/α pre-filters, lane serialization + restart, determinism,
- * AC-vs-legacy matching, performance (plan §3.2.9 / contract §5.1).
+ * pagination, time/α/event pre-filters, lane serialization + restart,
+ * determinism, AC-vs-legacy matching, performance (plan §3.2.9 / contract §5.1,
+ * event constraint design §4).
  *
  * Everything here is deterministic: the tests use their own mulberry32 PRNG and
  * never Math.random(). The determinism test additionally proves the module
@@ -26,6 +27,7 @@ import {
   summarizeGuarantees,
   trimBlock,
 } from '../engine/recall-index.js'
+import { buildEventIndex, resolveEventQuery } from '../engine/event-index.js'
 import { countKeywordMatches, keywordMatches, normalizeText } from '../engine/tokenize.js'
 
 // ---------------------------------------------------------------------------
@@ -1496,5 +1498,210 @@ test('G3: block high-α (alpha >= thetaHigh 0.6) share stays >= 0.85 after warmu
   assert.ok(highCounts[rounds - 1] >= Math.ceil(0.85 * block.length))
   // low-α churn went through the recycle lane (never silently dropped)
   assert.ok(lanes.recycle.length > 0)
+})
+
+// ---------------------------------------------------------------------------
+// 22) event constraint (design §4): C(Q)∩W∩E
+//
+// `eventIds: Set|null` is a pre-filter exactly like `timeIds`: it is applied
+// after the time window, never consumes quota and never advances the frontier.
+// `stats.candidates` = |C(Q)∩W∩E|, `filteredByEvent` = candidates rejected by
+// the event constraint (deduplicated, same rule as filteredByTime).
+// ---------------------------------------------------------------------------
+
+function constrainCfg() {
+  return makeCfg({ event: { mode: 'constrain' } })
+}
+
+/** Mixed-event world: 12 jp / 8 lo / 1 no-event, all sharing one keyword. */
+function eventWorld() {
+  const list = []
+  for (let at = 0; at < 12; at += 1) list.push(folder(`jp${at}`, 0.8 - at * 0.01, at + 1, ['topicword'], { event: '日本旅行' }))
+  for (let at = 0; at < 8; at += 1) list.push(folder(`lo${at}`, 0.75 - at * 0.01, 100 + at, ['topicword'], { event: '登录重构项目' }))
+  list.push(folder('plain', 0.9, 200, ['topicword']))
+  return list
+}
+
+/** Resolve an event label to its id Set through the real event-index module. */
+function eventIdsOf(list, label) {
+  const cfg = constrainCfg()
+  const plan = resolveEventQuery(buildEventIndex(list, cfg), label, cfg)
+  assert.equal(plan.status, 'exact', `event plan for ${label}`)
+  return plan.ids
+}
+
+test('eventIds: C(Q)∩E filters candidates and selects only the constrained event', () => {
+  const cfg = constrainCfg()
+  const list = eventWorld()
+  const index = buildRecallIndex(list, cfg)
+  const eventIds = eventIdsOf(list, '日本旅行')
+  assert.equal(eventIds.size, 12)
+  const seeds = querySeeds(index, 'topicword', cfg).seeds
+  assert.equal(countCandidates(index, seeds), 21)
+  assert.equal(countCandidates(index, seeds, { eventIds }), 12)
+
+  const result = selectRecall(index, 'topicword', { cfg, lanes: emptyLanes(), round: 1, k: 10, eventIds })
+  assert.equal(result.stats.candidates, 12) // |C(Q)∩E|
+  assert.equal(result.stats.candidatesAll, 21)
+  assert.equal(result.stats.filteredByEvent, 9) // 21 - 12
+  assert.equal(result.stats.filteredByTime, 0)
+  assert.ok(result.picks.length > 0)
+  assert.ok(result.picks.every((pick) => eventIds.has(pick.id)))
+  assert.ok(result.candidateIds.every((id) => eventIds.has(id)))
+  assert.equal(result.hasMore, true) // 12 candidates > k=10
+})
+
+test('eventIds: time and event constraints are ANDed (C(Q)∩W∩E)', () => {
+  const cfg = constrainCfg()
+  const list = eventWorld()
+  const index = buildRecallIndex(list, cfg)
+  const eventIds = eventIdsOf(list, '日本旅行')
+  // 5 memories inside the event + 1 inside the window but from another event
+  const timeIds = new Set(['jp0', 'jp1', 'jp2', 'jp3', 'jp4', 'lo0'])
+  const result = selectRecall(index, 'topicword', { cfg, lanes: emptyLanes(), round: 1, k: 10, eventIds, timeIds })
+  assert.equal(result.stats.candidatesAll, 21)
+  assert.equal(result.stats.candidates, 5) // |C∩W∩E|
+  assert.equal(result.stats.filteredByTime, 15) // 21 - 6 (time window)
+  assert.equal(result.stats.filteredByEvent, 1) // 6 - 5 (lo0 outside the event)
+  assert.deepEqual(result.picks.map((pick) => pick.id).sort(), ['jp0', 'jp1', 'jp2', 'jp3', 'jp4'])
+  assert.ok(result.picks.every((pick) => eventIds.has(pick.id) && timeIds.has(pick.id)))
+})
+
+test('eventIds: pre-filter never consumes quota nor advances the frontier', () => {
+  const cfg = constrainCfg()
+  const list = eventWorld()
+  const index = buildRecallIndex(list, cfg)
+  const narrowIds = new Set(['jp0', 'jp1'])
+  const lanes = emptyLanes()
+  const ledger = new Set()
+  const narrow = selectRecall(index, 'topicword', { cfg, lanes, round: 1, k: 10, eventIds: narrowIds })
+  // picks = min(k, |C∩E|): the 19 out-of-event candidates never take a slot
+  assert.equal(narrow.picks.length, 2)
+  assert.deepEqual(narrow.picks.map((pick) => pick.id).sort(), ['jp0', 'jp1'])
+  for (const pick of narrow.picks) ledger.add(pick.id)
+  // widening the event constraint with the same lanes exposes the entries that
+  // were event-filtered before (the frontier did not skip them)
+  const wide = selectRecall(index, 'topicword', { cfg, lanes, round: 2, k: 10, ledger, eventIds: null })
+  assert.equal(wide.stats.filteredByEvent, 0)
+  assert.equal(wide.stats.candidates, 21)
+  assert.ok(wide.picks.length === 10)
+  assert.ok(!wide.picks.some((pick) => narrowIds.has(pick.id))) // ledger honoured
+  assert.ok(wide.picks.some((pick) => pick.id === 'jp2'))
+})
+
+test('eventIds: filteredByEvent counts deduplicated candidates (multi-keyword match once)', () => {
+  const cfg = constrainCfg()
+  const index = buildRecallIndex([
+    folder('a', 0.9, 1, ['alpha', 'beta'], { event: '事件A' }),
+    folder('b', 0.8, 2, ['alpha', 'beta']),
+  ], cfg)
+  const eventIds = new Set(['a'])
+  const seeds = querySeeds(index, 'alpha beta', cfg).seeds
+  assert.equal(seeds.length, 2)
+  assert.equal(countCandidates(index, seeds), 2)
+  assert.equal(countCandidates(index, seeds, { eventIds }), 1)
+  const result = selectRecall(index, 'alpha beta', { cfg, lanes: emptyLanes(), round: 1, k: 10, eventIds })
+  assert.equal(result.stats.candidatesAll, 2)
+  assert.equal(result.stats.candidates, 1)
+  assert.equal(result.stats.filteredByEvent, 1) // 'b' counted once, not once per keyword
+})
+
+test('eventIds: an empty Set means "strictly no candidates" (unknown event)', () => {
+  const cfg = constrainCfg()
+  const list = eventWorld()
+  const index = buildRecallIndex(list, cfg)
+  const empty = new Set()
+  const result = selectRecall(index, 'topicword', { cfg, lanes: emptyLanes(), round: 1, k: 10, eventIds: empty })
+  assert.deepEqual(result.picks, [])
+  assert.equal(result.stats.candidates, 0)
+  assert.equal(result.stats.candidatesAll, 21)
+  assert.equal(result.stats.filteredByEvent, 21)
+  assert.equal(result.hasMore, false)
+  // deferral / recycle pools are gated too: nothing may leak from outside the event
+  const lanes = emptyLanes()
+  lanes.pendingHigh = ['jp0']
+  lanes.pendingHighRound = [1]
+  lanes.recycle = [{ id: 'jp1', eligibleRound: 0 }]
+  const gated = selectRecall(index, 'topicword', { cfg, lanes, round: 2, k: 10, eventIds: empty })
+  assert.deepEqual(gated.picks, [])
+  assert.deepEqual(lanes.pendingHigh, ['jp0']) // kept, not dropped
+  assert.equal(lanes.recycle.length, 1)
+  // ... and they are injected once the constraint widens again (jp0 via the
+  // deferral register; jp1 is a normal candidate again and is picked by the
+  // high-α lane before the recycle lane would need to run)
+  const widened = selectRecall(index, 'topicword', { cfg, lanes, round: 3, k: 10, eventIds: eventIdsOf(list, '日本旅行') })
+  assert.equal(widened.picks.find((pick) => pick.id === 'jp0').lane, 'register')
+  assert.ok(widened.picks.some((pick) => pick.id === 'jp1'))
+})
+
+test('eventIds: selection stays deterministic', () => {
+  const cfg = constrainCfg()
+  const list = eventWorld()
+  const index = buildRecallIndex(list, cfg)
+  const eventIds = eventIdsOf(list, '日本旅行')
+  const replay = () => {
+    const lanes = emptyLanes()
+    const ledger = new Set()
+    const rows = []
+    for (let round = 1; round <= 5; round += 1) {
+      const result = selectRecall(index, 'topicword', { cfg, lanes, round, k: 10, ledger, eventIds })
+      rows.push(result.picks.map((pick) => `${pick.id}:${pick.lane}`).join(','))
+      for (const pick of result.picks) ledger.add(pick.id)
+    }
+    return rows
+  }
+  const reference = replay()
+  assert.deepEqual(replay(), reference)
+  // fairness lane telemetry still adds up to the picks
+  const lanes = emptyLanes()
+  const ledger = new Set()
+  for (let round = 1; round <= 3; round += 1) {
+    const result = selectRecall(index, 'topicword', { cfg, lanes, round, k: 10, ledger, eventIds })
+    assert.equal(Object.values(result.stats.lanesPicked).reduce((sum, value) => sum + value, 0), result.picks.length)
+    for (const pick of result.picks) ledger.add(pick.id)
+  }
+})
+
+test('selectSigma: eventIds filters direct matches and hop expansion', () => {
+  const cfg = constrainCfg()
+  const index = buildRecallIndex([
+    folder('bridge', 0.9, 1, ['start_kw', 'bridge_kw'], { event: '事件A' }),
+    folder('targetA', 0.5, 2, ['bridge_kw', 'target_kw'], { event: '事件A' }),
+    folder('targetB', 0.5, 3, ['bridge_kw', 'target_kw'], { event: '事件B' }),
+  ], cfg)
+  const seeds = querySeeds(index, 'start_kw', cfg).seeds
+  const onlyA = new Set(['bridge', 'targetA'])
+  assert.deepEqual(selectSigma(index, seeds, { k: 5, eventIds: onlyA }).picked.map((item) => item.id), ['bridge'])
+  assert.deepEqual(
+    selectSigma(index, seeds, { k: 5, eventIds: onlyA, hops: 1 }).picked.map((item) => item.id),
+    ['bridge', 'targetA'],
+  )
+  // direct match outside the event: filtered without consuming quota
+  const onlyB = new Set(['targetB'])
+  const empty = selectSigma(index, seeds, { k: 5, eventIds: onlyB })
+  assert.deepEqual(empty.picked, [])
+  assert.equal(empty.stats.filteredByEvent, 1)
+  assert.equal(empty.stats.hasMore, false)
+})
+
+test('simulateTurns: rank domain is C(Q)∩E', () => {
+  const cfg = constrainCfg()
+  const folders = []
+  for (let at = 0; at < 20; at += 1) {
+    folders.push(folder(`m${String(at).padStart(2, '0')}`, 0.9 - at / 100, at + 1, ['eventkw'], {
+      event: at % 2 === 0 ? '事件A' : '事件B',
+    }))
+  }
+  const index = buildRecallIndex(folders, cfg)
+  const seeds = querySeeds(index, 'eventkw', cfg).seeds
+  const eventIds = new Set(folders.filter((item) => item.event === '事件A').map((item) => item.id))
+  assert.equal(countCandidates(index, seeds), 20)
+  assert.equal(countCandidates(index, seeds, { eventIds }), 10)
+  const sim = simulateTurns(index, seeds, { k: 3, maxTurns: 10, eventIds })
+  assert.equal(sim.total, 10)
+  const ranked = oracleCandidates(index, 'eventkw').filter((entry) => eventIds.has(entry.id))
+  ranked.forEach((entry, at) => {
+    assert.equal(sim.firstSeen.get(entry.id), Math.ceil((at + 1) / 3), `rank ${at + 1}`)
+  })
 })
 

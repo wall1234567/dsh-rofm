@@ -2,16 +2,17 @@
  * v1.4.0 config consistency (docs/SPEC.md §2, README §3).
  *
  * There is exactly one default truth: `engine/config.js` `DEFAULT_CONFIG`.
- * The packaged `config.json` overrides only two product values on purpose
- * (`time.mode='constrain'`, `time.timezone='Asia/Shanghai'`), and the README /
- * SPEC tables are the user-facing documentation of those defaults. This test
- * fails the release when any of the three drifts:
+ * The packaged `config.json` overrides a few product values on purpose
+ * (`time.mode='constrain'`, `time.timezone='Asia/Shanghai'`,
+ * `event.mode='constrain'`), and the README / SPEC tables are the user-facing
+ * documentation of those defaults. This test fails the release when any of the
+ * three drifts:
  *
  *   1. `DEFAULT_CONFIG` vs the shipped `config.json` (every engine key, with the
- *      two documented product overrides whitelisted);
+ *      documented product overrides whitelisted);
  *   2. the shipped `config.json` vs the documented values in README §3 and
- *      SPEC §2 (triggerPercent / recall.mode / time.mode / fairness / scoring /
- *      match / compress guards);
+ *      SPEC §2 (triggerPercent / recall.mode / time.mode / event / fairness /
+ *      scoring / match / compress guards);
  *   3. `package.json` vs `engine/package.json` version, both pinned to 1.4.0;
  *   4. `CHANGELOG.md` has a non-empty `## [1.4.0]` section (the release tool
  *      refuses to run without it).
@@ -49,6 +50,7 @@ const EXPECTED_VERSION = '1.4.0'
 const PRODUCT_OVERRIDES = Object.freeze({
   'time.mode': 'constrain',
   'time.timezone': 'Asia/Shanghai',
+  'event.mode': 'constrain',
 })
 
 /**
@@ -115,7 +117,7 @@ test('config: DEFAULT_CONFIG and the packaged config.json are the single default
   assert.deepEqual(missing, [], 'only the documented INHERITED_DEFAULTS may be omitted from the packaged config.json')
   assert.deepEqual(mismatches, [], 'packaged config.json must match engine/config.js DEFAULT_CONFIG (except the documented time overrides)')
 
-  // Exactly the two documented overrides — no third surprise.
+  // Exactly the documented product overrides — no third surprise.
   const overrides = Object.keys(engineKeys).filter(
     (key) => Object.prototype.hasOwnProperty.call(shippedKeys, key) && JSON.stringify(shippedKeys[key]) !== JSON.stringify(engineKeys[key]),
   )
@@ -129,6 +131,7 @@ test('config: shipped config.json loads without warnings and keeps triggerPercen
   assert.equal(cfg.recall.mode, 'fair', 'fair (FAIR-DRI) is the default recall mode')
   assert.equal(cfg.time.mode, 'constrain', 'the packaged product enables time-constrained recall')
   assert.equal(cfg.time.timezone, 'Asia/Shanghai', 'the packaged product pins the +08 day/month/year boundaries')
+  assert.equal(cfg.event.mode, 'constrain', 'the packaged product enables the event constraint (engine default is index)')
   assert.equal(cfg.compress.maxFoldersPerRun, 500)
   assert.equal(cfg.storage.maxFolders, 10000)
 })
@@ -164,6 +167,11 @@ test('config: every new v1.4.0 key is present in the packaged config.json', () =
   assert.equal(shipped.time.windowScanMax, 4096)
   assert.equal(shipped.time.askUserHint, true)
   assert.equal(shipped.time.judgeEventTime, false)
+  // event constraint (v1.4.0 增补).
+  assert.equal(shipped.event.mode, 'constrain')
+  assert.equal(shipped.event.maxLabelLength, 60)
+  assert.deepEqual(shipped.event.similarity, { metric: 'dice', threshold: 0.72, maxCandidates: 5 })
+  assert.equal(shipped.event.askUserHint, true)
   // scoring pipeline.
   assert.equal(shipped.scoring.includeLegacy, false)
   assert.equal(shipped.scoring.maxPending, 200)
@@ -208,6 +216,12 @@ test('docs: README config table documents the shipped values', () => {
     'time.timezone': 'Asia/Shanghai',
     'time.minRangeDays': '3',
     'time.fallback': '["day3", "month", "year", "all"]',
+    'event.mode': 'constrain',
+    'event.maxLabelLength': '60',
+    'event.similarity.metric': 'dice',
+    'event.similarity.threshold': '0.72',
+    'event.similarity.maxCandidates': '5',
+    'event.askUserHint': 'true',
     'scoring.maxPending': '200',
     'scoring.fallback': 'onPressure',
     'scoring.taskBudgetPercent': '15',
@@ -239,6 +253,10 @@ test('docs: SPEC §2 DEFAULT_CONFIG block documents the engine defaults', () => 
   assert.match(spec, /Asia\/Shanghai/, 'SPEC must document the packaged timezone')
   assert.match(spec, /expandLatinCase:\s*false/, 'SPEC §2 must document match.expandLatinCase: false')
   assert.match(spec, /cjkBigram:\s*false/, 'SPEC §2 must document match.cjkBigram: false')
+  // v1.4.0 增补：事件约束 — engine default index, packaged constrain.
+  assert.match(spec, /similarity:\s*\{\s*metric:\s*'dice',\s*threshold:\s*0\.72,\s*maxCandidates:\s*5\s*\}/, 'SPEC §2 must document event.similarity defaults (metric dice / threshold 0.72 / maxCandidates 5)')
+  assert.match(spec, /maxLabelLength:\s*60/, 'SPEC §2 must document event.maxLabelLength: 60')
+  assert.match(spec, /event\.mode='constrain'/, 'SPEC must document the packaged event.mode override')
 })
 
 test('docs: CHANGELOG has a non-empty section for the current version', () => {
@@ -249,7 +267,7 @@ test('docs: CHANGELOG has a non-empty section for the current version', () => {
   const nextHeading = /^## /m.exec(rest)
   const body = (nextHeading ? rest.slice(0, nextHeading.index) : rest).trim()
   assert.ok(body.length > 200, 'the 1.4.0 changelog section must describe the release, not be a placeholder')
-  for (const phrase of ['确定性召回', '时间辅助', '遗留数据', '回滚']) {
+  for (const phrase of ['确定性召回', '时间辅助', '事件约束', '遗留数据', '回滚']) {
     assert.ok(body.includes(phrase), `the 1.4.0 changelog section must mention ${phrase}`)
   }
 })

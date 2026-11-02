@@ -208,6 +208,23 @@ export const DEFAULT_CONFIG = {
     askUserHint: true, // tell the model it may ask the user for a time
     judgeEventTime: false, // 1.4.0: the scoring model cannot override event time
   },
+  // v1.4.0 event constraint (docs/SPEC.md §6.9). Every folder may carry an
+  // optional canonical `event` label (a trip, a work project, a review thread, a
+  // long-running incident, …); one recall may then be constrained to one event.
+  // The event index is derived in memory from index.folders and never persisted:
+  // the canonical label lives in the folder meta, which stays the single truth.
+  event: {
+    // 'off' = ignore event args; 'index' = build the in-memory event index but
+    // never filter (engine default); 'constrain' = filter (packaged default).
+    mode: 'index',
+    maxLabelLength: 60,
+    // "bidirectionally highly similar" = Dice coefficient
+    //   2·|A∩B| / (|A|+|B|) >= threshold
+    // (symmetric: neither label may be a small subset of the other; `metric` is
+    // configurable for experiments: 'dice' | 'avg' | 'min').
+    similarity: { metric: 'dice', threshold: 0.72, maxCandidates: 5 },
+    askUserHint: true, // ambiguous/unknown results tell the model it may ask the user
+  },
   // v1.4.0 scoring pipeline (docs/SPEC.md §4).
   scoring: {
     includeLegacy: false, // pre-1.2.0 / synthetic pending never enters the task list
@@ -417,7 +434,7 @@ export function mergeConfig(base, patch) {
 export function validateConfig(input) {
   const warnings = []
   const cfg = deepMerge(cloneConfig(DEFAULT_CONFIG), isPlainObject(input) ? input : {})
-  for (const group of ['compress', 'importance', 'keywords', 'recall', 'time', 'scoring', 'match', 'storage', 'external', 'debug']) {
+  for (const group of ['compress', 'importance', 'keywords', 'recall', 'time', 'event', 'scoring', 'match', 'storage', 'external', 'debug']) {
     if (!isPlainObject(cfg[group])) {
       warnings.push(`${group}: expected an object; using defaults`)
       cfg[group] = cloneConfig(DEFAULT_CONFIG[group])
@@ -569,6 +586,20 @@ export function validateConfig(input) {
   tm.windowScanMax = numberField(warnings, 'time.windowScanMax', tm.windowScanMax, tmDefaults.windowScanMax, { min: 1, integer: true })
   tm.askUserHint = booleanField(warnings, 'time.askUserHint', tm.askUserHint, tmDefaults.askUserHint)
   tm.judgeEventTime = booleanField(warnings, 'time.judgeEventTime', tm.judgeEventTime, tmDefaults.judgeEventTime)
+
+  // --- event (v1.4.0) -----------------------------------------------------
+  const ev = cfg.event
+  const evDefaults = DEFAULT_CONFIG.event
+  ev.mode = enumField(warnings, 'event.mode', ev.mode, ['off', 'index', 'constrain'], evDefaults.mode)
+  ev.maxLabelLength = numberField(warnings, 'event.maxLabelLength', ev.maxLabelLength, evDefaults.maxLabelLength, { min: 1, max: 200, integer: true })
+  ev.similarity = numberBlock(warnings, 'event.similarity', ev.similarity, evDefaults.similarity, {
+    threshold: { min: 0, max: 1 },
+    maxCandidates: { min: 1, max: 10, integer: true },
+  })
+  // `metric` is a string knob; validate it after numberBlock narrowed the numbers.
+  if (!isPlainObject(ev.similarity)) ev.similarity = cloneConfig(evDefaults.similarity)
+  ev.similarity.metric = enumField(warnings, 'event.similarity.metric', ev.similarity.metric, ['dice', 'avg', 'min'], evDefaults.similarity.metric)
+  ev.askUserHint = booleanField(warnings, 'event.askUserHint', ev.askUserHint, evDefaults.askUserHint)
 
   // --- scoring (v1.4.0) ---------------------------------------------------
   const sc = cfg.scoring

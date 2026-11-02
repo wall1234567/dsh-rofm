@@ -10,10 +10,13 @@
  *                            [--context token=41000 window=128000]
  *                            [--time-from 2026-10-31] [--time-to 2026-11-01]
  *                            [--granularity day|month|year]
+ *                            [--event 日本旅行]
  *                            [--offset 0] [--limit 5] [--mode fair|deterministic|legacy]
  *                            [--config config.json] [--seed 42] [--dir memory]
  *   node engine/cli.mjs recall --time-from 2026-10-31 [--time-to 2026-11-02]
  *                            # pure time browsing (no --text, v1.4.0 §6.8)
+ *   node engine/cli.mjs recall --event 日本旅行
+ *                            # pure event browsing (no --text, v1.4.0 §6.9)
  *   node engine/cli.mjs list [--config config.json] [--dir memory]
  *   node engine/cli.mjs report [--config config.json] [--dir memory] [--json]
  *
@@ -39,6 +42,7 @@ Usage:
                                [--context token=41000 window=128000]
                                [--time-from 2026-10-31] [--time-to 2026-11-01]
                                [--granularity day|month|year]
+                               [--event 日本旅行]
                                [--offset 0] [--limit 5] [--mode fair|deterministic|legacy]
                                [--config config.json] [--seed 42] [--dir memory]
   node engine/cli.mjs list [--config config.json] [--dir memory]
@@ -49,6 +53,12 @@ Usage:
   is a lookup, not a recall decision; needs time.mode="constrain" in the config
   to actually filter, otherwise timeWindow.enforced=false). --time-* accept
   "2026-10-31" (day), "2026-10" (month), "2026" (year) or an epoch ms value.
+
+  Event constraint: --event <name> restricts the recall to memories tagged with
+  that event (needs event.mode="constrain"). "空" means "no event constraint".
+  Omit --text and pass --event for pure event browsing. A submitted event that is
+  bidirectionally similar to an existing one returns eventInfo.candidates instead
+  of guessing (ambiguous), so the caller can decide or ask the user.
 
 conversation.json = { "messages": MemMessage[], "usedPercent": 63.2,
                       "contextWindowTokens": 128000,
@@ -198,6 +208,12 @@ function buildRecallOptions(flags) {
     }
     options.mode = flags.mode
   }
+  if (flags.event !== undefined) {
+    if (typeof flags.event !== 'string' || flags.event.length > 200) {
+      throw new CliError('--event must be a short event name (<= 200 chars)')
+    }
+    options.event = flags.event
+  }
   if (flags.offset !== undefined) {
     const offset = Number(flags.offset)
     if (!Number.isInteger(offset) || offset < 0) throw new CliError('--offset must be a non-negative integer')
@@ -309,8 +325,9 @@ function commandRecall(flags) {
   const text = typeof flags.text === 'string' ? flags.text : ''
   const hasTimeInput =
     recallOptions.timeFrom !== undefined || recallOptions.timeTo !== undefined || recallOptions.granularity !== undefined
-  if (!text.trim() && !hasTimeInput) {
-    throw new CliError('recall requires --text "用户这句话" (or --time-from/--time-to for pure time browsing)')
+  const hasEventInput = recallOptions.event !== undefined
+  if (!text.trim() && !hasTimeInput && !hasEventInput) {
+    throw new CliError('recall requires --text "用户这句话" (or --time-from/--time-to / --event for pure browsing)')
   }
   const { cfg, memoryDir } = makeContext(flags)
   const context = parseContext(flags.context)
@@ -326,6 +343,8 @@ function commandRecall(flags) {
     mode: result.mode ?? null,
     page: result.page ?? null,
     timeWindow: result.timeWindow ?? null,
+    // v1.4.0 event constraint: exact/unknown/similar/empty/disabled + candidates.
+    eventInfo: result.eventInfo ?? null,
     missType: result.missType ?? null,
     additions: result.additions.map((addition) => ({
       id: addition.id,
@@ -340,7 +359,12 @@ function commandRecall(flags) {
     warnings: result.warnings,
   })
   if (block) hint(block)
-  else if (result.browse === true) hint('no memory folder in the requested time window')
+  else if (result.missType === 'event-ambiguous') {
+    const labels = (result.eventInfo?.candidates || []).map((candidate) => `${candidate.label}(${candidate.count})`)
+    hint(`event ambiguous: ${JSON.stringify(result.eventInfo?.requested)} is similar to ${labels.join(', ')} — is it the same event? retry with that label, or --event 空; ask the user when unsure`)
+  } else if (result.eventInfo?.status === 'unknown') hint('event miss: no memory is tagged with that event yet (score/tag memories first, use --event 空, or ask the user)')
+  else if (result.missType === 'event') hint('event miss: keywords matched, but none of those memories belong to the requested event (try another event / --event 空 / ask the user)')
+  else if (result.browse === true) hint('no memory folder in the requested time window / event')
   else if (result.missType === 'time') hint('time miss: keywords matched outside the requested window (try another window / ask the user about the time)')
   else hint('nothing recalled')
   return 0

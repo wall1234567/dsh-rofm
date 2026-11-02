@@ -22,6 +22,7 @@ import {
   MISS_DISABLE_AT,
   MISS_WARNING,
   MISS_WARN_AT,
+  normalizeEventArg,
   normalizeRecallOffset,
 } from '../lib/recall-tool.js'
 
@@ -201,12 +202,24 @@ test('definition exposes the memory_recall contract (v1.4.0 schema)', () => {
   for (const phrase of ['timeFrom', 'timeTo', 'granularity', '最小连续 3 天', 'offset', '纯时间浏览', '分页', '询问']) {
     assert.ok(definition.description.includes(phrase), `description must mention ${phrase}`)
   }
+  // v1.4.0 event constraint: optional, model-chosen, "空" clears it.
+  for (const phrase of ['事件约束', 'event', '「空」']) {
+    assert.ok(definition.description.includes(phrase), `description must mention ${phrase}`)
+  }
 
   assert.equal(definition.parameters.type, 'object')
-  // v1.4.0: keywords is optional when a time window is given (browse mode).
+  // v1.4.0: keywords is optional when a time/event window is given (browse mode).
   assert.deepEqual(definition.parameters.required, [])
   const properties = definition.parameters.properties
-  assert.deepEqual(Object.keys(properties).sort(), ['granularity', 'keywords', 'limit', 'offset', 'timeFrom', 'timeTo'])
+  assert.deepEqual(Object.keys(properties).sort(), [
+    'event',
+    'granularity',
+    'keywords',
+    'limit',
+    'offset',
+    'timeFrom',
+    'timeTo',
+  ])
   assert.equal(properties.keywords.type, 'string')
   assert.ok(properties.keywords.description.includes('可省略'), 'keywords is documented as optional with a time window')
   assert.equal(properties.limit.type, 'integer')
@@ -218,13 +231,16 @@ test('definition exposes the memory_recall contract (v1.4.0 schema)', () => {
   assert.equal(properties.timeTo.type, 'string')
   assert.equal(properties.granularity.type, 'string')
   for (const name of ['day', 'month', 'year']) assert.ok(properties.granularity.description.includes(name))
+  assert.equal(properties.event.type, 'string')
+  for (const phrase of ['事件约束', '「空」', '省略']) assert.ok(properties.event.description.includes(phrase), phrase)
 
-  // The output schema documents the v1.4.0 value shape (pagination + time).
+  // The output schema documents the v1.4.0 value shape (pagination + time + event).
   assert.equal(definition.output.schema.type, 'object')
   assert.deepEqual(Object.keys(definition.output.schema.properties).sort(), [
     'added',
     'attempted',
     'degraded',
+    'eventInfo',
     'found',
     'hasMore',
     'images',
@@ -239,6 +255,7 @@ test('definition exposes the memory_recall contract (v1.4.0 schema)', () => {
     'timeWindow',
     'warnings',
   ])
+  assert.equal(definition.output.schema.properties.eventInfo.type, 'object')
   assert.equal(definition.output.schema.required, undefined, 'no output field is claimed as required')
   assert.equal(definition.output.schema.properties.images.items.properties.name.type, 'string')
   assert.equal(definition.output.schema.properties.images.items.properties.path.type, 'string')
@@ -539,10 +556,10 @@ test('empty or non-string keywords are rejected; a completely empty query is rej
       message: 'keywords must be a non-empty string',
     })
   }
-  // v1.4.0: keywords may be omitted only when a time window is supplied.
-  for (const args of [{}, { keywords: undefined }, { keywords: null }]) {
+  // v1.4.0: keywords may be omitted only when a time window or an event is given.
+  for (const args of [{}, { keywords: undefined }, { keywords: null }, { event: '空' }, { timeFrom: '' }]) {
     await assert.rejects(tool.execute(args, exec()), {
-      message: 'memory_recall 需要 keywords（关键词），或 timeFrom/timeTo/granularity 时间参数（纯时间浏览）',
+      message: 'memory_recall 需要 keywords（关键词），或 timeFrom/timeTo/granularity 时间参数，或 event 事件约束（三者至少给一个）',
     })
   }
 })
@@ -751,7 +768,7 @@ test('time.mode=off drops time arguments with a warning; a time-only call is rej
   assert.ok(textOf(render(tool, { keywords: 'docker' }, value)).includes('time.mode=off'))
 
   await assert.rejects(tool.execute({ timeFrom: '2026-10-31' }, exec()), {
-    message: 'memory_recall 需要 keywords（关键词），或 timeFrom/timeTo/granularity 时间参数（纯时间浏览）',
+    message: 'memory_recall 需要 keywords（关键词），或 timeFrom/timeTo/granularity 时间参数，或 event 事件约束（三者至少给一个）',
   })
 })
 
@@ -1266,4 +1283,257 @@ test('real engine: time.mode=index records the window but does not filter (rende
     assert.ok(text.includes('未启用时间约束'), text)
     assert.ok(text.includes('time.mode=index'), text)
   })
+})
+
+// ---------------------------------------------------------------------------
+// v1.4.0 event constraint (design §6.1)
+// ---------------------------------------------------------------------------
+
+const exactEventInfo = (count = 12) => ({
+  status: 'exact',
+  requested: '日本旅行',
+  label: '日本旅行',
+  count,
+  candidates: [],
+  enforced: true,
+})
+
+test('normalizeEventArg: omitted/blank = no constraint, placeholders = explicit empty, too long = error', () => {
+  // Omitted / blank -> nothing is forwarded.
+  for (const value of [undefined, null, '', '   ']) {
+    assert.deepEqual(normalizeEventArg(value, {}), { hasEvent: false, explicitEmpty: false })
+  }
+  // Placeholders mean "explicitly no event" -> forwarded (telemetry empty) but
+  // never constrain the query.
+  for (const value of ['空', '无', '不约束', '无事件', 'NONE', 'n/a', '-', '  空  ']) {
+    const parsed = normalizeEventArg(value, {})
+    assert.equal(parsed.hasEvent, false, `${value} must not constrain`)
+    assert.equal(parsed.explicitEmpty, true, `${value} is an explicit empty`)
+    assert.equal(typeof parsed.event, 'string')
+  }
+  // Real labels are trimmed/collapsed and forwarded verbatim (engine canonicalizes).
+  assert.deepEqual(normalizeEventArg('  日本旅行  ', {}), {
+    hasEvent: true,
+    explicitEmpty: false,
+    event: '日本旅行',
+  })
+  assert.equal(normalizeEventArg('登录  重构项目', {}).event, '登录 重构项目')
+  // Too long is a parameter error (silent truncation would target another event).
+  const long = '日'.repeat(61)
+  assert.throws(() => normalizeEventArg(long, {}), /event 过长（61 字符，最多 60 字符）/)
+  assert.doesNotThrow(() => normalizeEventArg('日'.repeat(60), {}))
+  assert.throws(() => normalizeEventArg('日'.repeat(11), { event: { maxLabelLength: 10 } }), /最多 10 字符/)
+  assert.throws(() => normalizeEventArg(42, {}), { message: 'event must be a string' })
+})
+
+test('event is forwarded to engine.recall; event-only is a valid browse query', async () => {
+  const engine = makeEngine(
+    successResult([makeAddition()], {}, { mode: 'fair', eventInfo: exactEventInfo(12) }),
+    successResult([makeAddition()], {}, { mode: 'fair', eventInfo: exactEventInfo(12) }),
+    successResult([makeAddition()], {}, { mode: 'fair', eventInfo: exactEventInfo(12) }),
+  )
+  const tool = new MemoryRecallTool(makePlugin({ engine }))
+
+  const keywordEvent = await tool.execute({ keywords: 'docker', event: '日本旅行' }, exec())
+  assert.equal(engine.calls[0].options.event, '日本旅行')
+  assert.equal(engine.calls[0].userText, 'docker')
+  assert.equal(keywordEvent.found, 1)
+  assert.deepEqual(keywordEvent.eventInfo, exactEventInfo(12))
+  assertLosslessJson(keywordEvent)
+
+  const browse = await tool.execute({ event: '日本旅行' }, exec())
+  assert.equal(engine.calls[1].userText, '', 'event-only browse sends no keyword text')
+  assert.equal(engine.calls[1].options.event, '日本旅行')
+  assert.equal(browse.mode, 'browse')
+  const browseText = textOf(render(tool, { event: '日本旅行' }, browse))
+  assert.ok(browseText.includes('事件浏览'), browseText)
+  assert.ok(browseText.includes('本次回忆已约束事件：「日本旅行」（该事件共 12 条记忆）'), browseText)
+
+  // Explicit "空" is forwarded (engine records status=empty) but does not make a
+  // query valid on its own.
+  const cleared = await tool.execute({ keywords: 'docker', event: '空' }, exec())
+  assert.equal(engine.calls[2].options.event, '空')
+  assert.equal(cleared.found, 1)
+  await assert.rejects(tool.execute({ event: '空' }, exec()), /三者至少给一个/)
+})
+
+test('event exact is rendered with the constraint line; time+event render both (AND)', async () => {
+  const window = { from: Date.UTC(2026, 9, 30), to: Date.UTC(2026, 10, 2), level: 'day', enforced: true, timezone: 'UTC' }
+  const engine = makeEngine(
+    successResult([makeAddition()], {}, { mode: 'fair', timeWindow: window, eventInfo: exactEventInfo(7) }),
+  )
+  const tool = new MemoryRecallTool(makePlugin({ engine }))
+  const value = await tool.execute({ keywords: 'docker', timeFrom: '2026-10-30', timeTo: '2026-10-31', event: '日本旅行' }, exec())
+
+  assert.equal(engine.calls[0].options.event, '日本旅行')
+  assert.equal(engine.calls[0].options.timeFrom, '2026-10-30')
+  assertLosslessJson(value)
+  const text = textOf(render(tool, { keywords: 'docker' }, value))
+  assert.ok(text.includes('时间范围：2026-10-30 ~ 2026-11-01'), text)
+  assert.ok(text.includes('本次回忆已约束事件：「日本旅行」（该事件共 7 条记忆）'), text)
+  // Both constraint lines come before the entries.
+  assert.ok(text.indexOf('时间范围：') < text.indexOf('### 回忆 1'), text)
+  assert.ok(text.indexOf('本次回忆已约束事件：') < text.indexOf('### 回忆 1'), text)
+})
+
+test('event exact without a count still renders (tolerant to older engine shapes)', async () => {
+  const engine = makeEngine(
+    successResult([makeAddition()], {}, {
+      mode: 'fair',
+      eventInfo: { status: 'exact', requested: '日本旅行', label: '日本旅行', count: null, candidates: [], enforced: true },
+    }),
+  )
+  const tool = new MemoryRecallTool(makePlugin({ engine }))
+  const value = await tool.execute({ keywords: 'docker', event: '日本旅行' }, exec())
+  assert.equal(value.eventInfo.count, undefined)
+  assertLosslessJson(value)
+  const text = textOf(render(tool, { keywords: 'docker' }, value))
+  assert.ok(text.includes('本次回忆已约束事件：「日本旅行」'), text)
+  assert.ok(!text.includes('该事件共'), text)
+})
+
+test('event unknown: does not strike, suggests the 3 next steps and the closest events', async () => {
+  const engine = makeEngine(
+    missResult({ matchedFolders: 0 }, {
+      missType: 'event',
+      eventInfo: {
+        status: 'unknown',
+        requested: '火星旅行',
+        label: null,
+        count: 0,
+        candidates: [{ label: '日本旅行', count: 12, score: 0.6 }],
+        enforced: true,
+      },
+    }),
+  )
+  const tool = new MemoryRecallTool(makePlugin({ engine }))
+  const value = await tool.execute({ keywords: '旅行', event: '火星旅行' }, exec())
+
+  assert.equal(value.found, 0)
+  assert.equal(value.missType, 'event')
+  assert.equal(value.misses, undefined, 'an unknown event is not a keyword strike')
+  assert.equal(value.eventInfo.count, 0)
+  assertLosslessJson(value)
+  const text = textOf(render(tool, { keywords: '旅行', event: '火星旅行' }, value))
+  assert.ok(text.includes('事件「火星旅行」还没有任何记忆'), text)
+  assert.ok(text.includes('最接近的已有事件：日本旅行（0.60）'), text)
+  assert.ok(text.includes('① 先用 memory_judge 给相关记忆打上该事件标签'), text)
+  assert.ok(text.includes('② 用 event:"空" 取消事件约束'), text)
+  assert.ok(text.includes('③ 询问用户属于哪个事件'), text)
+})
+
+test('event ambiguous (R5): lists similar events, never strikes, waits for the model judgement', async () => {
+  const ambiguousInfo = {
+    status: 'similar',
+    requested: '旅行经历',
+    label: null,
+    count: null,
+    candidates: [
+      { label: '日本旅行', count: 12, score: 0.83 },
+      { label: '日本出差', count: 5, score: 0.75 },
+    ],
+    enforced: true,
+  }
+  const engine = makeEngine(
+    missResult({ matchedFolders: 0 }, { missType: 'event-ambiguous', eventInfo: ambiguousInfo }),
+    missResult({ matchedFolders: 0 }, { missType: 'event-ambiguous', eventInfo: ambiguousInfo }),
+    missResult({ matchedFolders: 0 }, { missType: 'keyword' }),
+  )
+  const tool = new MemoryRecallTool(makePlugin({ engine }))
+
+  const first = await tool.execute({ keywords: '旅行', event: '旅行经历' }, exec())
+  assert.equal(first.missType, 'event-ambiguous')
+  assert.equal(first.misses, undefined, 'ambiguous is not a strike')
+  assertLosslessJson(first)
+  const text = textOf(render(tool, { keywords: '旅行', event: '旅行经历' }, first))
+  assert.ok(text.includes('你提交的事件「旅行经历」与已有事件高度相似'), text)
+  assert.ok(text.includes('日本旅行（12 条，相似度 0.83）'), text)
+  assert.ok(text.includes('日本出差（5 条，相似度 0.75）'), text)
+  assert.ok(text.includes('是 → 用该事件标签重试'), text)
+  assert.ok(text.includes('否 → 用 event:"空" 重新检索'), text)
+  assert.ok(text.includes('无法判断 → 询问用户'), text)
+
+  // Repeated ambiguous results still never accumulate strikes...
+  const second = await tool.execute({ keywords: '旅行', event: '旅行经历' }, exec())
+  assert.equal(second.misses, undefined)
+  // ...while a real keyword miss starts the run.
+  const realMiss = await tool.execute({ keywords: '旅行', event: '旅行经历' }, exec())
+  assert.equal(realMiss.misses, 1, 'a true keyword miss still counts')
+})
+
+test('event miss (exact window, no member matches the keywords) does not strike and names the event', async () => {
+  const engine = makeEngine(
+    missResult({ matchedFolders: 7 }, { missType: 'event', eventInfo: exactEventInfo(12) }),
+  )
+  const tool = new MemoryRecallTool(makePlugin({ engine }))
+  const value = await tool.execute({ keywords: 'docker', event: '日本旅行' }, exec())
+
+  assert.equal(value.missType, 'event')
+  assert.equal(value.misses, undefined, 'event miss is not a strike')
+  assertLosslessJson(value)
+  const text = textOf(render(tool, { keywords: 'docker' }, value))
+  assert.ok(text.includes('关键词命中了 7 条记忆，但都不属于事件「日本旅行」'), text)
+  assert.ok(text.includes('可换一个事件名、取消事件约束（event:"空"）或询问用户'), text)
+  assert.ok(!text.includes('本次回忆已约束事件'), 'the miss hint already names the event; no duplicate constraint line')
+})
+
+test('event.mode=index (status=disabled) is explained as recorded-but-not-enforced', async () => {
+  const disabledInfo = { status: 'disabled', requested: '日本旅行', label: '日本旅行', count: null, candidates: [], enforced: false }
+  const engine = makeEngine(successResult([makeAddition()], {}, { mode: 'fair', eventInfo: disabledInfo }))
+  const tool = new MemoryRecallTool(makePlugin({ engine }))
+  const value = await tool.execute({ keywords: 'docker', event: '日本旅行' }, exec())
+
+  assert.equal(value.eventInfo.enforced, false)
+  assertLosslessJson(value)
+  const text = textOf(render(tool, { keywords: 'docker' }, value))
+  assert.ok(text.includes('事件条件：日本旅行（当前 event.mode=index，只记录事件条件、未启用事件约束，本次未按事件过滤）'), text)
+  assert.ok(!text.includes('本次回忆已约束事件'), 'must not claim the event was enforced')
+})
+
+test('event.askUserHint=false drops the "ask the user" suggestion from unknown/ambiguous hints', async () => {
+  const cfg = makeConfig({
+    recall: { enabled: true, mode: 'fair' },
+    event: { askUserHint: false, maxLabelLength: 60 },
+  })
+  const engine = makeEngine(
+    missResult({}, {
+      missType: 'event',
+      eventInfo: { status: 'unknown', requested: '火星旅行', label: null, count: 0, candidates: [], enforced: true },
+    }),
+    missResult({}, {
+      missType: 'event-ambiguous',
+      eventInfo: { status: 'similar', requested: '旅行经历', label: null, count: null, candidates: [{ label: '日本旅行', count: 12, score: 0.8 }], enforced: true },
+    }),
+  )
+  const tool = new MemoryRecallTool(makePlugin({ engine, cfg }))
+
+  const unknown = await tool.execute({ keywords: '旅行', event: '火星旅行' }, exec())
+  const unknownText = textOf(render(tool, { keywords: '旅行' }, unknown))
+  assert.ok(unknownText.includes('事件「火星旅行」还没有任何记忆'), unknownText)
+  assert.ok(!unknownText.includes('询问用户'), unknownText)
+
+  const ambiguous = await tool.execute({ keywords: '旅行', event: '旅行经历' }, exec())
+  const ambiguousText = textOf(render(tool, { keywords: '旅行' }, ambiguous))
+  assert.ok(ambiguousText.includes('与已有事件高度相似'), ambiguousText)
+  assert.ok(!ambiguousText.includes('询问用户'), ambiguousText)
+})
+
+test('an overlong event argument is a parameter error before any engine call', async () => {
+  const engine = makeEngine()
+  const tool = new MemoryRecallTool(makePlugin({ engine }))
+  await assert.rejects(tool.execute({ keywords: 'docker', event: '日'.repeat(61) }, exec()), /event 过长/)
+  assert.equal(engine.calls.length, 0, 'the engine is never called with an invalid event')
+})
+
+test('an event-only browse that finds nothing is an event miss by fallback (no strike)', async () => {
+  const engine = makeEngine(missResult({ matchedFolders: 0 })) // engine did not classify the miss
+  const tool = new MemoryRecallTool(makePlugin({ engine }))
+  const value = await tool.execute({ event: '日本旅行' }, exec())
+
+  assert.equal(value.mode, 'browse')
+  assert.equal(value.missType, 'event')
+  assert.equal(value.misses, undefined)
+  assertLosslessJson(value)
+  const text = textOf(render(tool, { event: '日本旅行' }, value))
+  assert.ok(text.includes('没有属于事件'), text)
 })

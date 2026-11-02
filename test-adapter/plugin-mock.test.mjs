@@ -562,20 +562,38 @@ test('start() registers the memory-tasks section and the memory_judge + memory_r
     // semantic fragments rather than the exact wording, so a copy edit there does
     // not turn this adapter-level contract test red (v1.4.0 added the β rubric).
     assert.ok(tool.description.startsWith('更新 dsh-rofm 记忆的重要度 α、信赖度 β 和关键词。'), tool.description.slice(0, 60))
-    assert.ok(tool.description.includes('α（0.01~1）决定该记忆以后被自动回忆的概率'), 'describes α semantics')
+    // v1.4.0 rewords α from "recall probability" to "importance → recall priority
+    // + lanes" (only legacy mode is still probability), so assert semantics rather
+    // than one exact sentence (the copy is owned by lib/memory-tool.js).
+    assert.ok(tool.description.includes('α（0.01~1）表示该记忆对未来对话的重要度'), 'describes α semantics')
+    assert.ok(tool.description.includes('决定召回优先级与车道'), 'α maps to recall priority/lanes')
     assert.ok(tool.description.includes('β（-10~10）是这条记忆能否当事实或指令使用的信赖度'), 'describes β semantics')
     assert.ok(tool.description.includes('β 只影响这条记忆被回忆出来后能否当作事实或指令使用的可信度'), 'v1.4.0 β clarification')
     assert.ok(tool.description.includes('keep=true 表示保持原值'), 'describes keep')
+    // v1.4.0 event constraint: the judge is the only place a memory gets its event
+    // tag (contract §6.2). The description is owned by tools-lib — assert the
+    // stable semantic fragments so a copy tweak does not break this adapter test.
+    assert.ok(tool.description.includes('event 表示这条记忆所属的事件'), 'describes the event tag')
+    assert.ok(tool.description.includes('一次旅行'), 'gives the travel-example event')
+    assert.ok(tool.description.includes('给「空」'), 'greetings/chatter are not events')
     assert.equal(tool.parameters.type, 'object')
     assert.deepEqual(tool.parameters.required, ['updates'])
     assert.equal(tool.parameters.properties.updates.type, 'array')
     const item = tool.parameters.properties.updates.items
     assert.deepEqual(item.required, ['id'])
-    assert.deepEqual(Object.keys(item.properties).sort(), ['alpha', 'beta', 'id', 'keep', 'keywords', 'reason'])
+    // The core update fields stay stable; the v1.4.0 event constraint may add an
+    // optional `event` string (tools-lib), so it is excluded from the exact set
+    // and asserted separately when present.
+    const itemKeys = Object.keys(item.properties).filter((key) => key !== 'event').sort()
+    assert.deepEqual(itemKeys, ['alpha', 'beta', 'id', 'keep', 'keywords', 'reason'])
     assert.equal(item.properties.alpha.type, 'number')
     assert.equal(item.properties.beta.type, 'number')
     assert.equal(item.properties.keep.type, 'boolean')
     assert.equal(item.properties.keywords.type, 'array')
+    if ('event' in item.properties) {
+      assert.equal(item.properties.event.type, 'string', 'memory_judge accepts an optional event tag')
+      assert.match(item.properties.event.description ?? '', /事件/)
+    }
     assert.deepEqual(tool.output.schema.properties.updated.items, { type: 'string' })
     assert.deepEqual(tool.output.schema.properties.kept.items, { type: 'string' })
     assert.equal(tool.output.schema.properties.rejected.items.type, 'object')
@@ -605,6 +623,15 @@ test('start() registers the memory-tasks section and the memory_judge + memory_r
     assert.equal(recallTool.parameters.properties.timeFrom.type, 'string')
     assert.equal(recallTool.parameters.properties.timeTo.type, 'string')
     assert.equal(recallTool.parameters.properties.granularity.type, 'string')
+    // v1.4.0 event constraint: `memory_recall` accepts an optional event filter.
+    // It is added by tools-lib together with the engine wiring; when present the
+    // adapter contract requires a string parameter that stays optional.
+    if ('event' in recallTool.parameters.properties) {
+      assert.equal(recallTool.parameters.properties.event.type, 'string', 'memory_recall accepts an optional event filter')
+      assert.match(recallTool.parameters.properties.event.description ?? '', /事件/)
+      assert.deepEqual(recallTool.parameters.required, [], 'event stays optional')
+      assert.match(recallTool.description, /event/, 'the description documents the event filter')
+    }
     assert.equal(recallTool.parameters.additionalProperties, undefined)
     assert.equal(recallTool.timeoutMs, 10000)
     assert.equal(recallTool.isConcurrencySafe(), false)
@@ -634,9 +661,16 @@ test('memory_judge flags α above importance.warnAbove back to the model (1.2.1,
     const high = await executeJudge(capture, session, [{ id, alpha: 0.95, beta: 4, keywords }])
     assert.deepEqual(high.updated, [id])
     // Not a cap: the submitted value is honored, but the model gets a reminder.
-    assert.equal(high.warnings.length, 1)
-    assert.match(high.warnings[0], /α=0\.95 超过 importance\.warnAbove=0\.8/)
-    assert.match(high.warnings[0], /未拦截/)
+    // (v1.4.0 also appends a non-blocking "new memory has no event tag" reminder,
+    // so count the α reminder specifically instead of the whole array.)
+    const alphaWarnings = high.warnings.filter((warning) => warning.includes('importance.warnAbove'))
+    assert.equal(alphaWarnings.length, 1, JSON.stringify(high.warnings))
+    assert.match(alphaWarnings[0], /α=0\.95 超过 importance\.warnAbove=0\.8/)
+    assert.match(alphaWarnings[0], /未拦截/)
+    assert.ok(
+      high.warnings.some((warning) => /event/.test(warning)),
+      'v1.4.0: a new memory without an event tag gets a non-blocking reminder',
+    )
     assert.equal(readMeta(memoryDir, id).alpha, 0.95)
     const renderedHigh = judgeDefinition(capture).output.render({}, high)
     assert.match(renderedHigh[0].text, /注意：/)
@@ -644,7 +678,11 @@ test('memory_judge flags α above importance.warnAbove back to the model (1.2.1,
     // A normal α produces no reminder (and the renderer adds no "注意：" line).
     const normal = await executeJudge(capture, session, [{ id, alpha: 0.5, keywords }])
     assert.deepEqual(normal.updated, [id])
-    assert.deepEqual(normal.warnings, [])
+    assert.deepEqual(
+      normal.warnings.filter((warning) => warning.includes('importance.warnAbove')),
+      [],
+      'α below warnAbove produces no α reminder',
+    )
     const renderedNormal = judgeDefinition(capture).output.render({}, normal)
     assert.ok(!renderedNormal[0].text.includes('注意：'), renderedNormal[0].text)
     assert.equal(readMeta(memoryDir, id).alpha, 0.5)
@@ -1193,6 +1231,12 @@ test('memory-tasks section lists pending folders with title, summary and the rub
     assert.ok(text.includes('用户明确表达的喜好/厌恶/习惯/长期偏好'), 'α rubric includes user preference (I1)')
     assert.ok(text.includes('- β（-10~10）'))
     assert.ok(text.includes('- keywords（3~8 个）'))
+    // v1.4.0 event constraint (contract §6.2): the rubric teaches the model to
+    // tag each memory with the event it belongs to.
+    assert.ok(text.includes('- event（可选但建议）'), 'rubric lists the event scoring rule')
+    assert.ok(text.includes('寒暄问候、一次性闲聊、纯过程日志给「空」'), 'rubric explains what is NOT an event')
+    assert.ok(text.includes('同一事件在全库内用同一个标签'), 'rubric requires a stable event label')
+    assert.ok(text.indexOf('- keywords（3~8 个）') < text.indexOf('- event（可选但建议）'), 'event rule follows keywords')
     assert.ok(text.includes('keep=true'))
     // The summary is bounded, not the full body.
     const summaryLine = text.split('\n').find((line) => line.includes('摘要='))
@@ -1321,6 +1365,98 @@ test('memory-tasks section is empty with no work and nudges when a recall block 
     assert.ok(nudge.includes('memory_judge'), nudge)
     assert.ok(!nudge.includes('评分口径：'), 'the nudge does not repeat the whole rubric')
     assert.ok(!nudge.includes('待评分的新归档记忆'), 'no pending list in the nudge')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// v1.4.0 event constraint: adapter-side rubric + empty-recall hint (contract §7)
+// ---------------------------------------------------------------------------
+
+test('memory-tasks rubric teaches the event scoring rule (v1.4.0 event constraint)', async () => {
+  await withTempDirAsync(async (dir) => {
+    const memoryDir = path.join(dir, 'memory')
+    const { session, capture } = await archiveConversation(memoryDir)
+    const text = tasksText(capture, session)
+    const eventLine = text.split('\n').find((line) => line.startsWith('- event（可选但建议）'))
+    assert.ok(eventLine, `the rubric has an event line, got: ${JSON.stringify(text.split('\n').filter((line) => line.startsWith('- ')))}`)
+    // The exact wording is the contract §6.2 rubric (owned by this adapter).
+    assert.ok(eventLine.includes('这次对话围绕的事件/主题'), 'defines an event')
+    assert.ok(eventLine.includes('一次旅行、一个工作项目、一次方案评审或决定线程、一段持续排查的故障'), 'gives representative examples')
+    assert.ok(eventLine.includes('用简短名词短语命名'), 'requires a short noun phrase')
+    assert.ok(eventLine.includes('寒暄问候、一次性闲聊、纯过程日志给「空」'), 'excludes greetings/chatter/process logs')
+    assert.ok(eventLine.includes('同一事件在全库内用同一个标签'), 'requires a store-wide stable label')
+    // Ordering: α/β/keywords first, then event, then the keep guidance.
+    const indexOf = (needle) => text.indexOf(needle)
+    assert.ok(indexOf('- keywords（3~8 个）') < indexOf('- event（可选但建议）'), 'event comes after keywords')
+    assert.ok(indexOf('- event（可选但建议）') < indexOf('无法判断或不需要修改时'), 'event comes before the keep guidance')
+  })
+})
+
+test('empty automatic recall hints at the memory_recall event filter (recall.espEmptyHint)', async () => {
+  await withTempDirAsync(async (dir) => {
+    const memoryDir = path.join(dir, 'memory')
+    mkdirSync(memoryDir, { recursive: true })
+    // A scored memory that would match other text but not this query.
+    writeFolderFixture(memoryDir, 'mem-20260101T000000Z-0001', {
+      alpha: 0.9,
+      keywords: ['星港'],
+      text: 'EVENT-HINT-FIXTURE',
+      createdAt: Date.now() - 3600_000,
+    })
+    const session = new FakeSession({ id: 'session-empty-hint' })
+    appendSystem(session)
+    const { ctx, capture } = makeContext(session)
+    const plugin = new RofmPlugin(ctx, makeOverrides(memoryDir))
+    plugin.start()
+    plugin.onInboxInserted({ agent: { session }, message: userMessage('u-event-hint', '完全无关的问题：晚饭吃什么') })
+    const hint = recallText(capture, session)
+    assert.ok(hint.includes('未自动回忆到相关记忆'), hint)
+    assert.ok(hint.includes('如记忆与某个事件相关'), 'the hint mentions event-related memories')
+    assert.ok(hint.includes('memory_recall 的 event 参数'), 'the hint names the event filter')
+    assert.equal(hint.split('\n').length, 1, 'still one low-noise line (no permanent extra prompt)')
+
+    // The switch stays: recall.espEmptyHint=false keeps the pre-1.4.0 silence.
+    const { ctx: ctx2, capture: capture2 } = makeContext(session)
+    const overrides = makeOverrides(memoryDir)
+    overrides.recall = { ...overrides.recall, espEmptyHint: false }
+    const plugin2 = new RofmPlugin(ctx2, overrides)
+    plugin2.start()
+    plugin2.onInboxInserted({ agent: { session }, message: userMessage('u-event-hint-2', '完全无关的问题：晚饭吃什么') })
+    assert.equal(recallText(capture2, session), '', 'espEmptyHint=false keeps the silent behaviour')
+  })
+})
+
+test('automatic recall never passes an event constraint to the engine (contract §7)', async () => {
+  await withTempDirAsync(async (dir) => {
+    const memoryDir = path.join(dir, 'memory')
+    mkdirSync(memoryDir, { recursive: true })
+    writeFolderFixture(memoryDir, 'mem-20260101T000000Z-0001', {
+      alpha: 0.9,
+      keywords: ['部署'],
+      text: 'AUTO-EVENT-FIXTURE',
+      createdAt: Date.now() - 3600_000,
+    })
+    const session = new FakeSession({ id: 'session-auto-no-event' })
+    appendSystem(session)
+    const { ctx } = makeContext(session)
+    const overrides = makeOverrides(memoryDir)
+    // Even with the event constraint fully enabled, the automatic path must not
+    // guess an event: it runs before the model, so there is no event judge yet.
+    overrides.event = { mode: 'constrain' }
+    const plugin = new RofmPlugin(ctx, overrides)
+    plugin.start()
+    const engine = plugin.engineFor(session, plugin.currentConfig())
+    const calls = []
+    const original = engine.recall.bind(engine)
+    engine.recall = (text, stats, options) => {
+      calls.push(options ?? {})
+      return original(text, stats, options)
+    }
+    plugin.onInboxInserted({ agent: { session }, message: userMessage('u-auto-event', '部署 现在什么情况？') })
+    assert.equal(calls.length, 1, 'automatic recall called the engine')
+    assert.equal('event' in calls[0], false, 'automatic recall passes no event constraint')
+    assert.equal('timeFrom' in calls[0], false, 'automatic recall passes no time constraint either')
+    assert.ok(plugin.sessionState(session).additions.length > 0, 'recall still injects matching memories')
   })
 })
 

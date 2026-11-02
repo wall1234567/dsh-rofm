@@ -133,8 +133,8 @@ function toIdSet(value) {
   return set
 }
 
-/** Normalize `options.timeIds`: null = no time constraint, otherwise a Set. */
-function toTimeIds(value) {
+/** Normalize an optional id filter (`timeIds` / `eventIds`): null = no constraint. */
+function toIdFilter(value) {
   if (value === null || value === undefined) return null
   return toIdSet(value)
 }
@@ -572,12 +572,18 @@ export function querySeeds(index, userText, cfg) {
 /**
  * Collect the candidate set C(Q) (∪ posting lists of the seeds).
  *
+ * Filters, in order: `minAlpha` (α gate) → `timeIds` (time window W) →
+ * `eventIds` (event constraint E). Time/event filters are pre-filters: they do
+ * not consume quota and never move the frontier (a different window / event
+ * must be able to surface the memory later).
+ *
  * @param {object} index
  * @param {string[]} seeds
- * @param {{ minAlpha?: number, timeIds?: Set<string>|null }} [options]
+ * @param {{ minAlpha?: number, timeIds?: Set<string>|null, eventIds?: Set<string>|null }} [options]
  * @returns {{
  *   indices: number[], windowIndices: number[], matchCount: Map<number, number>,
- *   filteredByAlpha: number, filteredByTime: number, windowSet: Set<number>,
+ *   filteredByAlpha: number, filteredByTime: number, filteredByEvent: number,
+ *   windowSet: Set<number>,
  * }}
  */
 function scanCandidates(index, seeds, options = {}) {
@@ -585,13 +591,14 @@ function scanCandidates(index, seeds, options = {}) {
   const postings = index.postings
   const minAlpha = clampAlpha(numberOr(options.minAlpha, 0))
   const timeIds = options.timeIds || null
+  const eventIds = options.eventIds || null
   const indices = []
   const windowIndices = []
   const windowSet = new Set()
   const matchCount = new Map()
-  const seen = new Set()
   let filteredByAlpha = 0
   let filteredByTime = 0
+  let filteredByEvent = 0
   for (const seed of seeds) {
     const posting = postings.get(seed)
     if (!posting || !posting.length) continue
@@ -614,25 +621,28 @@ function scanCandidates(index, seeds, options = {}) {
         filteredByTime += 1
         continue
       }
+      if (eventIds && !eventIds.has(entry.id)) {
+        filteredByEvent += 1
+        continue
+      }
       windowIndices.push(at)
       windowSet.add(at)
     }
   }
-  return { indices, windowIndices, matchCount, filteredByAlpha, filteredByTime, windowSet }
+  return { indices, windowIndices, matchCount, filteredByAlpha, filteredByTime, filteredByEvent, windowSet }
 }
 
 /**
- * |C(Q)∩W| — deduplicated candidates matched by the seeds, after the query-time
- * `minAlpha` gate and the optional `timeIds` window filter.
+ * |C(Q)∩W∩E| — deduplicated candidates matched by the seeds, after the query-time
+ * `minAlpha` gate, the optional `timeIds` window filter and the optional
+ * `eventIds` event constraint (all three are part of the candidate definition
+ * for the rank bound: `rank` must be defined on C(Q)∩W∩E).
  *
- * The time window is part of the candidate definition for the rank bound
- * (`rank` must be defined on C(Q)∩W, proof §3.6), so `timeIds` filters here
- * instead of just at selection time. Not on the per-turn hot path
- * (tests/tools/telemetry only).
+ * Not on the per-turn hot path (tests/tools/telemetry only).
  *
  * @param {object} index
  * @param {string[]} seeds
- * @param {{ minAlpha?: number, timeIds?: Set<string>|null }} [options]
+ * @param {{ minAlpha?: number, timeIds?: Set<string>|null, eventIds?: Set<string>|null }} [options]
  * @returns {number}
  */
 export function countCandidates(index, seeds, options = {}) {
@@ -696,6 +706,7 @@ function keyOf(entry) {
  *   sticky?: Set<string>,
  *   minAlpha?: number,
  *   timeIds?: Set<string>|null,
+ *   eventIds?: Set<string>|null,
  *   frontier?: Map<string, {key: object, length: number}>|null,
  *   picked?: object[],
  *   seenIndices?: Set<number>,
@@ -713,6 +724,7 @@ function mergeSigma(index, seeds, context) {
   const sticky = context.sticky || new Set()
   const minAlpha = clampAlpha(numberOr(context.minAlpha, 0))
   const timeIds = context.timeIds || null
+  const eventIds = context.eventIds || null
   const frontier = context.frontier || null
   const picked = context.picked || []
   const seenIndices = context.seenIndices || new Set()
@@ -802,9 +814,15 @@ function mergeSigma(index, seeds, context) {
       advanceList(node)
       continue
     }
-    // Time window pre-filter: skip without touching the quota/frontier.
+    // Time window / event pre-filters: skip without touching the quota or the
+    // frontier (a different window/event must be able to surface the memory later).
     if (timeIds && !timeIds.has(entry.id)) {
       if (stats) stats.filteredByTime = (stats.filteredByTime || 0) + 1
+      advanceList(node)
+      continue
+    }
+    if (eventIds && !eventIds.has(entry.id)) {
+      if (stats) stats.filteredByEvent = (stats.filteredByEvent || 0) + 1
       advanceList(node)
       continue
     }
@@ -859,6 +877,12 @@ function mergeSigma(index, seeds, context) {
       pops += 1
       continue
     }
+    if (eventIds && !eventIds.has(entry.id)) {
+      pop()
+      advanceList(node)
+      pops += 1
+      continue
+    }
     if (minAlpha > 0 && entry.alpha < minAlpha) break
     if (seenIndices.has(entryIndex) || exclude.has(entry.id)) {
       if (stats) stats.excludedSkips = (stats.excludedSkips || 0) + 1
@@ -885,8 +909,8 @@ function mergeSigma(index, seeds, context) {
  *
  * Options: `k` (default 10), `exclude`/`excludeIds`/`blockIds`/`ledger` id
  * collections, `sticky` (ids allowed to advance the last frontier; defaults to
- * `exclude` ∪ `ledger`), `minAlpha`, `timeIds`, `frontier` (Map, mutated),
- * `hops` (default 0), `maxPops`, `wantHasMore` (default true).
+ * `exclude` ∪ `ledger`), `minAlpha`, `timeIds`, `eventIds`, `frontier` (Map,
+ * mutated), `hops` (default 0), `maxPops`, `wantHasMore` (default true).
  *
  * @param {object} index
  * @param {string[]} seeds
@@ -908,7 +932,8 @@ export function selectSigma(index, seeds, options = {}) {
     for (const id of ledger) sticky.add(id)
   }
   const minAlpha = clampAlpha(numberOr(opts.minAlpha, 0))
-  const timeIds = toTimeIds(opts.timeIds)
+  const timeIds = toIdFilter(opts.timeIds)
+  const eventIds = toIdFilter(opts.eventIds)
   const frontier = opts.frontier instanceof Map ? opts.frontier : null
   const maxPops = integerOr(opts.maxPops, MAX_MERGE_POPS)
   const stats = {
@@ -919,6 +944,7 @@ export function selectSigma(index, seeds, options = {}) {
     excludedSkips: 0,
     frontierHits: 0,
     filteredByTime: 0,
+    filteredByEvent: 0,
     hasMore: false,
   }
   const seedList = []
@@ -937,6 +963,7 @@ export function selectSigma(index, seeds, options = {}) {
     sticky,
     minAlpha,
     timeIds,
+    eventIds,
     frontier,
     picked,
     seenIndices,
@@ -969,6 +996,7 @@ export function selectSigma(index, seeds, options = {}) {
         sticky,
         minAlpha,
         timeIds,
+        eventIds,
         frontier,
         picked: hopPicked,
         seenIndices,
@@ -1004,6 +1032,7 @@ function scanRareTerms(index, seeds, options = {}) {
   const scanCap = integerOr(options.scanCap, DEFAULT_FAIR.rareTerm.scanCap)
   const minAlpha = clampAlpha(numberOr(options.minAlpha, 0))
   const timeIds = options.timeIds || null
+  const eventIds = options.eventIds || null
   const entries = index.entries
   const infos = []
   for (const seed of seeds) {
@@ -1023,6 +1052,7 @@ function scanRareTerms(index, seeds, options = {}) {
       if (!entry) continue
       if (minAlpha > 0 && entry.alpha < minAlpha) continue
       if (timeIds && !timeIds.has(entry.id)) continue
+      if (eventIds && !eventIds.has(entry.id)) continue
       scored.set(at, (scored.get(at) || 0) + weight)
     }
   }
@@ -1262,6 +1292,7 @@ function emptySelectStats(round, mode) {
     reInjections: 0,
     degraded: false,
     filteredByTime: 0,
+    filteredByEvent: 0,
     filteredByAlpha: 0,
     round,
     mode,
@@ -1300,7 +1331,7 @@ function capPool(pool, max) {
  *   lanes?: LaneState, cfg?: object, round?: number,
  *   blockIds?: Set<string>|string[], ledger?: Set<string>|string[],
  *   excludeIds?: Set<string>|string[], minAlpha?: number,
- *   timeIds?: Set<string>|null, k?: number,
+ *   timeIds?: Set<string>|null, eventIds?: Set<string>|null, k?: number,
  *   mode?: 'fair'|'deterministic', hops?: number,
  * }} [options]
  * @returns {{
@@ -1337,7 +1368,8 @@ export function selectRecall(index, userText, options = {}) {
   const ledger = toIdSet(opts.ledger)
   const extraExclude = toIdSet(opts.excludeIds)
   const minAlpha = clampAlpha(numberOr(opts.minAlpha, numberOr(recall.minAlpha, 0)))
-  const timeIds = toTimeIds(opts.timeIds)
+  const timeIds = toIdFilter(opts.timeIds)
+  const eventIds = toIdFilter(opts.eventIds)
   const thetaHigh = effective.thetaHigh
   const exploreRatio = effective.exploreRatio
   const r = rotationRate(k, exploreRatio)
@@ -1351,14 +1383,16 @@ export function selectRecall(index, userText, options = {}) {
     stats.degraded = lanes.degraded === true
     return { picks: [], stats, hasMore: stats.hasMore, lanes, warnings }
   }
-  const scan = scanCandidates(safeIndex, seeds, { minAlpha, timeIds })
-  // `candidates` is the rank domain |C(Q)∩W| (after the α/time pre-filters);
-  // `candidatesAll` additionally counts the candidates rejected by the time
-  // window (telemetry / missType='time' decisions).
+  const scan = scanCandidates(safeIndex, seeds, { minAlpha, timeIds, eventIds })
+  // `candidates` is the rank domain |C(Q)∩W∩E| (after the α/time/event
+  // pre-filters); `candidatesAll` additionally counts the candidates rejected by
+  // the time window, and `filteredByEvent` the time-passed candidates rejected by
+  // the event constraint (telemetry / missType decisions).
   stats.candidates = scan.windowIndices.length
   stats.candidatesAll = scan.indices.length
   stats.filteredByAlpha = scan.filteredByAlpha
   stats.filteredByTime = scan.filteredByTime
+  stats.filteredByEvent = scan.filteredByEvent
   const windowIndices = scan.windowIndices
   const windowSet = scan.windowSet
   const matchCount = scan.matchCount
@@ -1382,6 +1416,7 @@ export function selectRecall(index, userText, options = {}) {
       sticky,
       minAlpha,
       timeIds,
+      eventIds,
       frontier: lanes.frontier,
       hops,
       maxPops: MAX_MERGE_POPS,
@@ -1390,10 +1425,11 @@ export function selectRecall(index, userText, options = {}) {
     stats.frontierHits = result.stats.frontierHits
     stats.duplicates = result.stats.duplicates
     stats.excludedSkips = result.stats.excludedSkips
-    // Merge-level time skips are a different counter (a popped entry can be
-    // reached from several posting lists); the telemetry `filteredByTime` is the
-    // deduplicated number of candidates outside the window.
+    // Merge-level time/event skips are a different counter (a popped entry can
+    // be reached from several posting lists); the telemetry `filteredByTime` /
+    // `filteredByEvent` are the deduplicated candidate counts from scanCandidates.
     stats.laneTimeSkips = result.stats.filteredByTime
+    stats.laneEventSkips = result.stats.filteredByEvent
     const picks = result.picked
       .map((item) => {
         const entry = entries[item.index]
@@ -1433,6 +1469,7 @@ export function selectRecall(index, userText, options = {}) {
   const rare = scanRareTerms(safeIndex, seeds, {
     minAlpha,
     timeIds,
+    eventIds,
     scanCap: effective.rareScanCap,
   })
   const rareHigh = []
@@ -1496,7 +1533,7 @@ export function selectRecall(index, userText, options = {}) {
     if (!entry) continue
     if (minAlpha > 0 && entry.alpha < minAlpha) continue // gate: drop
     if (ledger.has(id)) continue // already surfaced elsewhere: drop
-    if (timeIds && !timeIds.has(id)) {
+    if ((timeIds && !timeIds.has(id)) || (eventIds && !eventIds.has(id))) {
       pendingRecords.push({ id, round: enqueuedRound, at: indexAt })
       continue
     }
@@ -1510,6 +1547,7 @@ export function selectRecall(index, userText, options = {}) {
       && !blockIds.has(record.id)
       && !extraExclude.has(record.id)
       && !(timeIds && !timeIds.has(record.id))
+      && !(eventIds && !eventIds.has(record.id))
     if (canInject && pushPick(record.at, 'register', 0, 1)) continue
     keptPending.push(record)
   }
@@ -1545,13 +1583,14 @@ export function selectRecall(index, userText, options = {}) {
     // A separate stats object: merges are allowed to re-visit time-filtered
     // entries on every round, while telemetry.filteredByTime is the deduplicated
     // candidate count computed by scanCandidates.
-    const mergeStats = { pops: 0, frontierHits: 0, duplicates: 0, excludedSkips: 0, filteredByTime: 0, lists: 0 }
+    const mergeStats = { pops: 0, frontierHits: 0, duplicates: 0, excludedSkips: 0, filteredByTime: 0, filteredByEvent: 0, lists: 0 }
     mergeSigma(safeIndex, seeds, {
       k: popTarget,
       exclude: excludeHigh,
       sticky: stickyHigh,
       minAlpha: Math.max(minAlpha, thetaHigh),
       timeIds,
+      eventIds,
       frontier: lanes.frontier,
       picked: lanePicked,
       seenIndices: new Set(),
@@ -1565,6 +1604,7 @@ export function selectRecall(index, userText, options = {}) {
     stats.duplicates += mergeStats.duplicates
     stats.excludedSkips += mergeStats.excludedSkips
     stats.laneTimeSkips = (stats.laneTimeSkips || 0) + mergeStats.filteredByTime
+    stats.laneEventSkips = (stats.laneEventSkips || 0) + mergeStats.filteredByEvent
     let slots = remainingHigh
     const deferred = []
     for (const item of lanePicked) {
@@ -1680,6 +1720,10 @@ export function selectRecall(index, userText, options = {}) {
         kept.push(item)
         continue
       }
+      if (eventIds && !eventIds.has(entry.id)) {
+        kept.push(item)
+        continue
+      }
       if (pickedIds.has(entry.id) || blockIds.has(entry.id) || extraExclude.has(entry.id)) {
         kept.push(item)
         continue
@@ -1715,7 +1759,7 @@ export function selectRecall(index, userText, options = {}) {
       const expansionSeeds = [...expansion].sort(idCompare).slice(0, hopKeywordCap)
       for (const keyword of expansionSeeds) seedSet.add(keyword)
       const hopPicked = []
-      const hopStats = { pops: 0, frontierHits: 0, duplicates: 0, excludedSkips: 0, filteredByTime: 0, lists: 0 }
+      const hopStats = { pops: 0, frontierHits: 0, duplicates: 0, excludedSkips: 0, filteredByTime: 0, filteredByEvent: 0, lists: 0 }
       const hopExclude = new Set(excludedFromLanes)
       for (const id of pickedIds) hopExclude.add(id)
       mergeSigma(safeIndex, expansionSeeds, {
@@ -1724,6 +1768,7 @@ export function selectRecall(index, userText, options = {}) {
         sticky: new Set(ledger),
         minAlpha,
         timeIds,
+        eventIds,
         frontier: lanes.frontier,
         picked: hopPicked,
         seenIndices: new Set(),
@@ -1737,6 +1782,7 @@ export function selectRecall(index, userText, options = {}) {
       stats.duplicates += hopStats.duplicates
       stats.excludedSkips += hopStats.excludedSkips
       stats.laneTimeSkips = (stats.laneTimeSkips || 0) + hopStats.filteredByTime
+      stats.laneEventSkips = (stats.laneEventSkips || 0) + hopStats.filteredByEvent
       for (const item of hopPicked) pushPick(item.index, 'hi', 0, item.generation)
     }
   }
@@ -1927,7 +1973,7 @@ function compareTrimKey(left, right) {
  *
  * @param {object} index
  * @param {string[]} seeds
- * @param {{k?: number, minAlpha?: number, maxTurns?: number, timeIds?: Set<string>|null}} [options]
+ * @param {{k?: number, minAlpha?: number, maxTurns?: number, timeIds?: Set<string>|null, eventIds?: Set<string>|null}} [options]
  * @returns {{ firstSeen: Map<string, number>, turns: string[][], total: number }}
  */
 export function simulateTurns(index, seeds, options = {}) {
@@ -1936,13 +1982,14 @@ export function simulateTurns(index, seeds, options = {}) {
   const k = Math.max(1, integerOr(opts.k, DEFAULT_K))
   const maxTurns = Math.max(1, integerOr(opts.maxTurns, 64))
   const minAlpha = clampAlpha(numberOr(opts.minAlpha, 0))
-  const timeIds = toTimeIds(opts.timeIds)
-  const total = countCandidates(safeIndex, seeds, { minAlpha, timeIds })
+  const timeIds = toIdFilter(opts.timeIds)
+  const eventIds = toIdFilter(opts.eventIds)
+  const total = countCandidates(safeIndex, seeds, { minAlpha, timeIds, eventIds })
   const exclude = new Set()
   const firstSeen = new Map()
   const turns = []
   for (let turn = 1; turn <= maxTurns; turn += 1) {
-    const result = selectSigma(safeIndex, seeds, { k, exclude, minAlpha, timeIds })
+    const result = selectSigma(safeIndex, seeds, { k, exclude, minAlpha, timeIds, eventIds })
     turns.push(result.picked.map((item) => item.id))
     if (!result.picked.length) break
     for (const item of result.picked) {

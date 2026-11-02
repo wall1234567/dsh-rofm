@@ -513,6 +513,44 @@ test('memory-audit: samples honour sampleLimit and detail mode', () => {
   assert.equal(auditMemory(memoryDir).samples, null)
 })
 
+test('memory-audit: events section counts tagged folders, distinct events and the top labels', () => {
+  const memoryDir = path.join(makeTempDir(), 'memory')
+  writeStore(memoryDir, 'session-events', [
+    folderEntry({ createdAt: CURRENT_TS, scored: true, event: '日本旅行' }),
+    folderEntry({ createdAt: CURRENT_TS, scored: true, event: '日本旅行' }),
+    folderEntry({ createdAt: CURRENT_TS, scored: true, event: '登录重构项目' }),
+    folderEntry({ createdAt: CURRENT_TS, scored: true }), // untagged
+  ])
+  const result = auditMemory(memoryDir)
+  assert.deepEqual(result.events, {
+    foldersWithEvent: 3,
+    distinctEvents: 2,
+    top: [
+      { label: '日本旅行', count: 2 },
+      { label: '登录重构项目', count: 1 },
+    ],
+  })
+  assert.equal(result.readOnly, true)
+
+  // The CLI exposes the same summary and stays read-only.
+  const { status, json } = runJson(['--memory', memoryDir])
+  assert.equal(status, 0)
+  assert.deepEqual(json.events, result.events)
+  assert.equal(json.readOnly, true)
+  // --help documents the events section.
+  assert.match(runCli(['--help']).stdout, /events = v1\.4\.0 事件标签统计/)
+})
+
+test('memory-audit: events section is empty (and stays readable) when nothing is tagged', () => {
+  const memoryDir = buildFixture()
+  const result = auditMemory(memoryDir)
+  assert.deepEqual(result.events, { foldersWithEvent: 0, distinctEvents: 0, top: [] })
+  const { status, json } = runJson(['--memory', memoryDir])
+  assert.equal(status, 0)
+  assert.deepEqual(json.events.foldersWithEvent, 0)
+  assert.deepEqual(json.events.top, [])
+})
+
 test('memory-audit: auditStore reports a missing/corrupt index instead of throwing', () => {
   const emptyDir = path.join(makeTempDir(), 'no-index')
   fs.mkdirSync(emptyDir, { recursive: true })
@@ -904,6 +942,13 @@ test('memory-audit: real memory/ is only read and reproduces the documented data
   assert.equal(json.calibers.A.folders, json.totals.folders)
   assert.equal(json.calibers.B.folders, json.totals.folders - json.buckets.legacy.folders)
   assert.equal(json.calibers.C.folders, json.buckets.current.folders)
+  // v1.4.0 event tag summary is always present and internally consistent.
+  assert.ok(Number.isInteger(json.events.foldersWithEvent))
+  assert.ok(Number.isInteger(json.events.distinctEvents))
+  assert.ok(Array.isArray(json.events.top))
+  assert.ok(json.events.foldersWithEvent <= json.totals.folders)
+  assert.ok(json.events.top.length <= 5)
+  assert.equal(json.events.top.reduce((sum, event) => sum + event.count, 0) <= json.events.foldersWithEvent, true)
   for (const session of json.sessions) {
     assert.ok(['synthetic', 'current'].includes(session.era), 'session era is session-level from engine/era.js')
     if (session.dominantEra !== 'legacy') continue

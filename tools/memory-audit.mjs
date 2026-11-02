@@ -54,6 +54,7 @@ import {
   sessionEraSignals,
   summarizeEras,
 } from '../engine/era.js'
+import { buildEventIndex } from '../engine/event-index.js'
 import { invokedAsMain } from './main-module.mjs'
 
 const TOOL_FILE = fileURLToPath(import.meta.url)
@@ -138,6 +139,8 @@ const USAGE = `dsh-rofm 记忆时代审计工具（零依赖，默认只读）
   · reasons / inconsistentMarks 保留：已写入的 pendingEra 标记会被信任，
     与"重新判定"不一致的标记数量记在 inconsistentMarks（--apply 可刷新）。
   顶层 buckets 的 folders 是 folder 总数，pending 才是待评分数量，不要混用。
+  顶层 events = v1.4.0 事件标签统计：foldersWithEvent（带 event 标签的 folder 数）、
+  distinctEvents（不同事件数）、top（前 5 个 {label,count}）；只读，不参与过滤。
 
 口径（与计划书 §2.2 / §9.2 一致，输出会自动计算）:
   A 全库存量 pending 比例（仅描述现状）；
@@ -361,6 +364,9 @@ export function auditStore(storeDir, options = {}) {
     mixed: false,
     markedPendingEra: 0,
     inconsistentMarks: 0,
+    // event-tag counters of this store (aggregated into `auditMemory().events`).
+    eventFolders: 0,
+    eventLabels: [],
     samples: sampleLimit > 0 ? { legacy: [], synthetic: [], current: [] } : null,
   }
   const parsedIndex = readJsonFile(path.join(storeDir, 'index.json'))
@@ -440,6 +446,11 @@ export function auditStore(storeDir, options = {}) {
     : explainStoreEra(session.era, result.dominantEra, result.reasons, result.buckets)
   result.normalSession =
     !result.empty && session.era === 'current' && minCreatedAt !== null && minCreatedAt >= NORMAL_SESSION_BOUNDARY_MS
+  // v1.4.0 event constraint: optional `event` label per folder (already mirrored
+  // into index.folders by engine/store.js). Audit-only aggregate, never a filter.
+  const eventIndex = buildEventIndex(folders, {})
+  result.eventFolders = eventIndex.byId.size
+  result.eventLabels = eventIndex.labels.map((bucket) => ({ label: bucket.label, key: bucket.key, count: bucket.count }))
   return result
 }
 
@@ -531,6 +542,8 @@ export function auditMemory(memoryDir, options = {}) {
     },
     totals: { folders: 0, scored: 0, pending: 0, pendingPercent: 0, currentPendingPercent: 0, stores: 0, sessions: 0 },
     buckets: { legacy: emptyCounts(), synthetic: emptyCounts(), current: emptyCounts() },
+    // v1.4.0 event constraint observability (optional `event` labels; read-only).
+    events: { foldersWithEvent: 0, distinctEvents: 0, top: [] },
     calibers: {},
     sessions: [],
     currentPending: [],
@@ -541,6 +554,9 @@ export function auditMemory(memoryDir, options = {}) {
   }
   if (isFile(path.join(memoryDir, 'index.json'))) result.layout = 'single'
   else if (isDirectory(path.join(memoryDir, 'sessions'))) result.layout = 'per-session'
+  /** v1.4.0 event labels merged across stores: normalised key → { label, count }. */
+  const eventTotals = new Map()
+  let eventFolders = 0
 
   if (!isDirectory(memoryDir)) {
     result.warnings.push(`memory 目录不存在：${memoryDir}（没有已归档记忆，按 0 计）`)
@@ -607,8 +623,22 @@ export function auditMemory(memoryDir, options = {}) {
           }
         }
       }
+      eventFolders += audit.eventFolders
+      for (const bucket of audit.eventLabels) {
+        const existing = eventTotals.get(bucket.key)
+        if (existing) existing.count += bucket.count
+        else eventTotals.set(bucket.key, { label: bucket.label, count: bucket.count })
+      }
     }
   }
+
+  // v1.4.0 event tag summary: folders carrying an optional event label, the
+  // distinct event count and the top 5 events (by folder count). Read-only.
+  const topEvents = [...eventTotals.values()]
+    .sort((left, right) => right.count - left.count || (left.label < right.label ? -1 : left.label > right.label ? 1 : 0))
+    .slice(0, 5)
+    .map((event) => ({ label: event.label, count: event.count }))
+  result.events = { foldersWithEvent: eventFolders, distinctEvents: eventTotals.size, top: topEvents }
 
   // Human order: legacy folders first, then synthetic, then current; biggest first.
   const eraRank = { legacy: 0, synthetic: 1, current: 2 }

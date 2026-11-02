@@ -94,6 +94,21 @@ export {
   validateTimezone,
 } from './time-index.js'
 
+// v1.4.0 event constraint (in-memory event index + label resolution, §6.9)
+export {
+  EVENT_DEFAULTS,
+  EVENT_MODES,
+  EVENT_METRICS,
+  eventConfig,
+  normalizeEventLabel,
+  eventKeyOf,
+  eventSimilarity,
+  buildEventIndex,
+  resolveEventQuery,
+  assignEventLabel,
+  eventIdsFor,
+} from './event-index.js'
+
 // engine facade
 export { MemoryEngine } from './engine.js'
 

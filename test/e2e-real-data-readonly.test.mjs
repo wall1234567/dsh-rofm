@@ -22,6 +22,12 @@
  * never passes `--apply`, and skips (instead of failing) on a machine that has
  * no real store, so the suite stays green on CI checkouts.
  *
+ * v1.4.0 addendum (event constraint): one extra read-only assertion builds the
+ * in-memory `engine.eventIndex()` on the real legacy store — old data carries no
+ * event labels (design §1.1: only a new `memory_judge` writes them), so the
+ * index must build safely with zero labels, and the same `(path → size:mtimeMs)`
+ * snapshot must show zero changes afterwards.
+ *
  * The contract numbers are the *installed snapshot* (plan §2.2): a session that
  * legitimately archived new folders changes them. That is exactly why the test
  * hard-codes them — a silent change of the era split must be reviewed, not
@@ -240,6 +246,23 @@ test('selfcheck --json agrees with memory-audit and reports 0 failed checks', { 
   const fairness = (selfcheck.checks ?? []).find((check) => check.name === 'recall fairness')
   assert.ok(fairness, 'selfcheck reports recall fairness metrics')
   assert.equal(fairness.status, 'PASS', 'legacy-only telemetry is INFO, not WARN/FAIL')
+
+  // v1.4.0 event-constraint addendum: selfcheck audits event tags (INFO only) and
+  // must agree with the direct index.json count below (0 tagged legacy folders).
+  const eventCheck = (selfcheck.checks ?? []).find((check) => check.name === 'event tags')
+  assert.ok(eventCheck, 'selfcheck audits event tags (SPEC §8 check 8)')
+  assert.equal(eventCheck.status, 'PASS', 'event tags are observability metadata: never WARN/FAIL')
+  assert.equal(eventCheck.data?.foldersWithEvent, 0, 'no legacy folder carries an event label')
+  assert.equal(eventCheck.data?.distinctEvents, 0, 'the real store has zero distinct events')
+  assert.equal(eventCheck.data?.folders, EXPECTED.totals.folders, 'the event audit covers every indexed folder')
+  assert.deepEqual(eventCheck.data?.eventMode, {
+    engineDefault: 'index',
+    packaged: 'constrain',
+    effective: 'constrain',
+    packagedMatchesEffective: true,
+  }, 'engine default index / packaged constrain / effective constrain agree')
+  assert.equal(eventCheck.data?.similarity?.metric, 'dice', 'the event similarity metric is Dice')
+  assert.equal(eventCheck.data?.similarity?.threshold, 0.72, 'the event similarity threshold is 0.72')
 })
 
 test('recall-report --json agrees with both tools (74.00% all-stock / 0.54% current / 0/359 normal)', { skip: storeSkipReason() }, () => {
@@ -459,4 +482,57 @@ test('the 1.3.0 recall-state.json snapshot is still restorable through the v2 re
     restoredText.length > 0 || restoredIds.length > 0,
     'a non-empty v2 snapshot restores injected text or ids without throwing',
   )
+})
+
+// ---------------------------------------------------------------------------
+// v1.4.0 addendum — event constraint index on the real (legacy) store
+// ---------------------------------------------------------------------------
+
+test('the real legacy store has no event labels and engine.eventIndex() builds safely (read-only)', { skip: storeSkipReason() }, async () => {
+  const before = snapshotTree(SESSIONS_DIR)
+  assert.ok(before.size > 0, 'the store snapshot is non-empty')
+
+  // (1) Old data must not carry event labels: no v1.4.0 scoring model ever ran
+  // on it (design §1.1 — only `memory_judge` writes `meta.event`).
+  const stores = []
+  let folders = 0
+  let foldersWithEvent = 0
+  for (const dir of listSessionDirs()) {
+    const indexPath = path.join(SESSIONS_DIR, dir, 'index.json')
+    if (!existsSync(indexPath)) continue
+    const parsed = JSON.parse(readFileSync(indexPath, 'utf8'))
+    const entries = Array.isArray(parsed?.folders) ? parsed.folders : []
+    folders += entries.length
+    for (const entry of entries) {
+      if (entry && typeof entry.event === 'string' && entry.event.trim().length > 0) foldersWithEvent += 1
+    }
+    if (entries.length > 0) stores.push({ dir, entries: entries.length })
+  }
+  assert.equal(folders, EXPECTED.totals.folders, 'the real store still holds the documented 3742 folders')
+  assert.equal(foldersWithEvent, 0, 'legacy data carries no event labels (design §1.1: only new judging writes them)')
+  stores.sort((left, right) => right.entries - left.entries)
+  assert.ok(stores.length > 0, 'at least one real store has indexed folders')
+
+  // (2) The derived event index must build from the real index.json without
+  // throwing and be empty (pure in-memory derivation, contract §1.3).
+  const { MemoryEngine, loadConfig } = await import('../engine/index.js')
+  const cfg = loadConfig(path.join(REPO, 'config.json'))
+  for (const store of stores) {
+    const engine = new MemoryEngine({ memoryDir: path.join(SESSIONS_DIR, store.dir), config: cfg })
+    let eventIndex
+    assert.doesNotThrow(() => {
+      eventIndex = engine.eventIndex()
+    }, `engine.eventIndex() must build safely for ${store.dir}`)
+    assert.ok(eventIndex && typeof eventIndex === 'object', `the event index object is returned for ${store.dir}`)
+    assert.deepEqual(eventIndex.labels, [], `no event buckets in legacy store ${store.dir}`)
+    assert.equal(eventIndex.byKey.size, 0, `no canonical event keys in legacy store ${store.dir}`)
+    assert.equal(eventIndex.byId.size, 0, `no folder carries an event in legacy store ${store.dir}`)
+    assert.equal(eventIndex.folderCount, store.entries, `the event index covers every indexed folder of ${store.dir}`)
+    assert.ok(typeof eventIndex.signature === 'string' && eventIndex.signature.length > 0, 'the index carries a cache signature')
+  }
+
+  // (3) Building the derived index must not write a single byte.
+  const after = snapshotTree(SESSIONS_DIR)
+  const diffs = diffSnapshots(before, after)
+  assert.deepEqual(diffs, [], `building the event index must stay read-only; changed: ${diffs.slice(0, 20).join(', ')}`)
 })

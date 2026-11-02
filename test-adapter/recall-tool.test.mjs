@@ -754,6 +754,7 @@ test('an empty browse result is a time miss with a widening/ask-user hint', asyn
   const text = textOf(render(tool, { timeFrom: '2026-10-31' }, value))
   assert.ok(text.includes('纯时间浏览'), text)
   assert.ok(text.includes('指定时间范围内没有找到记忆'), text)
+  assert.ok(text.includes('询问期望的事件名'), 'a time miss also mentions the event reminder')
   assert.ok(text.includes('询问'), text)
 })
 
@@ -816,15 +817,20 @@ test('missType=time does not count a strike and returns an ask-the-user hint', a
   assert.equal(third.misses, 1, 'a true miss starts the strike run')
 })
 
-test('the three model-visible hints all tell the model it may ask the user for a time range', () => {
+test('the three model-visible hints tell the model it may ask the user for a time range AND an event name', () => {
   // The 3rd-miss warning and the 6th-miss disable hint keep their v1.3.0
   // sentences (rollback parity) and append the v1.4.0 time-assistance sentence.
   assert.ok(MISS_WARNING.includes('可能关键词没有选对'), 'legacy warning sentence kept')
   assert.ok(MISS_WARNING.includes('询问'), '3rd-miss warning mentions asking the user')
   assert.ok(MISS_WARNING.includes('最小连续 3 天'), MISS_WARNING)
+  // v1.4.0 event assist: the same hints may ask the user for the expected event.
+  assert.ok(MISS_WARNING.includes('询问期望的事件名'), MISS_WARNING)
+  assert.ok(MISS_WARNING.includes('event'), MISS_WARNING)
   assert.ok(DISABLED_HINT.includes('目标回忆 α 值过低'), 'legacy disable sentence kept')
   assert.ok(DISABLED_HINT.includes('询问'), '6th-miss hint mentions asking the user')
   assert.ok(DISABLED_HINT.includes('最小连续 3 天'), DISABLED_HINT)
+  assert.ok(DISABLED_HINT.includes('询问期望的事件名'), DISABLED_HINT)
+  assert.ok(DISABLED_HINT.includes('event'), DISABLED_HINT)
 
   // The empty-result missHint is the third model-visible place.
   const tool = new MemoryRecallTool(makePlugin({ engine: makeEngine() }))
@@ -842,6 +848,26 @@ test('the three model-visible hints all tell the model it may ask the user for a
   assert.ok(text.includes('没有匹配到任何记忆'), text)
   assert.ok(text.includes('询问'), 'empty-result hint mentions asking the user')
   assert.ok(text.includes('最小连续 3 天'), text)
+  assert.ok(text.includes('询问期望的事件名'), text)
+  assert.ok(text.includes('event 参数'), text)
+})
+
+test('the event "ask the user" reminder honours event.askUserHint=false', () => {
+  const tool = new MemoryRecallTool(makePlugin({ engine: makeEngine() }))
+  const value = {
+    found: 0,
+    matchedFolders: 0,
+    attempted: 0,
+    added: [],
+    images: [],
+    entries: [],
+    misses: 1,
+    askUserHint: true,
+    eventAskUserHint: false,
+  }
+  const text = textOf(render(tool, { keywords: 'nothing' }, value))
+  assert.ok(!text.includes('询问期望的事件名'), 'event reminder is suppressed by event.askUserHint=false')
+  assert.ok(text.includes('询问期望的时间范围'), 'the time reminder is independent and still present')
 })
 
 // ---------------------------------------------------------------------------

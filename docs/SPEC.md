@@ -250,7 +250,11 @@ export const DEFAULT_CONFIG = {
   compress: {
     enabled: true,
     triggerPercent: 60,      // compress when the model context is above 60% of window
-    compressPercent: 20,     // remove the earliest 20% of the *used* context
+    compressPercent: 20,     // normal target: remove the earliest 20% of the *used* context
+    // v1.4.0 archive floor: every archival must at least bring the context below
+    // this percentage; compressPercent is *enlarged* when it would stay above it.
+    releaseTargetPercent: 50,
+    releaseFloorEnabled: true, // false restores the v1.4.0-cap behaviour (fixtures)
     contextWindowTokens: 0,  // 0 = host-provided; > 0 overrides the window (adapter) / CLI fallback
     minContextTokens: 512,   // never compress a tiny context
     minMessagesToCompress: 4,
@@ -1501,8 +1505,10 @@ v1.3.0 "warn only" behaviour.
 
 **d. Per-step folder cap.** The plan's folder count is capped by
 `min(compress.maxFoldersPerRun, compress.maxFoldersPerStep,
-releaseEstimate)` where `releaseEstimate` is the folder count the remaining
-window can actually release (`releaseTokens` / `releaseCapped` are reported);
+releaseEstimate)` where `releaseEstimate` is the folder count needed for the
+release floor (an archival must at least reach `releaseTargetPercent`, default
+50%; `releaseTokens` / `releaseTargetPercent` / `releaseFloor` are reported and
+`releaseCapped` is kept for compatibility but is never raised);
 `plan.maxFoldersCapped=true` when the natural folder count was cut. The adapter
 records `maxFoldersCapped` in `compress-applied`.
 
@@ -1510,8 +1516,9 @@ records `maxFoldersCapped` in `compress-applied`.
 `{shouldCompress, reason, usedPercent, totalTokens, remove, keep, folders,
 warnings}` (v1.3.0) plus v1.4.0:
 `protectedTurn / protectedStart / smallWindow / maxFoldersCapped / maxFolders /
-releaseTokens / releaseCapped / eventTime / eventTimeSourceCounts /
-pendingAtArchive / allowSmallWindow`; failure reasons are
+releaseTokens / releaseTargetPercent / releaseFloor / eventTime /
+eventTimeSourceCounts / pendingAtArchive / allowSmallWindow` (`releaseCapped` is
+a compatibility field, always false); failure reasons are
 `'protected-turn' | 'no-legal-cut' | 'small-window' | 'window-conflict' |
 'hard-limit'` (in addition to the v1.3.0 `'below-threshold' |
 'too-few-messages' | 'nothing-to-remove' | 'ok'`).

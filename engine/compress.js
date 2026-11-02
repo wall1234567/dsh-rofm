@@ -170,16 +170,20 @@ function chunkEventRange(chunkMessages, chunk, eventTimes) {
  * the observed chars/token ratio of the message span). Returns `null` when the
  * window / usage percentage is unknown — nothing to cap then.
  */
-function estimateWindowRelease({ usedPercent, usedTokens, windowTokens, totalTokens, totalChars, triggerPercent, targetChunkChars }) {
+function estimateWindowRelease({ usedPercent, usedTokens, windowTokens, totalTokens, totalChars, targetPercent, targetChunkChars }) {
   const window = finiteNumberOrNull(windowTokens)
   const percent = finiteNumberOrNull(usedPercent)
-  const trigger = finiteNumberOrNull(triggerPercent)
-  if (!(window > 0) || percent === null || trigger === null || !(percent > trigger)) return null
+  const target = finiteNumberOrNull(targetPercent)
+  if (!(window > 0) || percent === null || target === null || !(percent > target)) return null
   const used = finiteNumberOrNull(usedTokens)
   if (!(used > 0)) return null
-  const releasableTokens = ((percent - trigger) / 100) * window
+  // v1.4.0: the release target is a *floor* (default 50%): an archival must at
+  // least free enough tokens to bring the context strictly below it, so the
+  // exact target boundary gets one extra token of margin.
+  const releasableTokens = ((percent - target) / 100) * window
+  const strictTokens = Math.ceil(releasableTokens) + 1
   if (!(releasableTokens > 0)) return null
-  const tokens = Math.min(releasableTokens, used)
+  const tokens = Math.min(strictTokens, used)
   const messageTokens = finiteNumberOrNull(totalTokens)
   const charsPerToken = totalChars > 0 && messageTokens > 0 ? totalChars / messageTokens : 3
   const tokensPerFolder = Math.max(1, targetChunkChars / Math.max(charsPerToken, 0.05))
@@ -568,31 +572,39 @@ export function planCompression(options = {}) {
     plan.reason = 'nothing-to-remove'
     return plan
   }
-  // P1-6: never release more than the remaining window still needs. When the
-  // context only slightly exceeds the trigger, archiving the full compressPercent
-  // slice would remove useful context for nothing.
-  const release = estimateWindowRelease({
+  // v1.4.0 archive target (release floor, not a cap): every archival must at
+  // least free enough tokens to bring the context below
+  // `compress.releaseTargetPercent` (default 50%). `compressPercent` remains the
+  // normal target; when it would leave the context above the release target, the
+  // removed span is enlarged instead of capped.
+  const releaseTargetPercent = finiteNumberOrNull(compressCfg.releaseTargetPercent)
+  const release = compressCfg.releaseFloorEnabled === false
+    ? null
+    : estimateWindowRelease({
     usedPercent,
     usedTokens: plan.usedTokens,
     windowTokens: plan.windowTokens,
     totalTokens: plan.totalTokens,
     totalChars,
-    triggerPercent: compressCfg.triggerPercent,
+    targetPercent: releaseTargetPercent,
     targetChunkChars: Math.max(1, finiteNumberOrNull(compressCfg.targetChunkChars) ?? 1200),
   })
   if (release) {
+    plan.releaseTargetPercent = releaseTargetPercent
     plan.releaseTokens = roundNumber(release.tokens, 2)
     plan.releaseFolders = release.folders
-    if (release.tokens < targetTokens) {
+    if (release.tokens > targetTokens) {
       targetTokens = release.tokens
-      plan.releaseCapped = true
+      plan.releaseFloor = true
       plan.warnings.push(
-        `planCompression: only ~${Math.round(release.tokens)} tokens are needed to get back below ` +
-          `triggerPercent=${compressCfg.triggerPercent}%; the archived span was capped from ` +
-          `${Math.round(plan.usedTokens * (compressCfg.compressPercent / 100))} tokens`,
+        `planCompression: archiving at least ~${Math.round(release.tokens)} tokens to get below ` +
+          `releaseTargetPercent=${releaseTargetPercent}% (compressPercent=${compressCfg.compressPercent}% would only ` +
+          `remove ~${Math.round(plan.usedTokens * (compressCfg.compressPercent / 100))} tokens)`,
       )
     }
   }
+  // `releaseCapped` is the v1.4.0 cap-era field; the behavior is now a floor, so
+  // it is never set and only kept for telemetry/backward compatibility.
   plan.targetTokens = roundNumber(targetTokens, 2)
 
   const tokens = messages.map((message) => messageTokens(message))
@@ -820,6 +832,13 @@ export function planCompression(options = {}) {
   // unchanged; the adapter can surface one INFO/WARN from this flag instead of
   // leaving it at debug level.
   plan.trickleArchive = plan.releaseCapped === true && folderPlans.length === 1
+  if (plan.releaseFloor === true && Number.isFinite(plan.removeTokens) && plan.removeTokens < plan.targetTokens) {
+    plan.warnings.push(
+      `planCompression: the legal cut / folder caps only remove ~${Math.round(plan.removeTokens)} tokens ` +
+        `(< release floor ${Math.round(plan.targetTokens)}); the context may stay above ` +
+        `releaseTargetPercent=${plan.releaseTargetPercent}% and the next archival will continue`,
+    )
+  }
 
   plan.shouldCompress = folderPlans.length > 0
   plan.reason = plan.shouldCompress ? 'ok' : 'nothing-to-remove'
@@ -1121,6 +1140,8 @@ export function commitCompression(plan, options = {}) {
         foldersArchived: written.length,
         // P1-6/O1: release cap + trickle (1-folder) archive observability.
         releaseCapped: planObject.releaseCapped === true,
+        releaseFloor: planObject.releaseFloor === true,
+        releaseTargetPercent: Number.isFinite(planObject.releaseTargetPercent) ? planObject.releaseTargetPercent : null,
         trickleArchive: planObject.trickleArchive === true,
         rollback: false,
         maxFoldersCapped: planObject.maxFoldersCapped === true,

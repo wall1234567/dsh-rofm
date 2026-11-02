@@ -60,6 +60,10 @@ function makeCfg(patch = {}) {
       // so every legacy fixture opts in explicitly; the default-refusal path is
       // covered by dedicated tests further down.
       allowSmallWindow: true,
+      // The parser fixtures below use synthetic window/used numbers (tiny used
+      // totals against large percentage windows); the release floor is a
+      // product-level default exercised by dedicated tests further down.
+      releaseFloorEnabled: false,
     },
   }
   return loadConfig(undefined, {
@@ -901,32 +905,49 @@ test('compress: eventStart/eventEnd/eventTimeSource are collected from message t
   assert.equal(eventTimeRangeOf([{ role: 'user', content: 'no time' }]), null)
 })
 
-test('compress: a release-capped 1-folder archive is flagged as trickle telemetry (O1)', () => {
-  // Just above the trigger in a large window: the remaining releasable amount
-  // ((61-60)% of 128k = 1280 tokens) is smaller than the compressPercent target
-  // (20% of 8000 = 1600), so the archive is release-capped and yields one folder.
-  const cfg = makeCfg({
-    compress: { compressPercent: 20, keepRecentMessages: 2, targetChunkChars: 2000, minChunkChars: 50, maxFoldersPerRun: 100 },
-  })
+test('compress: the release floor archives at least to releaseTargetPercent (default 50%)', () => {
   const messages = makeMessages(16)
-  const plan = planCompression({ messages, usedPercent: 61, cfg, totalUsedTokens: 8000, windowTokens: 128000, sessionId: 'trickle', now: 1700000000000 })
+  // compressPercent alone would remove only ~5% of the used context; the floor
+  // (61% -> 50% of a 128k window = 14080 tokens) must enlarge the target.
+  const cfg = makeCfg({ compress: { compressPercent: 5, releaseFloorEnabled: true, releaseTargetPercent: 50, targetChunkChars: 2000, minChunkChars: 50, maxFoldersPerRun: 500 } })
+  // Consistent measurement: 61% of 128k = 78080 used tokens; the floor needs
+  // 11% of the window = 14080 tokens, while compressPercent=5% would only plan 3904.
+  const plan = planCompression({ messages, usedPercent: 61, cfg, totalUsedTokens: 78080, windowTokens: 128000, sessionId: 'floor', now: 1700000000000 })
   assert.equal(plan.shouldCompress, true)
-  assert.equal(plan.releaseCapped, true)
-  assert.equal(plan.folders.length, 1)
-  assert.equal(plan.trickleArchive, true, 'a capped 1-folder archive is a trickle archive')
+  assert.equal(plan.releaseTargetPercent, 50, 'the floor target is reported')
+  assert.equal(plan.releaseFloor, true, 'the floor raised the target above compressPercent')
+  assert.equal(plan.releaseCapped, undefined, 'the cap-era flag is never set by the floor logic')
+  assert.equal(plan.trickleArchive, false, 'a floor-driven archive is not a trickle archive')
+  assert.ok(plan.targetTokens >= 14080, `targetTokens ${plan.targetTokens} must include the 14080-token floor`)
+  assert.ok(plan.warnings.some((warning) => warning.includes('releaseTargetPercent=50')), JSON.stringify(plan.warnings))
 
+  // A consistent measurement where compressPercent already exceeds the floor:
+  // 20% of 78080 tokens = 15616 > 14080 -> no floor, normal target.
+  const normal = planCompression({ messages, usedPercent: 61, cfg: makeCfg({ compress: { compressPercent: 20, releaseFloorEnabled: true } }), totalUsedTokens: 78080, windowTokens: 128000 })
+  assert.notEqual(normal.releaseFloor, true, 'the floor only applies when compressPercent is smaller')
+  assert.ok(normal.targetTokens >= 15616)
+})
+
+test('compress: releaseFloorEnabled=false restores the plain compressPercent target', () => {
+  const messages = makeMessages(16)
+  const cfg = makeCfg({ compress: { compressPercent: 5, releaseFloorEnabled: false } })
+  const plan = planCompression({ messages, usedPercent: 61, cfg, totalUsedTokens: 8000, windowTokens: 128000 })
+  assert.equal(plan.releaseFloor, undefined)
+  assert.equal(plan.releaseTargetPercent, undefined)
+  assert.ok(plan.targetTokens <= 401, `targetTokens ${plan.targetTokens} must stay at the compressPercent target`)
+  assert.ok(!plan.warnings.some((warning) => warning.includes('releaseTargetPercent')), JSON.stringify(plan.warnings))
+})
+
+test('compress: a release floor is reported in the compress telemetry', () => {
+  const messages = makeMessages(16)
+  const cfg = makeCfg({ compress: { compressPercent: 5, releaseFloorEnabled: true, releaseTargetPercent: 50 } })
+  const plan = planCompression({ messages, usedPercent: 61, cfg, totalUsedTokens: 8000, windowTokens: 128000, sessionId: 'floor-telemetry', now: 1700000000001 })
+  assert.equal(plan.shouldCompress, true)
   const memoryDir = tempDir()
-  const committed = commitCompression(plan, { memoryDir, cfg, sessionId: 'trickle' })
-  assert.equal(committed.folders.length, 1)
+  const committed = commitCompression(plan, { memoryDir, cfg, sessionId: 'floor-telemetry' })
+  assert.ok(committed.folders.length >= 1)
   const compressEvent = readStats(memoryDir, cfg).filter((event) => event.type === 'compress').at(-1)
-  assert.equal(compressEvent.trickleArchive, true)
-  assert.equal(compressEvent.releaseCapped, true)
-  assert.equal(compressEvent.foldersArchived, 1)
-
-  // A normal multi-folder archive keeps the flag off (behaviour is unchanged).
-  const normalCfg = makeCfg({ compress: { compressPercent: 80, keepRecentMessages: 2, targetChunkChars: 120, minChunkChars: 20 } })
-  const normalPlan = planCompression({ messages: makeMessages(16), usedPercent: 90, cfg: normalCfg, totalUsedTokens: 1600, now: 1700000000001 })
-  assert.ok(normalPlan.folders.length > 1)
-  assert.notEqual(normalPlan.releaseCapped, true)
-  assert.equal(normalPlan.trickleArchive, false)
+  assert.equal(compressEvent.releaseFloor, true)
+  assert.equal(compressEvent.releaseTargetPercent, 50)
+  assert.equal(compressEvent.releaseCapped, false, 'the old cap flag is never raised by the floor logic')
 })

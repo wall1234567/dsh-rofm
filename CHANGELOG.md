@@ -218,11 +218,12 @@ The project follows a lightweight [SemVer](https://semver.org/) scheme.
 #### Added
 
 - **`compress` 新配置**：`protectCurrentTurn=true` / `allowSmallWindow=false` / `smallWindowTokens=20000` /
-  `hardLimitStop=true` / `maxFoldersPerStep=500`。
+  `hardLimitStop=true` / `maxFoldersPerStep=500` / `releaseTargetPercent=50` / `releaseFloorEnabled=true`。
 - **`planCompression` 新可选入参**：`protectTurn` / `protectSeq` / `pendingCount` / `windowTokens` /
   `allowSmallWindow` / `maxFolders` / `eventTimes`（全部向后兼容）。
 - **plan 只读字段**：`protectedTurn` / `protectedStart` / `smallWindow` / `maxFoldersCapped` / `maxFolders` /
-  `releaseTokens` / `releaseCapped` / `eventTime` / `eventTimeSourceCounts` / `pendingAtArchive`，
+  `releaseTokens` / `releaseTargetPercent` / `releaseFloor` / `eventTime` / `eventTimeSourceCounts` /
+  `pendingAtArchive`（`releaseCapped` 保留兼容、恒为 false），
   以及失败 `reason ∈ 'protected-turn'|'no-legal-cut'|'small-window'|'window-conflict'|'hard-limit'`。
 - **commit 事务（P1-4）**：先写 folder → 最后写 index；写 `.commit-<id>.json` journal，
   异常时回滚已写 folder + 图片 + 内存索引并 **rethrow** 原错误（附加 `error.rolledBack=true` /
@@ -241,7 +242,10 @@ The project follows a lightweight [SemVer](https://semver.org/) scheme.
 - **小窗口/假窗口 sanity**：窗口 < `smallWindowTokens`、配置窗口与宿主窗口相差 >4×、或实测上下文 >窗口 500% 且
   `allowSmallWindow!=true` 时**跳过自动归档**（每会话只 WARN 一次）。
 - **pass-0 再归档**：本回合刚注入的 additions 受保护（`injectedTurn`），多步工具回合不再被自己删掉刚召回的记忆。
-- **单步归档上限**：`maxFoldersPerStep` 与“剩余窗口可释放量”取小，`maxFoldersCapped` 可观测。
+- **单步归档上限**：`maxFoldersPerStep` 与释放估算取小，`maxFoldersCapped` 可观测。
+- **归档释放下限（新）**：不再“只压到 trigger 以下”；每次归档至少压到 `compress.releaseTargetPercent`（默认 **50%**）以下，
+  `compressPercent` 只作为目标值、不足时自动扩大移除范围；合法切点/文件夹上限导致达不到下限时记 warning（下一次归档继续）。
+  `releaseCapped` 字段保留兼容（恒 false），新增 `releaseFloor/releaseTargetPercent` 计划与遥测字段。
 
 #### Fixed
 

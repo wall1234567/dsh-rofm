@@ -1066,6 +1066,9 @@ v1.4.0 新增/扩展测试文件（当前用例数，`node --test <file>` 实测
   archive → judge → recall, no self-destruction`）通过——全流程 afterPercent 始终 **< 95%（hardLimit）**、
   连续超过 hardLimit 线的 episode **≤ 2**（第 2 次即硬停止）、任务区块预算内、**无 > `scoring.maxPending`
   的积压**（评分后 pending 归零）。
+- **归档释放下限**：`compress: the release floor archives at least to releaseTargetPercent (default 50%)` 通过——
+  61% 触发时目标被抬到“至少 50% 以下”（128k 窗口 = 14080 tokens 下限）；
+  `releaseFloorEnabled=false` 恢复旧口径的用例同时通过；遥测含 `releaseFloor/releaseTargetPercent`。
 - **hardLimit 硬停止**：`hardLimitPercent becomes a hard stop after consecutive failed compressions` 通过；
   `hardLimitStop=false keeps the v1.3.0 diagnostics (WARN once, no stop)` 通过。
   阈值口径 = **连续 2 个压力 episode**（一次触发 + 其 emergency pass = 1 episode）。

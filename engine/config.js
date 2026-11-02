@@ -87,6 +87,14 @@ export const DEFAULT_CONFIG = {
     enabled: true,
     triggerPercent: 60, // compress when the model context is above 60% of window
     compressPercent: 20, // remove the earliest 20% of the *used* context
+    // v1.4.0 archive target: an archival must at least bring the context below
+    // this percentage (removal floor). It is a *floor*, not a cap: when
+    // compressPercent alone would leave the context above it, the span is
+    // enlarged instead of capped. Must stay below `triggerPercent`.
+    releaseTargetPercent: 50,
+    // Set false to restore the v1.4.0 "cap just below trigger" behaviour (unit
+    // fixtures with synthetic windows use it; product default is true).
+    releaseFloorEnabled: true,
     contextWindowTokens: 0, // 0 = host-provided; > 0 overrides the window (adapter resolveContextWindow, CLI fallback)
     minContextTokens: 512, // never compress a tiny context
     minMessagesToCompress: 4,
@@ -451,6 +459,14 @@ export function validateConfig(input) {
   c.enabled = booleanField(warnings, 'compress.enabled', c.enabled, DEFAULT_CONFIG.compress.enabled)
   c.triggerPercent = percentField(warnings, 'compress.triggerPercent', c.triggerPercent, DEFAULT_CONFIG.compress.triggerPercent)
   c.compressPercent = percentField(warnings, 'compress.compressPercent', c.compressPercent, DEFAULT_CONFIG.compress.compressPercent)
+  c.releaseTargetPercent = percentField(warnings, 'compress.releaseTargetPercent', c.releaseTargetPercent, DEFAULT_CONFIG.compress.releaseTargetPercent)
+  c.releaseFloorEnabled = booleanField(warnings, 'compress.releaseFloorEnabled', c.releaseFloorEnabled, DEFAULT_CONFIG.compress.releaseFloorEnabled)
+  if (!(c.releaseTargetPercent < c.triggerPercent)) {
+    warnings.push(
+      `compress.releaseTargetPercent: must be < compress.triggerPercent (${c.triggerPercent}); ` +
+        `the archive release floor is disabled for this config`,
+    )
+  }
   c.contextWindowTokens = numberField(warnings, 'compress.contextWindowTokens', c.contextWindowTokens, DEFAULT_CONFIG.compress.contextWindowTokens, { min: 0, integer: true })
   c.minContextTokens = numberField(warnings, 'compress.minContextTokens', c.minContextTokens, DEFAULT_CONFIG.compress.minContextTokens, { min: 0, integer: true })
   c.minMessagesToCompress = numberField(warnings, 'compress.minMessagesToCompress', c.minMessagesToCompress, DEFAULT_CONFIG.compress.minMessagesToCompress, { min: 1, integer: true })

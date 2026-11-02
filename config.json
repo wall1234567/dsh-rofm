@@ -5,6 +5,8 @@
     "enabled": true,
     "triggerPercent": 60,
     "compressPercent": 20,
+    "releaseTargetPercent": 50,
+    "releaseFloorEnabled": true,
     "contextWindowTokens": 0,
     "minContextTokens": 512,
     "minMessagesToCompress": 4,

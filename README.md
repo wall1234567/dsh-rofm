@@ -90,6 +90,7 @@
    - 先做**回忆块再归档**（已加回的回忆也按同一“最早占比”规则移除，见 §1.4）；
    - 再取**最早的约 `compress.compressPercent`（默认 20%）** 的已用对话（按 token 累计，切在完整用户回合边界，绝不拆散 tool-call / tool-result）；
      **注意 20% 是目标值**：受 `keepRecentMessages` 和回合边界影响可能更少，也可能因边界对齐超调；`maxBoundaryOvershoot` 限制单次超调，超大单回合会按消息拆成多个文件夹；
+     v1.4.0 起还有**释放下限**：若按 20% 移除后仍无法把上下文降到 `compress.releaseTargetPercent`（默认 **50%**）以下，目标会被**扩大**（下限不是上限；`compress.releaseFloorEnabled=false` 可关闭，恢复“只压到 trigger 以下”的旧行为）；
      v1.4.0 起**当前回合保护**（`compress.protectCurrentTurn=true`）：移除区间绝不覆盖当前 turn 的用户消息与同 turn 的 tool 配对；
      找不到合法切点时**拒绝本次归档**并记 warning（不再“随便切一刀”把用户问题归档掉，见 §1.1.1）；
    - 按 `targetChunkChars`（默认 1200 字）把这段拆成多个**回忆文件夹**；
@@ -138,7 +139,7 @@
 | `compress.allowSmallWindow` | `false` | 窗口 < `compress.smallWindowTokens`（默认 20000）或 `compress.contextWindowTokens` 与宿主窗口相差超过 4× 时，**跳过自动归档**（每会话只 WARN 一次）；设为 `true` 才允许小窗口归档 |
 | `compress.smallWindowTokens` | `20000` | “小窗口”阈值（token）。小窗口里 ROFM 自己的 2 个 prompt section 就会把占用推高，归档会自我增压 |
 | `compress.hardLimitStop` | `true` | 上下文连续 **2 个压力 episode** 仍 > `compress.hardLimitPercent`（默认 95）→ 停止归档并 WARN；不再每个 pre-step 重试 |
-| `compress.maxFoldersPerStep` | `500` | 单个模型步骤最多归档多少个 folder；还会再按“剩余窗口可释放量”封顶（`maxFoldersPerRun` 同时生效） |
+| `compress.maxFoldersPerStep` | `500` | 单个模型步骤最多归档多少个 folder；同时受“释放下限”（默认至少压到 50% 以下）与 `maxFoldersPerRun` 约束 |
 
 补充：实测上下文 > 窗口 500%（假窗口/压测）且未显式 `allowSmallWindow=true` 时同样跳过归档并 WARN——
 v1.3.0 的“8k 压测 541132 tokens / 6764% 窗口”自毁路径在 1.4.0 被这层 guard 挡住。
@@ -899,14 +900,16 @@ node engine/cli.mjs --help
 | `enabled` | `true` | 总开关；`false` 时所有钩子立即空转 |
 | `compress.enabled` | `true` | 是否启用归档（含回忆块再归档） |
 | `compress.triggerPercent` | `60` | 上下文占用超过该百分比时触发归档（v1.4.0 统一为 60，engine 默认与随包配置一致） |
-| `compress.compressPercent` | `20` | 归档“最早的已用上下文”的目标比例（回忆块再归档与普通对话归档共用该比例）；受 keepRecentMessages 与回合边界影响，实际通常更少（上限而非精确值） |
+| `compress.compressPercent` | `20` | 归档“最早的已用上下文”的目标比例（回忆块再归档与普通对话归档共用该比例）；受 keepRecentMessages 与回合边界影响，实际可能更少；若不足以降到释放下限则会扩大 |
+| `compress.releaseTargetPercent` | `50` | **v1.4.0** 释放下限：每次归档至少要压到该百分比**以下**；`compressPercent` 不够时自动扩大移除范围 |
+| `compress.releaseFloorEnabled` | `true` | **v1.4.0** `false` 关闭释放下限（回到“只压到 trigger 以下”的旧行为；单元测试夹具用） |
 | `compress.contextWindowTokens` | `0` | `0` = 使用 DSH 上报的窗口；>0 时强制覆盖（测试/小模型用） |
 | `compress.minContextTokens` | `512` | 上下文小于该 token 数不归档 |
 | `compress.minMessagesToCompress` | `4` | 可归档消息少于该数不归档 |
 | `compress.minChunkChars` | `200` | 过小的回忆文件夹会并入前一个 |
 | `compress.targetChunkChars` | `1200` | 单个回忆文件夹的目标字数（决定“分成几个”） |
 | `compress.maxFoldersPerRun` | `500` | 单次归档最多生成多少个文件夹（v1.2 起由 100 提高到 500） |
-| `compress.maxFoldersPerStep` | `500` | **v1.4.0** 单个模型步骤归档 folder 数上限；还会按“剩余窗口可释放量”再封顶 |
+| `compress.maxFoldersPerStep` | `500` | **v1.4.0** 单个模型步骤归档 folder 数上限；同时受释放下限与 `maxFoldersPerRun` 约束 |
 | `compress.keepRecentMessages` | `2` | 最近 N 条消息永不归档 |
 | `compress.maxBoundaryOvershoot` | `1.25` | 回合边界对齐可能超调；超过目标的该倍数时改回上一个边界（少移除），防止一次归档删掉半个上下文；超大单回合会按消息拆成多个文件夹 |
 | `compress.protectCurrentTurn` | `true` | **v1.4.0** 当前回合的 user 消息与同 turn 的 tool 配对绝不归档；无合法切点则拒绝本次归档 |

@@ -42,7 +42,13 @@ test('config.local.json overrides config.json but not the profile row config', (
     // local wins over config.json
     assert.equal(cfg.logging.verbose, true)
     assert.deepEqual(cfg.compat.ownerIds, ['123456789'])
-    assert.deepEqual(cfg.compat.mediaRoots, ['C:/Users/example/media'])
+    // mediaRoots are normalized the same way as storage.dir: absolute stays as-is,
+    // relative resolves against the process cwd. `C:/...` is only absolute on
+    // Windows, so POSIX runners (CI) see it resolved like any other relative path.
+    const expectedMediaRoots = process.platform === 'win32'
+      ? ['C:/Users/example/media']
+      : [path.resolve('C:/Users/example/media')]
+    assert.deepEqual(cfg.compat.mediaRoots, expectedMediaRoots)
     assert.equal(cfg.enabled, true, 'defaults still apply')
   } finally {
     rmSync(dir, { recursive: true, force: true })

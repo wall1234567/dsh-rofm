@@ -735,8 +735,11 @@ test('recall v1.4.0: a single-day time query returns only that day (constrain mo
   assert.equal(result.timeWindow.widenedTo, null)
   assert.ok(result.stats.timeFiltered >= 2, `the out-of-window candidates are recorded (${result.stats.timeFiltered})`)
   assert.equal(result.missType, null)
-  // around the day boundaries: the window is [dayStart, dayStart+1d) local time
-  assert.equal(new Date(result.timeWindow.from).getDate(), 31)
+  // around the day boundaries: the window is [dayStart, dayStart+1d) in the
+  // configured timezone (Asia/Shanghai). Assert the epoch directly so the test
+  // does not depend on the runner's local timezone (CI runs in UTC).
+  assert.equal(result.timeWindow.from, Date.parse('2026-10-31T00:00:00+08:00'))
+  assert.equal(result.timeWindow.to, Date.parse('2026-11-01T00:00:00+08:00'))
 })
 
 test('recall v1.4.0: time.mode=index normalizes but never filters (engine default)', () => {

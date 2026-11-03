@@ -569,6 +569,10 @@ function run(command, args, options = {}) {
     child.stderr.on('data', (chunk) => { stderr += chunk })
     child.on('error', (error) => { stderr += String((error && error.message) || error) })
     child.on('close', finish)
+    // The child can exit before we finish writing stdin (e.g. `git tag` fails
+    // instantly in a bare CI checkout); an unhandled EPIPE on stdin would crash
+    // the whole test runner instead of surfacing as a failed command result.
+    child.stdin.on('error', () => {})
     try { child.stdin.end(options.input === undefined || options.input === null ? '' : String(options.input)) } catch (error) {}
   })
 }

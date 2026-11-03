@@ -30,6 +30,7 @@ import {
     deserializeLanes,
     emptyLanes,
     lanesFingerprint,
+    PAGINATE_MAX_K,
     querySeeds,
     selectRecall,
     serializeLanes,
@@ -45,6 +46,12 @@ import {
     refreshIndex,
 } from './store.js'
 import { formatReport, summarizeStats } from './stats.js'
+
+/**
+ * B-03 (1.4.1): fallback for `recall.fairness.roundBudget.maxChars` when the
+ * config object carries no valid value (mirrors engine/config.js DEFAULT_CONFIG).
+ */
+const DEFAULT_ROUND_BUDGET_CHARS = 20000
 
 /** Clamp an optional integer option (offset/limit/round…) without throwing. */
 function clampInt(value, min, max, fallback) {
@@ -352,12 +359,18 @@ export class MemoryEngine {
    * @param {{ chars?: number, tokens?: number, windowTokens?: number, sessionId?: string }} [context]
    * @param {{ excludeIds?: Iterable<string>, minAlpha?: number,
    *   offset?: number, limit?: number, mode?: string,
+   *   paginate?: boolean,
    *   timeFrom?: string|number, timeTo?: string|number, granularity?: string,
    *   lanes?: object, round?: number, blockIds?: Iterable<string>, ledger?: Iterable<string> }} [options]
    *   `excludeIds`: folders already in the injected recall block — never
    *   re-added, never counted against `firstGenMax`, but still usable as keyword
    *   bridges for new folders. `minAlpha`: optional α floor (v1.3.0 QQ compat),
    *   folders below it behave exactly like unscored ones.
+   *   `paginate` (1.4.1): stable page cursor semantics — select a fixed window
+   *   `min(candidates, 10000)` from a **snapshot** of `lanes` (never written
+   *   back), exclude only `blockIds`, then return `picks.slice(offset, offset+limit)`
+   *   with an exact `page.hasMore`. Ignores `ledger`/`excludeIds`/roundBudget so
+   *   page N is reproducible; an offset past the window is an empty page.
    */
   recall(userText, context = {}, options = {}) {
     const ctx = context && typeof context === 'object' ? context : {}
@@ -369,12 +382,22 @@ export class MemoryEngine {
     // Pure browsing works in every mode (it is a lookup, not a recall decision):
     // `memory_recall` without keywords returns the folders inside the requested
     // time window and/or event, ordered by event start.
-    // Browsing needs an *enforced* filter: an `event.mode='index'`/explicit "空"
-    // argument alone must not turn into an unconstrained "browse the whole library".
+    // Browsing needs an *enforced* filter: an `event.mode='index'`/
+    // `time.mode='index'` window alone must not turn into an unconstrained
+    // "browse the whole library" (C-05, 1.4.1; the event side already checked).
     const browsing =
       typeof userText === 'string' &&
       userText.trim().length === 0 &&
-      (timePlan.active === true || (eventPlan.active === true && eventPlan.enforced === true))
+      ((timePlan.active === true && timePlan.enforced === true) ||
+        (eventPlan.active === true && eventPlan.enforced === true))
+    // C-05: make the "normalized but not enforced" case explicit instead of
+    // silently returning the whole library.
+    if (typeof userText === 'string' && userText.trim().length === 0 && timePlan.active === true && timePlan.enforced !== true) {
+      timePlan.warnings = [
+        ...(Array.isArray(timePlan.warnings) ? timePlan.warnings : []),
+        'recall: time.mode is "index" (window normalized, not enforced); pure time browsing needs time.mode="constrain"',
+      ]
+    }
     // Event ambiguity: never guess. Return BOTH events so the model can decide
     // whether they are the same event (and ask the user when it cannot tell).
     const ambiguous = eventPlan.active === true && eventPlan.status === 'similar'
@@ -389,6 +412,9 @@ export class MemoryEngine {
         page: { offset: clampInt(opts.offset, 0, 1_000_000, 0), limit: 0, returned: 0, candidates: 0, hasMore: false },
       }
     } else if (browsing) {
+      const configuredFirstGenMax = Number.isFinite(Number(this.cfg?.recall?.firstGenMax))
+        ? Math.max(0, Math.floor(Number(this.cfg.recall.firstGenMax)))
+        : 10
       result = this._browseRecall({
         index: this.recallIndex(),
         opts,
@@ -398,9 +424,7 @@ export class MemoryEngine {
         offset: clampInt(opts.offset, 0, 1_000_000, 0),
         take: Number.isFinite(Number(opts.limit)) && Number(opts.limit) > 0
           ? Math.min(1000, Math.floor(Number(opts.limit)))
-          : Number.isFinite(Number(this.cfg?.recall?.firstGenMax))
-            ? Math.max(1, Math.floor(Number(this.cfg.recall.firstGenMax)))
-            : 10,
+          : configuredFirstGenMax,
         warnings: [],
       })
     } else if (mode === 'legacy') {
@@ -534,6 +558,7 @@ export class MemoryEngine {
       frontierHits: Number.isFinite(stats.frontierHits) ? stats.frontierHits : null,
       registerDrops: Number.isFinite(stats.registerDrops) ? stats.registerDrops : null,
       reInjections: Number.isFinite(stats.reInjections) ? stats.reInjections : null,
+      categorySeeds: Array.isArray(stats.categorySeeds) ? stats.categorySeeds : [],
       degraded: stats.degraded === true,
       timeFiltered,
       // --- v1.4.0 event constraint telemetry ---
@@ -764,14 +789,23 @@ export class MemoryEngine {
     const mode = request.mode === 'deterministic' ? 'deterministic' : 'fair'
     const userText = typeof request.userText === 'string' ? request.userText : ''
 
-    // --- page window (deterministic: k = offset + limit) ---------------------
+    // --- page window ---------------------------------------------------------
+    // B-01 (1.4.1): `opts.paginate=true` selects a *fixed* candidate window
+    // (`min(candidates, PAGINATE_MAX_K)`) from a snapshot of the lane state and
+    // slices the page out of it, so page N is stable for a given state/query and
+    // pages never overlap or skip candidates. Callers that do not opt in keep the
+    // historical window (`k = offset+take+1`).
+    const paginate = opts.paginate === true
     const offset = clampInt(opts.offset, 0, 1_000_000, 0)
     const limitRaw = Number(opts.limit)
     const requestedLimit = Number.isFinite(limitRaw) && limitRaw > 0 ? Math.min(1000, Math.floor(limitRaw)) : null
-    const firstGenMax = Number.isFinite(Number(recallCfg.firstGenMax)) ? Math.max(1, Math.floor(Number(recallCfg.firstGenMax))) : 10
-    const take = requestedLimit ?? firstGenMax
-    // +1 lookahead pick so the page can report `hasMore` without a second pass.
-    const k = Math.min(2000, offset + take + 1)
+    // B-05 (1.4.1): `recall.firstGenMax=0` is the documented "recall disabled"
+    // quota; the engine wrapper used to force it to 1 and inject one memory in
+    // fair/deterministic mode (legacy already returned 0).
+    const configuredFirstGenMax = Number.isFinite(Number(recallCfg.firstGenMax))
+      ? Math.max(0, Math.floor(Number(recallCfg.firstGenMax)))
+      : 10
+    const take = requestedLimit ?? configuredFirstGenMax
 
     const index = this.recallIndex()
     const baseLanes = opts.lanes && typeof opts.lanes === 'object' && opts.lanes
@@ -788,9 +822,52 @@ export class MemoryEngine {
     // --- pure time browsing (no keywords): the time window *is* the query ----
     // `memory_recall` without keywords is a documented 1.4.0 mode (plan §3.3.3
     // "纯时间浏览"): every scored folder inside the window, ordered by event start.
-    const browsing = userText.trim().length === 0 && timePlan.active === true
+    // C-05 (1.4.1): only an *enforced* window may turn empty keywords into a
+    // browse — `time.mode='index'` must not return the whole library.
+    const browsing = userText.trim().length === 0 && timePlan.active === true && timePlan.enforced === true
     if (browsing) {
       return this._browseRecall({ index, opts, timePlan, offset, take, warnings, context: request.context })
+    }
+    // B-05: quota 0 → an empty round that consumes no lane state.
+    if (take <= 0) {
+      const ctx0 = request.context && typeof request.context === 'object' ? request.context : {}
+      return {
+        additions: [],
+        stats: {
+          userKeywords: [],
+          matchedFolders: 0,
+          excludedFolders: 0,
+          attempts: 0,
+          addedFolders: 0,
+          addedChars: 0,
+          addedTokens: 0,
+          contextChars: Number.isFinite(ctx0.chars) ? ctx0.chars : null,
+          windowTokens: Number.isFinite(ctx0.windowTokens) ? ctx0.windowTokens : null,
+          addedPercentOfContext: null,
+          addedPercentOfWindow: null,
+          byGeneration: {},
+          elapsedMs: 0,
+          candidates: 0,
+          candidatesAll: 0,
+          lowCandidates: 0,
+          lanesPicked: {},
+          pops: 0,
+          frontierHits: 0,
+          registerDrops: 0,
+          reInjections: 0,
+          degraded: baseLanes.degraded === true,
+          timeFiltered: 0,
+          eventFiltered: 0,
+          filteredByAlpha: 0,
+          round,
+        },
+        warnings,
+        lanes: baseLanes,
+        candidateIds: null,
+        timeWindow: { widenedTo: null, level: timePlan.normalized ? timePlan.normalized.level : null },
+        paginated: true,
+        page: { offset, limit: 0, returned: 0, candidates: 0, hasMore: false },
+      }
     }
 
     // --- time fallback ladder (plan §3.3.3): L0 → day3 → month → year → all --
@@ -818,32 +895,77 @@ export class MemoryEngine {
     // attempt's lane state is committed at the end.
     const laneSnapshot = serializeLanes(baseLanes)
     let chosen
-    for (let step = 0; step < attempts.length; step += 1) {
-      const attempt = attempts[step]
-      const lanesForAttempt = deserializeLanes(laneSnapshot)
-      const result = selectRecall(index, userText, {
-        cfg,
-        lanes: lanesForAttempt,
-        round,
-        mode,
-        blockIds: opts.blockIds,
-        ledger: opts.ledger,
-        excludeIds: opts.excludeIds,
-        minAlpha: opts.minAlpha,
-        timeIds: attempt.ids,
-        eventIds,
-        k,
-        hops,
-      })
-      if (Array.isArray(result.warnings) && result.warnings.length > 0) {
-        for (const warning of result.warnings) if (!warnings.includes(warning)) warnings.push(warning)
+    if (paginate) {
+      // B-01: choose the ladder rung by *candidate count* (not by offset), so all
+      // pages of one query see the same window. The selection then runs on a
+      // lane snapshot and its lane mutations are discarded below.
+      let attemptChosen = null
+      for (let step = 0; step < attempts.length; step += 1) {
+        const attempt = attempts[step]
+        let candidates = 0
+        try {
+          const seedList = querySeeds(index, userText, cfg).seeds
+          candidates = countCandidates(index, seedList, { minAlpha: opts.minAlpha, timeIds: attempt.ids, eventIds })
+        } catch {
+          candidates = 0
+        }
+        attemptChosen = { attempt, candidates }
+        if (candidates > 0) break
+        if (!canLadder) break
       }
-      if (!chosen) chosen = { result, attempt }
-      if ((result.picks || []).length >= minResults) {
-        chosen = { result, attempt }
-        break
+      const pageWindow = Math.min(Math.max(0, attemptChosen.candidates), PAGINATE_MAX_K)
+      const pageLanes = deserializeLanes(laneSnapshot)
+      const pageResult = pageWindow > 0
+        ? selectRecall(index, userText, {
+            cfg,
+            lanes: pageLanes,
+            round,
+            mode,
+            // B-01: the exclusion set is only the ids currently in the block; the
+            // ever-surfaced ledger must not shift items between pages.
+            blockIds: opts.blockIds,
+            ledger: undefined,
+            excludeIds: undefined,
+            minAlpha: opts.minAlpha,
+            timeIds: attemptChosen.attempt.ids,
+            eventIds,
+            k: pageWindow,
+            paginate: true,
+          })
+        : { picks: [], stats: {}, hasMore: false, warnings: [] }
+      if (Array.isArray(pageResult.warnings)) {
+        for (const warning of pageResult.warnings) if (!warnings.includes(warning)) warnings.push(warning)
       }
-      if (!canLadder) break
+      chosen = { result: pageResult, attempt: attemptChosen.attempt }
+    } else {
+      const k = requestedLimit === null && offset === 0 ? take : Math.min(2000, offset + take + 1)
+      for (let step = 0; step < attempts.length; step += 1) {
+        const attempt = attempts[step]
+        const lanesForAttempt = deserializeLanes(laneSnapshot)
+        const result = selectRecall(index, userText, {
+          cfg,
+          lanes: lanesForAttempt,
+          round,
+          mode,
+          blockIds: opts.blockIds,
+          ledger: opts.ledger,
+          excludeIds: opts.excludeIds,
+          minAlpha: opts.minAlpha,
+          timeIds: attempt.ids,
+          eventIds,
+          k,
+          hops,
+        })
+        if (Array.isArray(result.warnings) && result.warnings.length > 0) {
+          for (const warning of result.warnings) if (!warnings.includes(warning)) warnings.push(warning)
+        }
+        if (!chosen) chosen = { result, attempt }
+        if ((result.picks || []).length >= minResults) {
+          chosen = { result, attempt }
+          break
+        }
+        if (!canLadder) break
+      }
     }
 
     const result = chosen.result
@@ -870,8 +992,44 @@ export class MemoryEngine {
       })
     }
     const loadWarnings = []
-    const additions = sortRecallAdditions(loadRecallAdditions(picked, { memoryDir: this.memoryDir, warnings: loadWarnings }), recallCfg.sort)
+    const loadedAdditions = loadRecallAdditions(picked, { memoryDir: this.memoryDir, warnings: loadWarnings })
+    // B-01: a page is exactly `picks.slice(offset, offset+limit)` — re-sorting the
+    // page would break the "page N == next limit of one ordered list" contract.
+    const additions = paginate ? loadedAdditions : sortRecallAdditions(loadedAdditions, recallCfg.sort)
     for (const warning of loadWarnings) warnings.push(warning)
+
+    // --- B-03 (1.4.1): per-round character budget ---------------------------
+    // `recall.fairness.roundBudget.maxChars` was documented but never read. A
+    // single round now keeps the highest-priority prefix that fits and drops the
+    // tail (lowest priority lanes) with a warning + telemetry instead of
+    // injecting an unbounded block. At least one folder is always kept, mirroring
+    // `trimBlock`'s hard-cap behaviour.
+    const roundBudget = { maxChars: null, dropped: 0, chars: null }
+    if (!paginate) {
+      const fairCfg = recallCfg.fairness && typeof recallCfg.fairness === 'object' ? recallCfg.fairness : {}
+      const budgetCfg = fairCfg.roundBudget && typeof fairCfg.roundBudget === 'object' ? fairCfg.roundBudget : {}
+      const configuredBudget = Number(budgetCfg.maxChars)
+      const maxChars = Number.isFinite(configuredBudget) && configuredBudget > 0 ? Math.floor(configuredBudget) : DEFAULT_ROUND_BUDGET_CHARS
+      let usedChars = additions.length > 0 ? Number(additions[0].chars) || 0 : 0
+      let kept = additions.length > 0 ? 1 : 0
+      while (kept < additions.length) {
+        const chars = Number(additions[kept].chars) || 0
+        if (usedChars + chars > maxChars) break
+        usedChars += chars
+        kept += 1
+      }
+      const dropped = additions.length - kept
+      if (dropped > 0) {
+        additions.splice(kept)
+        roundBudget.maxChars = maxChars
+        roundBudget.dropped = dropped
+        roundBudget.chars = usedChars
+        warnings.push(
+          `recall: round char budget recall.fairness.roundBudget.maxChars=${maxChars} exceeded; kept ${kept} folder(s) ` +
+            `(${usedChars} chars), dropped ${dropped} lowest-priority pick(s)`,
+        )
+      }
+    }
 
     // --- stats (v1.3.0 field names + v1.4.0 lanes) -------------------------
     const ctx = request.context && typeof request.context === 'object' ? request.context : {}
@@ -887,7 +1045,9 @@ export class MemoryEngine {
       const seedList = querySeeds(index, userText, cfg).seeds
       const counts = uniqueCandidateCounts(index, seedList, {
         minAlpha: opts.minAlpha,
-        timeIds: timePlan.active && timePlan.enforced ? timePlan.ids : null,
+        // B-07 (1.4.1): use the *chosen* ladder rung's window. Re-counting the
+        // originally requested window made "returned 1, candidates 0" telemetry.
+        timeIds: attempt.ids instanceof Set ? attempt.ids : null,
         eventIds,
       })
       candidatesAll = counts.all
@@ -949,24 +1109,31 @@ export class MemoryEngine {
       timeFiltered,
       eventFiltered,
       filteredByAlpha: Number(selectStats.filteredByAlpha) || 0,
+      categorySeeds: Array.isArray(selectStats.categorySeeds) ? selectStats.categorySeeds : [],
+      // B-03 (1.4.1): per-round character budget telemetry (null/0 = no drop).
+      roundBudgetMaxChars: roundBudget.maxChars,
+      roundBudgetDropped: roundBudget.dropped,
+      roundBudgetChars: roundBudget.chars,
       round,
     }
 
     // Commit the winning lane state (the selector returns a normalized copy).
-    if (result.lanes && typeof result.lanes === 'object') {
+    // B-01: a paginated call never advances/writes back lane state — the pages
+    // must be reproducible from the same snapshot on every request.
+    if (!paginate && result.lanes && typeof result.lanes === 'object') {
       this._lanes = result.lanes
       this._round = Number.isFinite(result.lanes.round) ? result.lanes.round : round
     }
-    const hasMore = pageHasMore || result.hasMore === true
+    const hasMore = paginate ? pageHasMore : pageHasMore || result.hasMore === true
 
     return {
       additions,
       stats,
       warnings,
-      lanes: result.lanes,
+      lanes: paginate ? baseLanes : result.lanes,
       // σ-ordered ids of C(Q)∩W: `engine.trimBlock` uses this set to trim
       // "not in the current query" entries first (plan §3.2.4).
-      candidateIds: Array.isArray(result.candidateIds) ? result.candidateIds : null,
+      candidateIds: !paginate && Array.isArray(result.candidateIds) ? result.candidateIds : null,
       timeWindow: { widenedTo: attempt.widenedTo ?? null, level: attempt.level ?? null },
       paginated: true,
       page: {
@@ -996,7 +1163,9 @@ export class MemoryEngine {
     const ctx = request.context && typeof request.context === 'object' ? request.context : {}
     const index = request.index || this.recallIndex()
     const offset = clampInt(request.offset, 0, 1_000_000, 0)
-    const take = Number.isFinite(request.take) && request.take > 0 ? Math.floor(request.take) : 10
+    // B-05 (1.4.1): a 0 quota (recall.firstGenMax=0) must yield an empty page,
+    // not the historical fallback to 10.
+    const take = Number.isFinite(request.take) ? Math.max(0, Math.floor(request.take)) : 10
     const warnings = Array.isArray(request.warnings) ? request.warnings : []
     const windowIds = timePlan.ids instanceof Set ? timePlan.ids : null
     const eventIds = eventPlan.ids instanceof Set ? eventPlan.ids : null
@@ -1039,7 +1208,10 @@ export class MemoryEngine {
       lane: 'browse',
     }))
     const loadWarnings = []
-    const additions = sortRecallAdditions(loadRecallAdditions(picked, { memoryDir: this.memoryDir, warnings: loadWarnings }), this.cfg?.recall?.sort)
+    // C-02 (1.4.1): pure time browsing is documented as ordered by event start
+    // (SPEC §6.8); `recall.sort` re-sorted it by createdAt and the CLI/engine API
+    // returned the wrong order. `picked` is already in event-start order.
+    const additions = loadRecallAdditions(picked, { memoryDir: this.memoryDir, warnings: loadWarnings })
     for (const warning of loadWarnings) warnings.push(warning)
 
     let addedChars = 0
@@ -1091,7 +1263,7 @@ export class MemoryEngine {
         limit: take,
         returned: additions.length,
         candidates: candidates.length,
-        hasMore: offset + take < candidates.length,
+        hasMore: take > 0 && offset + take < candidates.length,
       },
     }
   }

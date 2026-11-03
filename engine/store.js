@@ -242,16 +242,55 @@ export function scanFolderMetas(memoryDir) {
   return metas
 }
 
-/** Rebuild `index.json` by scanning folder `meta.json` files. */
-export function rebuildIndex(memoryDir, cfg) {
-  ensureMemoryDir(memoryDir)
+/** Number of memory folder directories present on disk (cheap `readdir`). */
+export function countFoldersOnDisk(memoryDir) {
+  let dirents = []
+  try {
+    dirents = fs.readdirSync(memoryDir, { withFileTypes: true })
+  } catch {
+    return 0
+  }
+  let count = 0
+  for (const dirent of dirents) {
+    if (!dirent.isDirectory() || dirent.name.startsWith('.')) continue
+    if (!isSafeFolderId(dirent.name)) continue
+    count += 1
+  }
+  return count
+}
+
+/** Journal files left behind by a crashed/incomplete commit (`.commit-*.json`). */
+function listCommitJournalFiles(memoryDir) {
+  let dirents = []
+  try {
+    dirents = fs.readdirSync(memoryDir, { withFileTypes: true })
+  } catch {
+    return []
+  }
+  const journals = []
+  for (const dirent of dirents) {
+    if (!dirent.isFile()) continue
+    if (!dirent.name.startsWith('.commit-') || !dirent.name.endsWith('.json')) continue
+    journals.push(path.join(memoryDir, dirent.name))
+  }
+  return journals
+}
+
+/** Index built purely from the `meta.json` files on disk (no write). */
+function buildIndexFromDisk(memoryDir) {
   const metas = scanFolderMetas(memoryDir)
-  const index = {
+  return {
     version: INDEX_VERSION,
     updatedAt: Date.now(),
     nextCounter: computeNextCounter(metas),
     folders: metas.map((meta) => indexEntryFromMeta(meta)),
   }
+}
+
+/** Rebuild `index.json` by scanning folder `meta.json` files. */
+export function rebuildIndex(memoryDir, cfg) {
+  ensureMemoryDir(memoryDir)
+  const index = buildIndexFromDisk(memoryDir)
   return writeIndex(memoryDir, cfg, index)
 }
 
@@ -281,13 +320,58 @@ export function writeIndex(memoryDir, cfg, index) {
 
 /**
  * Load the index, rebuilding it from folder `meta.json` files when it is
- * missing or corrupt. Never throws for corrupt data.
+ * missing or corrupt. Never throws for corrupt data (A-06: a failed rebuild
+ * write returns the in-memory result instead of the raw fs error).
+ *
+ * A-02 (1.4.1) crash recovery: `commitCompression` writes folders first and the
+ * index last, journaling the intent in `.commit-<id>.json`. A process killed
+ * between those steps leaves *committed folders that the index does not list*
+ * (orphans). `load` therefore adopts them:
+ *   - any surviving commit journal, or
+ *   - a disk folder count larger than the index (index missing entries, A-07)
+ * triggers a rebuild from the folder metas, then the stale journals are dropped.
+ * The rebuilt index contains the orphan's `idempotencyKey`, so a retried commit
+ * skips those folders instead of archiving the same span twice.
  */
 export function loadIndex(memoryDir, cfg) {
   ensureMemoryDir(memoryDir)
   const index = readIndex(memoryDir, cfg)
-  if (index) return index
-  return rebuildIndex(memoryDir, cfg)
+  if (!index) {
+    // Missing/corrupt: the index is disposable, rebuild it from the folder metas.
+    try {
+      return rebuildIndex(memoryDir, cfg)
+    } catch {
+      // The write failed (read-only store / ENOSPC): still return the in-memory
+      // rebuild instead of throwing from a read path.
+      const fallback = buildIndexFromDisk(memoryDir)
+      fallback.stale = true
+      return fallback
+    }
+  }
+  // Self-heal / crash recovery. Both signals are a single cheap `readdir`.
+  const journals = listCommitJournalFiles(memoryDir)
+  const diskFolders = countFoldersOnDisk(memoryDir)
+  if (journals.length > 0 || diskFolders > index.folders.length) {
+    try {
+      const recovered = rebuildIndex(memoryDir, cfg)
+      if (journals.length > 0) {
+        for (const journal of journals) {
+          try {
+            fs.unlinkSync(journal)
+          } catch {
+            /* best effort: the next load retries the (idempotent) recovery */
+          }
+        }
+      }
+      return recovered
+    } catch {
+      const fallback = buildIndexFromDisk(memoryDir)
+      fallback.stale = true
+      // Keep the journals: the next successful load re-runs the recovery.
+      return fallback
+    }
+  }
+  return index
 }
 
 /** True when the index file changed since `cache.mtimeMs` / `cache.size`. */

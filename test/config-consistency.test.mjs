@@ -1,5 +1,5 @@
 /**
- * v1.4.0 config consistency (docs/SPEC.md §2, README §3).
+ * Config consistency (docs/SPEC.md §2, README §3).
  *
  * There is exactly one default truth: `engine/config.js` `DEFAULT_CONFIG`.
  * The packaged `config.json` overrides a few product values on purpose
@@ -13,9 +13,10 @@
  *   2. the shipped `config.json` vs the documented values in README §3 and
  *      SPEC §2 (triggerPercent / recall.mode / time.mode / event / fairness /
  *      scoring / match / compress guards);
- *   3. `package.json` vs `engine/package.json` version, both pinned to 1.4.0;
- *   4. `CHANGELOG.md` has a non-empty `## [1.4.0]` section (the release tool
- *      refuses to run without it).
+ *   3. `package.json` vs `engine/package.json` version (both manifests must agree;
+ *      the current version is read from package.json, never hardcoded here);
+ *   4. `CHANGELOG.md` has a non-empty `## [<current version>]` section (the
+ *      release tool refuses to run without it).
  *
  * Expected-on-purpose differences are listed explicitly below so a future
  * release cannot silently "fix" one side only.
@@ -39,8 +40,11 @@ const readme = read('README.md')
 const spec = read('docs/SPEC.md')
 const changelog = read('CHANGELOG.md')
 
-/** The version this release ships. */
-const EXPECTED_VERSION = '1.4.0'
+/**
+ * The version this release ships — read from the manifest so a version bump
+ * (1.4.0 → 1.4.1, …) never makes this consistency gate red for the wrong reason.
+ */
+const EXPECTED_VERSION = pluginPackage.version
 
 /**
  * Keys the packaged product config may override relative to `DEFAULT_CONFIG`.
@@ -260,21 +264,30 @@ test('docs: SPEC §2 DEFAULT_CONFIG block documents the engine defaults', () => 
 })
 
 test('docs: CHANGELOG has a non-empty section for the current version', () => {
-  const escaped = EXPECTED_VERSION.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-  const heading = new RegExp('^## \\[' + escaped + '\\][^\n]*', 'm').exec(changelog)
-  assert.ok(heading, `CHANGELOG.md must have a "## [${EXPECTED_VERSION}]" section (tools/release.mjs refuses to run without it)`)
-  const rest = changelog.slice(heading.index + heading[0].length)
-  const nextHeading = /^## /m.exec(rest)
-  const body = (nextHeading ? rest.slice(0, nextHeading.index) : rest).trim()
-  assert.ok(body.length > 200, 'the 1.4.0 changelog section must describe the release, not be a placeholder')
+  const sectionBody = (version) => {
+    const escaped = version.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    const heading = new RegExp('^## \\[' + escaped + '\\][^\n]*', 'm').exec(changelog)
+    if (!heading) return null
+    const rest = changelog.slice(heading.index + heading[0].length)
+    const nextHeading = /^## /m.exec(rest)
+    return (nextHeading ? rest.slice(0, nextHeading.index) : rest).trim()
+  }
+  // Version-agnostic: the release gate only requires *a* non-empty section for
+  // whatever version package.json currently ships (a patch release may be short).
+  const body = sectionBody(EXPECTED_VERSION)
+  assert.ok(body !== null, `CHANGELOG.md must have a "## [${EXPECTED_VERSION}]" section (tools/release.mjs refuses to run without it)`)
+  assert.ok(body.length > 0, `the ${EXPECTED_VERSION} changelog section must describe the release, not be a placeholder`)
+  assert.doesNotMatch(body, /^(?:todo|tbd|placeholder)\.?$/i, 'the changelog section must not be a placeholder')
+  // The 1.4.0 historical section (the v1.4.0 feature release) must still describe
+  // that release; its content is version-independent history.
+  const legacyBody = sectionBody('1.4.0')
+  assert.ok(legacyBody !== null, 'CHANGELOG.md must keep the [1.4.0] history section')
   for (const phrase of ['确定性召回', '时间辅助', '事件约束', '遗留数据', '回滚']) {
-    assert.ok(body.includes(phrase), `the 1.4.0 changelog section must mention ${phrase}`)
+    assert.ok(legacyBody.includes(phrase), `the 1.4.0 changelog section must mention ${phrase}`)
   }
 })
 
-test('versions: package.json and engine/package.json agree and equal 1.4.0', () => {
-  assert.equal(pluginPackage.version, EXPECTED_VERSION, 'package.json version must be 1.4.0')
-  assert.equal(enginePackage.version, EXPECTED_VERSION, 'engine/package.json version must follow the plugin release')
+test('versions: package.json and engine/package.json agree on the current version', () => {
   assert.equal(enginePackage.version, pluginPackage.version, 'the two manifests must never drift apart')
   assert.match(pluginPackage.version, /^\d+\.\d+\.\d+$/)
 })

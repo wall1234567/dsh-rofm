@@ -130,6 +130,9 @@ test('definition: name, optional parameters, 5s timeout and read-only concurrenc
   assert.equal(typeof definition.execute, 'function')
   assert.equal(typeof definition.output.render, 'function')
   assert.equal(definition.output.schema.properties.found.type, 'number')
+  // v1.4.1 (D-07): `matched` is part of the returned value and the render, so a
+  // strict schema validator must not see an undeclared field.
+  assert.equal(definition.output.schema.properties.matched.type, 'number')
   assert.equal(definition.output.schema.properties.images.type, 'array')
   const itemProps = definition.output.schema.properties.images.items.properties
   for (const key of ['name', 'path', 'exists', 'mediaType', 'width', 'height', 'bytes', 'folderId', 'createdAt', 'keywords', 'title']) {

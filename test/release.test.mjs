@@ -1,10 +1,13 @@
 /**
  * dsh-rofm - tests for the maintainer release tool (tools/release.mjs).
  *
- * Only the pure helpers are covered: version math, CHANGELOG section extraction,
- * GitHub remote parsing, CLI parsing, the browser opener lookup, the npm 2FA URL
- * check and the "npm pack --dry-run" content guard. The side-effecting release
- * steps (git/npm/GitHub) are exercised by actually cutting a release, not here.
+ * Pure helpers are covered (version math, CHANGELOG section extraction, GitHub
+ * remote parsing, CLI parsing, the browser opener lookup, the npm 2FA URL check
+ * and the "npm pack --dry-run" content guard), plus the v1.4.1 resume-safety
+ * checks (F-02: tag/HEAD/worktree version integrity, backed by real temp git
+ * repositories) and the read-only preflight fetch (T-11). The full release
+ * steps (git push / npm publish / GitHub Release) are exercised by actually
+ * cutting a release, not here.
  */
 
 import { test } from 'node:test'
@@ -20,11 +23,14 @@ import {
   REPO_ROOT,
   ReleaseError,
   USAGE,
+  assertTagMatchesVersion,
   buildReleaseBody,
   buildReleaseName,
   bumpVersion,
+  evaluateResumeVersionIntegrity,
   extractChangelogSection,
   extractOtpUrls,
+  fetchArgs,
   formatVersion,
   installSystemCertificates,
   isCertificateError,
@@ -33,6 +39,7 @@ import {
   parseCliArgs,
   parseGitHubRemote,
   parseVersion,
+  readPackageVersionAtRef,
   releaseCommitMessage,
   resolveTargetVersion,
   shellCommandFor,
@@ -318,4 +325,124 @@ test('release: ReleaseError carries a recovery hint', () => {
   assert.equal(error.message, 'boom')
   assert.equal(error.recovery, 'fix it')
   assert.equal(new ReleaseError('plain').recovery, '')
+})
+
+// ---------------------------------------------------------------------------
+// v1.4.1 F-02 / T-11: resume version integrity + read-only fetch
+// ---------------------------------------------------------------------------
+
+/** Run one git command in a temp repo (skip the test when git is unavailable). */
+function runGit(cwd, args) {
+  const result = spawnSync('git', args, { cwd, encoding: 'utf8' })
+  if (result.error) throw result.error
+  return result
+}
+
+const GIT_AVAILABLE = (() => {
+  try {
+    const probe = spawnSync('git', ['--version'], { encoding: 'utf8' })
+    return !probe.error && probe.status === 0
+  } catch {
+    return false
+  }
+})()
+
+function makeTempGitRepo({ version = '1.4.0' } = {}) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-rofm-rel-'))
+  runGit(dir, ['init', '-q', '-b', 'main'])
+  runGit(dir, ['config', 'user.email', 'audit@example.com'])
+  runGit(dir, ['config', 'user.name', 'audit'])
+  runGit(dir, ['config', 'core.autocrlf', 'false'])
+  fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify({ name: 'dsh-rofm', version }) + '\n')
+  fs.mkdirSync(path.join(dir, 'engine'), { recursive: true })
+  fs.writeFileSync(path.join(dir, 'engine', 'package.json'), JSON.stringify({ name: 'dsh-rofm-engine', version }) + '\n')
+  runGit(dir, ['add', '-A'])
+  runGit(dir, ['commit', '-qm', 'init'])
+  return dir
+}
+
+test('release: resume version integrity needs HEAD and the worktree at the target version (F-02)', () => {
+  // The happy path: a committed release bump.
+  assert.deepEqual(
+    evaluateResumeVersionIntegrity({ targetVersion: '1.4.2', committedVersion: '1.4.2', worktreeVersion: '1.4.2' }),
+    [],
+  )
+  // The audit T-02 scenario: a failed commit left the bump uncommitted; the
+  // worktree says 1.4.2 but HEAD still says 1.4.0 -> resume must refuse.
+  const dirtyBump = evaluateResumeVersionIntegrity({ targetVersion: '1.4.2', committedVersion: '1.4.0', worktreeVersion: '1.4.2' })
+  assert.equal(dirtyBump.length, 1)
+  assert.match(dirtyBump[0], /HEAD package\.json says "1\.4\.0".*not committed/)
+  // The reverse (committed 1.4.2 but worktree reverted to 1.4.0) is also unsafe.
+  const reverted = evaluateResumeVersionIntegrity({ targetVersion: '1.4.2', committedVersion: '1.4.2', worktreeVersion: '1.4.0' })
+  assert.equal(reverted.length, 1)
+  assert.match(reverted[0], /working-tree package\.json says "1\.4\.0"/)
+  // Both wrong -> both problems reported, never a silent pass.
+  assert.equal(
+    evaluateResumeVersionIntegrity({ targetVersion: '1.4.2', committedVersion: '1.4.0', worktreeVersion: '1.4.1' }).length,
+    2,
+  )
+  // A non-semver target is rejected instead of silently compared.
+  assert.equal(evaluateResumeVersionIntegrity({ targetVersion: 'banana', committedVersion: 'x', worktreeVersion: 'x' }).length, 1)
+})
+
+test('release: assertTagMatchesVersion rejects a tag that describes another version (F-02)', { skip: GIT_AVAILABLE ? false : 'git is not available' }, async () => {
+  const dir = makeTempGitRepo({ version: '1.4.0' })
+  try {
+    // A tag pointing at the 1.4.0 commit must not be used to publish 1.4.2.
+    runGit(dir, ['tag', '-a', 'v1.4.2', '-m', 'v1.4.2'])
+    await assert.rejects(
+      () => assertTagMatchesVersion('v1.4.2', '1.4.2', { cwd: dir }),
+      (error) => error instanceof ReleaseError && /points at a commit whose package\.json says 1\.4\.0, not 1\.4\.2/.test(error.message),
+    )
+    // A tag whose commit really is the released version passes.
+    runGit(dir, ['tag', '-a', 'v1.4.0', '-m', 'v1.4.0'])
+    await assertTagMatchesVersion('v1.4.0', '1.4.0', { cwd: dir })
+    // A missing tag is an actionable error, not a crash.
+    await assert.rejects(
+      () => assertTagMatchesVersion('v9.9.9', '9.9.9', { cwd: dir }),
+      (error) => error instanceof ReleaseError && /cannot be read/.test(error.message),
+    )
+    // readPackageVersionAtRef exposes the same data used by the check.
+    assert.deepEqual(await readPackageVersionAtRef('v1.4.0', dir), { ok: true, version: '1.4.0', error: null })
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('release: preflight fetch does not create .git/FETCH_HEAD (T-11 dry-run side effect)', { skip: GIT_AVAILABLE ? false : 'git is not available' }, () => {
+  assert.deepEqual(fetchArgs(), ['fetch', '--quiet', '--no-write-fetch-head', 'origin', 'main'])
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-rofm-fetch-'))
+  const bare = path.join(root, 'origin.git')
+  const work = path.join(root, 'work')
+  try {
+    runGit(root, ['init', '--bare', '-q', bare])
+    runGit(root, ['init', '-q', '-b', 'main', work])
+    runGit(work, ['config', 'user.email', 'audit@example.com'])
+    runGit(work, ['config', 'user.name', 'audit'])
+    fs.writeFileSync(path.join(work, 'README.md'), 'fixture\n')
+    runGit(work, ['add', '-A'])
+    runGit(work, ['commit', '-qm', 'init'])
+    runGit(work, ['remote', 'add', 'origin', 'file:///' + bare.replace(/\\/g, '/')])
+    runGit(work, ['push', '-q', '-u', 'origin', 'main'])
+    // Make the local clone one commit behind so fetch actually transfers data.
+    fs.writeFileSync(path.join(work, 'README.md'), 'fixture 2\n')
+    runGit(work, ['commit', '-qam', 'second'])
+    runGit(work, ['push', '-q', 'origin', 'main'])
+    runGit(work, ['reset', '-q', '--hard', 'HEAD~1'])
+    fs.rmSync(path.join(work, '.git', 'FETCH_HEAD'), { force: true })
+
+    const fetched = runGit(work, fetchArgs())
+    assert.equal(fetched.status, 0, `fetch failed: ${fetched.stderr}`)
+    assert.equal(fs.existsSync(path.join(work, '.git', 'FETCH_HEAD')), false, '--no-write-fetch-head must not create FETCH_HEAD')
+    const remoteHead = runGit(work, ['ls-remote', 'origin', 'refs/heads/main']).stdout.split(/\s+/)[0]
+    const tracked = runGit(work, ['rev-parse', 'origin/main']).stdout.trim()
+    assert.equal(tracked, remoteHead, 'the remote-tracking ref must still be refreshed for the behind check')
+
+    // Control: the historical plain fetch DOES create FETCH_HEAD (the side
+    // effect the release tool used to have during --dry-run).
+    runGit(work, ['fetch', '--quiet', 'origin', 'main'])
+    assert.equal(fs.existsSync(path.join(work, '.git', 'FETCH_HEAD')), true, 'plain fetch writes FETCH_HEAD (control)')
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
 })

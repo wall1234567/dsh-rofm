@@ -196,6 +196,29 @@ export const DEFAULT_CONFIG = {
       // Per-round character budget for one recall round.
       roundBudget: { maxChars: 20000 },
     },
+    // Plan A (v1.4.1 addendum): deterministic "category layer" for generic
+    // high-α words. rofm recall is lexical; a memory about a preference may only
+    // carry the keyword 「偏好」 while the user asks 「我的喜好是什么」 — no
+    // literal overlap. A closed category lexicon bridges the synonyms without
+    // embeddings: folders whose keywords/title contain any word of a class become
+    // candidates for that class's synthetic posting, and a query containing any
+    // word of the class adds that posting as a seed. Only entries with
+    // alpha >= alphaMin take part (generic words must not flood low-α memories).
+    categoryMatch: {
+      enabled: true,
+      alphaMin: 0.6,
+      classes: {
+        preference: {
+          label: '喜好',
+          words: ['喜好', '偏好', '喜欢', '爱好', '口味', '讨厌', '厌恶', '习惯', '爱吃', '爱喝', '不喜欢'],
+        },
+        agreement: { label: '约定', words: ['约定', '说好', '承诺', '以后都', '统一', '采用'] },
+        decision: { label: '决定', words: ['决定', '确定', '结论', '方案'] },
+        rule: { label: '规则', words: ['规则', '规范', '规定', '禁止', '必须'] },
+        requirement: { label: '要求', words: ['要求', '需求', '参数', '配置'] },
+        taboo: { label: '禁忌', words: ['禁忌', '忌讳'] },
+      },
+    },
   },
   // v1.4.0 time assistance (docs/SPEC.md §6.8). The index is strictly in-memory
   // (derived from index.folders, never written back); `createdAt` stays the
@@ -247,6 +270,17 @@ export const DEFAULT_CONFIG = {
     order: 'newest', // 'newest' | 'mixed' | 'oldest' (pending task ordering)
     warnUniformAlpha: true, // warn on uniform α/β batches (quality telemetry)
     maxItemsPerJudge: 100, // memory_judge updates batch cap
+    // v1.4.1: high-α preference/agreement memories MUST carry one category word
+    // among their keywords (「喜好」「约定」…), otherwise an abstract question
+    // ("我的喜好是什么" / "我们约定了什么") can never match them: rofm recall is
+    // lexical, not semantic. The judge is told to submit the word itself; when it
+    // does not, the adapter auto-detects the category from the folder text and
+    // adds/replaces one keyword (with a non-blocking warning).
+    categoryKeyword: {
+      enabled: true,
+      alphaMin: 0.6,
+      words: ['喜好', '偏好', '习惯', '约定', '承诺', '决定', '规则', '要求', '禁忌'],
+    },
   },
   // v1.4.0 keyword matching (docs/SPEC.md §6.6); both default off (no regression).
   match: {
@@ -290,6 +324,55 @@ function fmt(value) {
 function replaceValue(warnings, label, value, fallback, requirement) {
   warnings.push(`${label}: expected ${requirement}; got ${fmt(value)}, using ${fmt(fallback)}`)
   return fallback
+}
+
+/**
+ * Validate `recall.categoryMatch.classes`: a plain object of
+ * `classKey -> { label?: string, words: string[] }` (a bare `words` array is
+ * also accepted). Words are NFKC/lower-cased and deduplicated; invalid class
+ * definitions are dropped with a warning. Never throws.
+ */
+function categoryClassesField(warnings, label, value, fallback) {
+  if (!isPlainObject(value)) {
+    return replaceValue(warnings, label, value, cloneConfig(fallback), 'an object of { label?, words: string[] } classes')
+  }
+  const out = {}
+  let count = 0
+  for (const key of Object.keys(value).sort()) {
+    if (count >= 32) {
+      warnings.push(`${label}: at most 32 category classes are supported; the rest were ignored`)
+      break
+    }
+    if (!/^[A-Za-z][A-Za-z0-9_-]{0,31}$/.test(key)) {
+      warnings.push(`${label}.${key}: class key must match [A-Za-z][A-Za-z0-9_-]*; ignored`)
+      continue
+    }
+    const def = value[key]
+    const rawWords = Array.isArray(def) ? def : isPlainObject(def) ? def.words : null
+    if (!Array.isArray(rawWords)) {
+      warnings.push(`${label}.${key}: expected a words array; ignored`)
+      continue
+    }
+    const words = []
+    for (const word of rawWords) {
+      if (typeof word !== 'string') continue
+      const normalized = word.normalize('NFKC').toLowerCase().trim()
+      if (normalized.length === 0 || words.includes(normalized)) continue
+      words.push(normalized)
+      if (words.length >= 64) break
+    }
+    if (words.length === 0) {
+      warnings.push(`${label}.${key}: no usable words; ignored`)
+      continue
+    }
+    const classLabel = isPlainObject(def) && typeof def.label === 'string' && def.label.trim().length > 0
+      ? def.label.trim()
+      : key
+    out[key] = { label: classLabel, words }
+    count += 1
+  }
+  if (count === 0) return replaceValue(warnings, label, value, cloneConfig(fallback), 'at least one non-empty category class')
+  return out
 }
 
 function numberField(warnings, label, value, fallback, opts = {}) {
@@ -585,6 +668,20 @@ export function validateConfig(input) {
     })
   }
 
+  // --- recall.categoryMatch (v1.4.1 addendum) ----------------------------
+  // Deterministic category layer for generic high-α words (plan A): a closed
+  // synonym lexicon bridges 「喜好」/「偏好」/「喜欢」 without embeddings.
+  const cy = rec.categoryMatch
+  const cyDefaults = DEFAULT_CONFIG.recall.categoryMatch
+  if (!isPlainObject(cy)) {
+    if (cy !== undefined) warnings.push('recall.categoryMatch: expected an object; using defaults')
+    rec.categoryMatch = cloneConfig(cyDefaults)
+  } else {
+    cy.enabled = booleanField(warnings, 'recall.categoryMatch.enabled', cy.enabled, cyDefaults.enabled)
+    cy.alphaMin = numberField(warnings, 'recall.categoryMatch.alphaMin', cy.alphaMin, cyDefaults.alphaMin, { min: 0, max: 1 })
+    cy.classes = categoryClassesField(warnings, 'recall.categoryMatch.classes', cy.classes, cyDefaults.classes)
+  }
+
   // --- time (v1.4.0) ------------------------------------------------------
   const tm = cfg.time
   const tmDefaults = DEFAULT_CONFIG.time
@@ -632,6 +729,25 @@ export function validateConfig(input) {
   sc.order = enumField(warnings, 'scoring.order', sc.order, ['newest', 'mixed', 'oldest'], scDefaults.order)
   sc.warnUniformAlpha = booleanField(warnings, 'scoring.warnUniformAlpha', sc.warnUniformAlpha, scDefaults.warnUniformAlpha)
   sc.maxItemsPerJudge = numberField(warnings, 'scoring.maxItemsPerJudge', sc.maxItemsPerJudge, scDefaults.maxItemsPerJudge, { min: 1, max: 1000, integer: true })
+  // --- scoring.categoryKeyword (v1.4.1) -----------------------------------
+  // High-α preference/agreement memories must keep a lexical "category word"
+  // among their keywords so abstract questions can retrieve them.
+  if (!isPlainObject(sc.categoryKeyword)) {
+    if (sc.categoryKeyword !== undefined) warnings.push('scoring.categoryKeyword: expected an object; using defaults')
+    sc.categoryKeyword = cloneConfig(scDefaults.categoryKeyword)
+  }
+  const ck = sc.categoryKeyword
+  const ckDefaults = scDefaults.categoryKeyword
+  ck.enabled = booleanField(warnings, 'scoring.categoryKeyword.enabled', ck.enabled, ckDefaults.enabled)
+  ck.alphaMin = numberField(warnings, 'scoring.categoryKeyword.alphaMin', ck.alphaMin, ckDefaults.alphaMin, { min: 0, max: 1 })
+  const ckWords = Array.isArray(ck.words)
+    ? ck.words
+        .filter((word) => typeof word === 'string' && word.trim().length > 0)
+        .map((word) => word.trim())
+        .slice(0, 32)
+    : []
+  ck.words = ckWords.length > 0 ? Array.from(new Set(ckWords)) : cloneConfig(ckDefaults.words)
+  if (!Array.isArray(ck.words) || ck.words.length === 0) ck.words = cloneConfig(ckDefaults.words)
 
   // --- match (v1.4.0) -----------------------------------------------------
   const mt = cfg.match

@@ -79,8 +79,14 @@ class FakeSession {
         return event.data
       case 'assistant/message':
       case 'system/message':
-      case 'developer/message':
-        return event.data.message
+      case 'developer/message': {
+        // Real DSH semantics (dsh-session `deriveEventMessage`): a message whose
+        // content array is empty derives to `null` — the v1.4.1 A-04 bug was
+        // that such a node stopped the archive-note merge walk.
+        const message = event.data.message
+        if (message && Array.isArray(message.content) && message.content.length === 0) return null
+        return message
+      }
       case 'tool/result':
         return event.data.message
       default:
@@ -2708,3 +2714,415 @@ test('R3 end-to-end: two real archives leave a single note with a cumulative N',
     assert.equal(applied.at(-1).archiveSegments, second[0].parsed.segments)
   })
 })
+
+// ===========================================================================
+// v1.4.1 regression tests (adapter fixes). Every test in this block FAILS on the
+// 1.4.0 code and passes after the fix; see output/rofm-fix/adapter-fix.md for
+// the before/after evidence.
+// ===========================================================================
+
+test('A-03: a commit that does not conserve the planned folders rolls back and keeps the conversation', async () => {
+  await withTempDirAsync(async (dir) => {
+    const memoryDir = path.join(dir, 'memory')
+    const session = new FakeSession({ id: 'session-a03', contextWindow: 1000 })
+    appendSystem(session)
+    appendConversation(session, 14)
+    const { ctx, capture } = makeContext(session)
+    const plugin = new RofmPlugin(ctx, makeOverrides(memoryDir))
+    plugin.start()
+    const cfg = plugin.currentConfig()
+    const engine = plugin.engineFor(session, cfg)
+    assert.ok(engine, 'engine available')
+    // Inject one plan entry the engine commit silently skips (the same shape the
+    // A-01 idempotency collision produced: planned > committed with skipped 0).
+    const original = engine.planCompression.bind(engine)
+    let injected = false
+    engine.planCompression = (...args) => {
+      const plan = original(...args)
+      if (!injected && Array.isArray(plan?.folders) && plan.folders.length > 0) {
+        // A planned folder the commit cannot write (messages is not an array is
+        // silently skipped by commitCompression) — the same planned>committed,
+        // skipped=0 shape the A-01 idempotency collision produced.
+        const template = plan.folders[0]
+        plan.folders.push({
+          meta: { ...template.meta, id: 'mem-injected-skip', createdAt: Number(template.meta?.createdAt) || Date.now() },
+          messages: undefined,
+        })
+        injected = true
+      }
+      return plan
+    }
+    try {
+      await plugin.compressWithEscalation(session, 1, cfg, 'test')
+    } finally {
+      engine.planCompression = original
+    }
+    assert.equal(injected, true, 'the fault was injected')
+    assert.equal(session.events.filter((event) => event.type.startsWith('compaction/')).length, 0, 'no checkpoint was appended')
+    const indexPath = path.join(memoryDir, 'index.json')
+    const folderCount = existsSync(indexPath) ? readIndexFile(memoryDir).folders.length : 0
+    assert.equal(folderCount, 0, 'the folders written by this commit were rolled back')
+    const dirs = existsSync(memoryDir) ? readdirSync(memoryDir).filter((name) => name.startsWith('mem-')) : []
+    assert.deepEqual(dirs, [], 'no orphan folder directory is left behind')
+    assert.ok(
+      capture.logs.some(([level, message]) => level === 'warn' && message.includes('commit conservation violated')),
+      'the violation is reported in the host log',
+    )
+  })
+})
+
+test('A-04: an empty system/message node does not block archive-note merging', async () => {
+  for (const withEmptySystem of [false, true]) {
+    await withTempDirAsync(async (dir) => {
+      const memoryDir = path.join(dir, 'memory')
+      const session = new FakeSession({ id: `session-a04-${withEmptySystem ? 'empty' : 'control'}`, contextWindow: 1000 })
+      appendSystem(session)
+      appendRofmNote(session, { id: 'old-note', segments: 5 })
+      if (withEmptySystem) {
+        // Exactly the node shape observed in the live session (`content: []`,
+        // deriveEventMessage -> null).
+        session.append(
+          'system/message',
+          { turn: 3, step: 90, message: { id: 'sys-empty', role: 'system', source: { kind: 'system-prompt' }, content: [] } },
+          { surfaceOp: 'append' },
+        )
+      }
+      appendConversation(session, 14)
+      const { ctx } = makeContext(session)
+      const plugin = new RofmPlugin(ctx, makeOverrides(memoryDir))
+      plugin.start()
+      await plugin.compressWithEscalation(session, 2, plugin.currentConfig(), 'test')
+
+      const notes = rofmNotesOf(session)
+      assert.equal(notes.length, 1, `one cumulative note (emptySystem=${withEmptySystem})`)
+      const index = readIndexFile(memoryDir)
+      assert.equal(
+        notes[0].parsed.segments,
+        5 + index.folders.length,
+        `N keeps accumulating across the empty system node (emptySystem=${withEmptySystem})`,
+      )
+      const applied = readStatsEvents(memoryDir).filter((event) => event.type === 'compress-applied').at(-1)
+      assert.equal(applied.mergedCheckpoints, 1, 'the old note was merged, not orphaned')
+    })
+  }
+})
+
+test('D-01: duplicate ids in one memory_judge batch apply in order (last value wins)', async () => {
+  await withTempDirAsync(async (dir) => {
+    const memoryDir = path.join(dir, 'memory')
+    const { session, capture } = await archiveConversation(memoryDir, { id: 'session-d01', turns: 14 })
+    const pending = readIndexFile(memoryDir).folders.filter((folder) => folder.scored === false)
+    assert.ok(pending.length > 0, 'archive left pending folders')
+    const id = pending[0].id
+    const result = await executeJudge(capture, session, [
+      { id, alpha: 0.33, beta: 1, keywords: ['部署', 'docker', '端口'] },
+      { id, alpha: 0.66, beta: 2 },
+    ])
+    assert.deepEqual(result.rejected, [], 'the second update is not rejected as a "new memory"')
+    assert.deepEqual(result.updated, [id, id], 'both updates were applied in order')
+    const meta = readMeta(memoryDir, id)
+    assert.equal(meta.alpha, 0.66, 'the last submitted α wins')
+    assert.equal(meta.beta, 2, 'the last submitted β wins')
+    assert.deepEqual(meta.keywords, ['部署', 'docker', '端口'], 'keywords from the first update are kept')
+    assert.equal(meta.scored, true)
+  })
+})
+
+test('D-02: near-identical event labels in one batch merge into one canonical label', async () => {
+  await withTempDirAsync(async (dir) => {
+    const memoryDir = path.join(dir, 'memory')
+    // Two pending folders (the judge only needs meta/index + context on disk).
+    writeFolderFixture(memoryDir, 'mem-ev-1', { scored: false, alpha: 0, beta: 0, keywords: [], text: '第一天：东京与京都的行程安排。' })
+    writeFolderFixture(memoryDir, 'mem-ev-2', { scored: false, alpha: 0, beta: 0, keywords: [], text: '第三天：大阪酒店与返程。' })
+    const session = new FakeSession({ id: 'session-d02' })
+    const { ctx, capture } = makeContext(session)
+    const plugin = new RofmPlugin(ctx, makeOverrides(memoryDir))
+    plugin.start()
+    const result = await executeJudge(capture, session, [
+      { id: 'mem-ev-1', alpha: 0.5, beta: 1, keywords: ['日本', '旅行', '行程'], event: '日本旅行' },
+      { id: 'mem-ev-2', alpha: 0.5, beta: 1, keywords: ['日本', '旅行', '酒店'], event: '日本 旅行' },
+    ])
+    assert.equal(result.eventStats.assigned, 1, 'the first label defines the canonical event')
+    assert.equal(result.eventStats.merged, 1, 'the second label is merged inside the same batch')
+    assert.equal(readMeta(memoryDir, 'mem-ev-1').event, '日本旅行')
+    assert.equal(readMeta(memoryDir, 'mem-ev-2').event, '日本旅行', 'both folders carry one canonical label')
+    assert.ok(result.warnings.some((warning) => warning.includes('event-merged')), 'the merge is reported')
+  })
+})
+
+test('D-03: enabled=false registers no tools, sections or listeners', async () => {
+  await withTempDirAsync(async (dir) => {
+    const memoryDir = path.join(dir, 'memory')
+    const session = new FakeSession()
+    const { ctx, capture } = makeContext(session)
+    const overrides = makeOverrides(memoryDir)
+    overrides.enabled = false
+    // Even with QQ compat requested, a disabled plugin must not touch the
+    // profile or auto-patch third-party files.
+    overrides.compat = { qqBots: 'on' }
+    const plugin = new RofmPlugin(ctx, overrides)
+    plugin.start()
+    assert.equal(capture.tools.length, 0, 'no model tools are registered')
+    assert.equal(capture.sections.length, 0, 'no prompt sections are registered')
+    assert.equal(ctx.handlerCount(), 0, 'no event listeners are registered')
+    assert.equal(plugin.toolRegistered, false)
+    assert.equal(plugin.autopatchStatus, undefined, 'the compat/autopatch path did not run')
+    assert.equal(plugin.passiveArchiver, undefined)
+    assert.ok(
+      capture.logs.some(([level, message]) => level === 'info' && message.includes('disabled (enabled=false)')),
+      'the inert state is logged',
+    )
+  })
+})
+
+test('D-04: an aborted agent/pre-step never archives (control archives when not aborted)', async () => {
+  for (const aborted of [true, false]) {
+    await withTempDirAsync(async (dir) => {
+      const memoryDir = path.join(dir, 'memory')
+      const session = new FakeSession({ id: `session-d04-${aborted ? 'aborted' : 'control'}`, contextWindow: 1000 })
+      appendSystem(session)
+      appendConversation(session, 14)
+      const { ctx } = makeContext(session)
+      const overrides = makeOverrides(memoryDir)
+      overrides.compress.preStepEnabled = true
+      const plugin = new RofmPlugin(ctx, overrides)
+      plugin.start()
+      const controller = new AbortController()
+      if (aborted) controller.abort()
+      await plugin.onPreStep(
+        { agent: { session }, turn: 1, step: 1, signal: controller.signal },
+        async () => ({ kind: 'enter', messages: [] }),
+      )
+      const compactions = session.events.filter((event) => event.type.startsWith('compaction/'))
+      const indexPath = path.join(memoryDir, 'index.json')
+      const folderCount = existsSync(indexPath) ? readIndexFile(memoryDir).folders.length : 0
+      if (aborted) {
+        assert.equal(compactions.length, 0, 'an aborted step appends no compaction transaction')
+        assert.equal(folderCount, 0, 'an aborted step writes no memory folder')
+        assert.deepEqual(
+          readStatsEvents(memoryDir).filter((event) => event.type === 'compress-applied'),
+          [],
+          'an aborted step writes no compress telemetry',
+        )
+      } else {
+        assert.ok(compactions.length > 0, 'control: the same step archives when not aborted')
+        assert.ok(folderCount > 0, 'control: folders were written')
+      }
+    })
+  }
+})
+
+test('L1 guard: no archive pass may start at or below compress.triggerPercent', async () => {
+  // Live-session forensics (session-7bc15160, 2026-11-02T15:13Z): three chained
+  // passes started at 59.474% / 47.004% / 36.031% while triggerPercent was 60 —
+  // that was a temporary experiment inside that session (the agent changed
+  // `compress.triggerPercent` to 5 at seq 5925 and restored 60 at seq 5972), not
+  // a code path of this repo. This guard pins the invariant for the real loop:
+  // a pass is only started while the *fresh* measurement is above the trigger.
+  await withTempDirAsync(async (dir) => {
+    const memoryDir = path.join(dir, 'memory')
+    const session = new FakeSession({ id: 'session-l1', contextWindow: 1000 })
+    appendSystem(session)
+    appendConversation(session, 20)
+    const { ctx } = makeContext(session)
+    const overrides = makeOverrides(memoryDir)
+    overrides.compress.triggerPercent = 1
+    overrides.compress.maxExtraPasses = 2
+    const plugin = new RofmPlugin(ctx, overrides)
+    plugin.start()
+    await plugin.compressWithEscalation(session, 1, plugin.currentConfig(), 'test')
+    const applied = readStatsEvents(memoryDir).filter((event) => event.type === 'compress-applied')
+    assert.ok(applied.length >= 1, 'at least one archive pass ran')
+    const trigger = overrides.compress.triggerPercent
+    for (let index = 0; index < applied.length; index += 1) {
+      const event = applied[index]
+      if (event.pass > 0) {
+        assert.ok(
+          event.beforePercent > trigger,
+          `pass ${event.pass} started at ${event.beforePercent}% <= triggerPercent=${trigger}%`,
+        )
+        const previous = applied[index - 1]
+        if (previous && Number.isFinite(previous.afterPercent) && previous.afterPercent <= trigger) {
+          assert.fail(`pass ${event.pass} ran after pass ${previous.pass} already reached ${previous.afterPercent}% <= ${trigger}%`)
+        }
+      }
+    }
+  })
+})
+
+test('L2: compress-applied forwards the archive-floor telemetry fields', async () => {
+  await withTempDirAsync(async (dir) => {
+    const memoryDir = path.join(dir, 'memory')
+    await archiveConversation(memoryDir, { id: 'session-l2', turns: 14 })
+    const event = readStatsEvents(memoryDir).filter((item) => item.type === 'compress-applied').at(-1)
+    assert.ok(event, 'compress-applied telemetry exists')
+    // 89d1421 added these to the engine `compress` event only; the adapter event
+    // must carry them too so one row describes the whole archive.
+    for (const key of ['releaseFloor', 'releaseCapped', 'trickleArchive']) {
+      assert.equal(typeof event[key], 'boolean', `${key} is forwarded as a boolean`)
+    }
+    assert.ok('releaseTargetPercent' in event, 'releaseTargetPercent is forwarded')
+    assert.ok(event.releaseTargetPercent === null || typeof event.releaseTargetPercent === 'number')
+    assert.equal(typeof event.foldersSkipped, 'number', 'foldersSkipped is forwarded')
+    assert.equal(event.foldersSkipped, 0)
+    assert.equal(event.foldersCommitted, event.foldersPlanned, 'old fields are unchanged')
+  })
+})
+
+test('E-06: two archives of the same chat dir never overwrite each other’s images', async () => {
+  await withTempDirAsync(async (dir) => {
+    const memoryDir = path.join(dir, 'memory')
+    const bytesA = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0xaa, 0xaa])
+    const bytesB = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0xbb, 0xbb])
+    const archiveWithImage = async (sessionId, bytes) => {
+      const hostImagePath = path.join(dir, `${sessionId}.png`)
+      writeFileSync(hostImagePath, bytes)
+      const attachmentId = `sha256:${sessionId}`
+      const attachments = { imageHostPath: (ref) => (ref?.attachmentId === attachmentId ? hostImagePath : undefined) }
+      const session = new FakeSession({ id: sessionId, contextWindow: 1000 })
+      appendSystem(session)
+      session.append(
+        'user/message',
+        {
+          id: `u-img-${sessionId}`,
+          role: 'user',
+          source: { kind: 'user' },
+          content: [
+            { type: 'text', text: '看这张截图：部署 docker 端口。' },
+            { type: 'image', attachment: { attachmentId, mediaType: 'image/png', bytes: bytes.length, width: 4, height: 3 } },
+          ],
+        },
+        { surfaceOp: 'append' },
+      )
+      session.append('assistant/message', { turn: 1, step: 1, message: assistantMessage(`a-${sessionId}`, '收到，我看一下截图。'), stream: [] }, { surfaceOp: 'append' })
+      appendConversation(session, 14)
+      const { ctx } = makeContext(session, { attachments })
+      const plugin = new RofmPlugin(ctx, makeOverrides(memoryDir))
+      plugin.start()
+      await plugin.compressWithEscalation(session, 1, plugin.currentConfig(), 'test')
+    }
+    // Two rebuilt sessions of the same chat: same memory dir (perSession:false
+    // in the overrides) and the image sits at the same in-session seq.
+    await archiveWithImage('session-img-a', bytesA)
+    await archiveWithImage('session-img-b', bytesB)
+
+    const names = []
+    for (const folder of readIndexFile(memoryDir).folders) {
+      const meta = readMeta(memoryDir, folder.id)
+      for (const image of meta.images ?? []) names.push(image.name)
+    }
+    assert.equal(names.length, 2, 'both archived images are recorded')
+    assert.notEqual(names[0], names[1], 'the second archive must not reuse the first archive image name')
+    for (const name of names) {
+      assert.ok(!name.includes('..'), 'image name is a safe file name')
+      assert.ok(existsSync(path.join(memoryDir, 'images', name)), `image ${name} exists`)
+    }
+    const storedBytes = names.map((name) => readFileSync(path.join(memoryDir, 'images', name)).toString('base64'))
+    assert.deepEqual(new Set(storedBytes), new Set([bytesA.toString('base64'), bytesB.toString('base64')]), 'both files keep their own bytes')
+  })
+})
+
+test('E-05: recall.minAlpha applies on non-gated recalls (fair + legacy), a QQ gate overrides it', async () => {
+  const writeMemories = (memoryDir, values) => {
+    for (const [id, alpha, text] of values) {
+      writeFolderFixture(memoryDir, id, { alpha, beta: 0, keywords: ['部署', 'docker', '端口'], text })
+    }
+  }
+  const runInbox = async (memoryDir, session, message, mutate) => {
+    appendSystem(session)
+    const overrides = makeOverrides(memoryDir)
+    if (mutate) mutate(overrides)
+    const { ctx, capture } = makeContext(session)
+    const plugin = new RofmPlugin(ctx, overrides)
+    plugin.start()
+    plugin.onInboxInserted({ agent: { session }, message })
+    return { plugin, capture, block: recallText(capture, session) }
+  }
+  // 1) fair (default-ish) non-gated: configured floor 0.5 hides the low-α memory.
+  await withTempDirAsync(async (dir) => {
+    const memoryDir = path.join(dir, 'memory')
+    writeMemories(memoryDir, [
+      ['mem-low', 0.2, 'LOW-ALPHA-MEMORY'],
+      ['mem-high', 0.9, 'HIGH-ALPHA-MEMORY'],
+    ])
+    const { block } = await runInbox(memoryDir, new FakeSession({ id: 'session-e05-fair' }), userMessage('u-e05-1', '部署 docker 端口怎么配'), (overrides) => {
+      overrides.recall.mode = 'fair'
+      overrides.recall.minAlpha = 0.5
+    })
+    assert.ok(block.includes('HIGH-ALPHA-MEMORY'), 'high-α memory is recalled')
+    assert.ok(!block.includes('LOW-ALPHA-MEMORY'), 'recall.minAlpha filters the low-α memory (no explicit 0 override)')
+  })
+  // 2) legacy: the selector only reads the explicit option, so the adapter must
+  //    forward cfg.recall.minAlpha itself.
+  await withTempDirAsync(async (dir) => {
+    const memoryDir = path.join(dir, 'memory')
+    writeMemories(memoryDir, [
+      ['mem-low', 0.2, 'LOW-ALPHA-MEMORY'],
+      ['mem-high', 0.9, 'HIGH-ALPHA-MEMORY'],
+    ])
+    const { block } = await runInbox(memoryDir, new FakeSession({ id: 'session-e05-legacy' }), userMessage('u-e05-2', '部署 docker 端口怎么配'), (overrides) => {
+      overrides.recall.mode = 'legacy'
+      overrides.recall.minAlpha = 0.5
+    })
+    assert.ok(block.includes('HIGH-ALPHA-MEMORY'))
+    assert.ok(!block.includes('LOW-ALPHA-MEMORY'), 'legacy honours cfg.recall.minAlpha')
+  })
+  // 3) gated group member: compat.memberMinAlpha=0.5 overrides the user's higher
+  //    floor (0.85), so the α=0.7 memory is recallable again.
+  await withTempDirAsync(async (dir) => {
+    const memoryDir = path.join(dir, 'memory')
+    writeMemories(memoryDir, [
+      ['mem-mid', 0.7, 'MID-ALPHA-MEMORY'],
+      ['mem-low', 0.2, 'LOW-ALPHA-MEMORY'],
+    ])
+    const session = new FakeSession({ id: 'onebot-group-123456789' })
+    const { plugin, block } = await runInbox(
+      memoryDir,
+      session,
+      userMessage('u-e05-3', '<user_message qq="99999" nickname="群友">部署 docker 端口怎么配</user_message>'),
+      (overrides) => {
+        overrides.recall.mode = 'fair'
+        overrides.recall.minAlpha = 0.85
+        overrides.compat = { qqBots: 'off', ownerIds: [], memberMinAlpha: 0.5 }
+      },
+    )
+    assert.equal(plugin.sessionState(session).gateMinAlpha, 0.5, 'the gate floor is recorded for the tool path')
+    assert.ok(block.includes('MID-ALPHA-MEMORY'), 'the member gate (0.5) overrides the user floor (0.85)')
+    assert.ok(!block.includes('LOW-ALPHA-MEMORY'), 'memories below the gate floor stay filtered')
+  })
+})
+
+test('D-06: keep=true together with changed values warns instead of silently ignoring (P3)', async () => {
+  await withTempDirAsync(async (dir) => {
+    const memoryDir = path.join(dir, 'memory')
+    const { session, capture } = await archiveConversation(memoryDir, { id: 'session-d06', turns: 14 })
+    await judgeAllPending(memoryDir, capture, session, { alpha: 0.5, beta: 1 })
+    const scored = readIndexFile(memoryDir).folders.find((folder) => folder.scored === true)
+    assert.ok(scored, 'a scored memory exists')
+    const before = readMeta(memoryDir, scored.id).alpha
+    const result = await executeJudge(capture, session, [{ id: scored.id, keep: true, alpha: 0.9, beta: -5 }])
+    assert.deepEqual(result.kept, [scored.id])
+    assert.ok(result.warnings.some((warning) => warning.includes('keep=true')), 'the ignored fields are reported to the model')
+    assert.equal(readMeta(memoryDir, scored.id).alpha, before, 'keep really keeps the old α')
+  })
+})
+
+test('D-09: a failed telemetry write warns once and is recorded (P3)', async () => {
+  await withTempDirAsync(async (dir) => {
+    const memoryDir = path.join(dir, 'memory')
+    // A directory at the stats path makes every append fail without touching
+    // any real file permission.
+    mkdirSync(path.join(memoryDir, 'stats.jsonl'), { recursive: true })
+    const session = new FakeSession()
+    const { ctx, capture } = makeContext(session)
+    const plugin = new RofmPlugin(ctx, makeOverrides(memoryDir))
+    plugin.start()
+    const cfg = plugin.currentConfig()
+    assert.equal(plugin.appendStatsSafe(memoryDir, cfg, { type: 'x' }), false)
+    assert.equal(plugin.appendStatsSafe(memoryDir, cfg, { type: 'x' }), false)
+    const warns = capture.logs.filter(([level, message]) => level === 'warn' && message.includes('telemetry: failed to append stats.jsonl'))
+    assert.equal(warns.length, 1, 'only the first failure is logged (no per-turn spam)')
+    assert.equal(typeof plugin.lastStatsError, 'string')
+  })
+})
+

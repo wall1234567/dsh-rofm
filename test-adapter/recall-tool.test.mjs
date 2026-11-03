@@ -874,7 +874,7 @@ test('the event "ask the user" reminder honours event.askUserHint=false', () => 
 // v1.4.0 lane state and legacy rollback
 // ---------------------------------------------------------------------------
 
-test('fair path passes plugin lanes/round into engine.recall and commits the updated lanes', async () => {
+test('fair path passes plugin lanes/round as a pagination snapshot and commits nothing (B-01)', async () => {
   const lanes = { round: 7, pendingHigh: [] }
   const returnedLanes = { round: 8, pendingHigh: ['mem-x'] }
   const engine = makeEngine(successResult([makeAddition()], {}, { mode: 'fair', lanes: returnedLanes }))
@@ -882,15 +882,17 @@ test('fair path passes plugin lanes/round into engine.recall and commits the upd
   const tool = new MemoryRecallTool(plugin)
 
   const value = await tool.execute({ keywords: 'docker' }, exec())
+  assert.equal(engine.calls[0].options.paginate, true, 'fair mode opts into the stable pagination window')
   assert.equal(engine.calls[0].options.lanes, lanes)
   assert.equal(engine.calls[0].options.round, 8)
-  assert.equal(plugin.calls.commits.length, 1)
-  assert.equal(plugin.calls.commits[0].lanes, returnedLanes)
+  // B-01: the engine returns the *input* snapshot, so committing it would make
+  // the next page see different state. The adapter must not write lane state.
+  assert.equal(plugin.calls.commits.length, 0, 'no commitRecallLanes on the paginated path')
   assert.equal(value.mode, 'fair')
   assertLosslessJson(value)
 })
 
-test('getRecallContext: lanes/round/blockIds/ledger travel together and the updated lanes are committed (G4)', async () => {
+test('getRecallContext: lanes/round/blockIds travel together; ledger is omitted and nothing is committed (B-01/G4)', async () => {
   const lanes = { round: 3, pendingHigh: [] }
   const returnedLanes = { round: 4, pendingHigh: [] }
   const blockIds = new Set(['mem-in-block'])
@@ -901,12 +903,14 @@ test('getRecallContext: lanes/round/blockIds/ledger travel together and the upda
 
   const value = await tool.execute({ keywords: 'docker' }, exec())
   assert.equal(plugin.calls.contexts.length, 1, 'the one-call hook is preferred')
+  assert.equal(engine.calls[0].options.paginate, true)
   assert.equal(engine.calls[0].options.lanes, lanes)
   assert.equal(engine.calls[0].options.round, 4)
-  assert.deepEqual(engine.calls[0].options.blockIds, blockIds, 'block ids are passed')
-  assert.deepEqual(engine.calls[0].options.ledger, ledger, 'the surfaced ledger is passed (selection excludes block ∪ ledger)')
-  assert.equal(plugin.calls.commits.length, 1)
-  assert.equal(plugin.calls.commits[0].lanes, returnedLanes)
+  assert.deepEqual(engine.calls[0].options.blockIds, blockIds, 'block ids are passed (the only exclusion on this path)')
+  // B-01: the ever-surfaced ledger would move candidates between pages, so the
+  // paginated path must not forward it and must not commit the snapshot.
+  assert.equal(engine.calls[0].options.ledger, undefined, 'the surfaced ledger is not used for pagination')
+  assert.equal(plugin.calls.commits.length, 0)
   assert.equal(value.mode, 'fair')
   assertLosslessJson(value)
 })
@@ -1243,7 +1247,7 @@ test('real engine: fair mode 3/6 strike escalation on true misses, time miss exe
   })
 })
 
-test('real engine: getRecallContext lanes/round are passed together and the updated lanes committed', async () => {
+test('real engine: getRecallContext lanes/round are read once per page and never committed (B-01)', async () => {
   await withRelMemoryDir(async (dir) => {
     const env = makeRealEnv(dir, { folders: MEMORY_FOLDERS, withLanes: true })
     const { tool, laneCalls, laneStore } = env
@@ -1251,34 +1255,33 @@ test('real engine: getRecallContext lanes/round are passed together and the upda
     const first = await tool.execute({ keywords: 'docker' }, exec())
     assert.equal(first.found, 3)
     assert.equal(laneCalls.context, 1, 'the one-call lane context is read once')
-    assert.equal(laneCalls.commits.length, 1, 'updated lanes committed back')
-    assert.equal(laneStore.value.round, 1, 'the committed lane state carries the round passed to the engine')
+    // B-01: paginate returns the unchanged snapshot; committing it would drift.
+    assert.equal(laneCalls.commits.length, 0, 'paginated recalls never commit lanes')
+    assert.equal(laneStore.value.round, 0, 'the persisted round is untouched')
 
     const second = await tool.execute({ keywords: 'docker' }, exec())
     assert.equal(second.found, 3)
     assert.equal(laneCalls.context, 2)
-    assert.equal(laneCalls.commits.length, 2)
-    assert.equal(laneStore.value.round, 2, 'the round is monotonic and travels with the lane state')
+    assert.equal(laneCalls.commits.length, 0)
   })
 })
 
-test('real engine: the surfaced ledger excludes memories from manual recall (G4 block ∪ ledger)', async () => {
+test('real engine: blockIds (current block) still exclude ids from paginated manual recall (B-01/G4)', async () => {
   await withRelMemoryDir(async (dir) => {
-    const env = makeRealEnv(dir, { folders: MEMORY_FOLDERS, withLanes: true })
-    const { tool, ledgerBox, laneCalls } = env
+    const blockedIds = MEMORY_FOLDERS.map((folder) => folder.id)
+    const env = makeRealEnv(dir, { folders: MEMORY_FOLDERS, withLanes: true, excludeIds: blockedIds })
+    const { tool } = env
 
-    // Every folder was already surfaced: a manual recall must not re-inject it
-    // before its recycle cooldown (G4). It is informational, not a strike.
-    ledgerBox.value = MEMORY_FOLDERS.map((folder) => folder.id)
+    // Everything is already in the injected block: the paginated path excludes
+    // the block ids (the only exclusion it uses; the ledger is not consulted so
+    // pages cannot drift between calls). The empty page is informational.
     const blocked = await tool.execute({ keywords: 'docker' }, exec())
     assert.equal(blocked.found, 0)
-    assert.equal(blocked.misses, undefined, 'excluded-by-ledger is not a keyword miss')
-    assert.equal(laneCalls.commits.length, 1, 'the lane state is still committed for the round')
+    assert.equal(blocked.misses, undefined, 'excluded-by-block is not a keyword miss')
 
-    // Emptying the ledger (e.g. recycle lane / cooldown passed) makes them
-    // recallable again.
-    ledgerBox.value = []
-    const allowed = await tool.execute({ keywords: 'docker' }, exec())
+    // Without the block ids the same query finds them again.
+    const open = makeRealEnv(dir, { folders: MEMORY_FOLDERS, withLanes: true })
+    const allowed = await open.tool.execute({ keywords: 'docker' }, exec())
     assert.equal(allowed.found, 3)
   })
 })
@@ -1562,4 +1565,94 @@ test('an event-only browse that finds nothing is an event miss by fallback (no s
   assertLosslessJson(value)
   const text = textOf(render(tool, { event: '日本旅行' }, value))
   assert.ok(text.includes('没有属于事件'), text)
+})
+
+// ---------------------------------------------------------------------------
+// B-01 (v1.4.1): stable manual-recall pagination (engine `opts.paginate`)
+// ---------------------------------------------------------------------------
+
+test('B-01: 30-candidate manual recall pages 3 at a time -> 30 distinct, no duplicate, no gap', async () => {
+  await withRelMemoryDir(async (dir) => {
+    const folders = []
+    for (let index = 0; index < 30; index += 1) {
+      folders.push({
+        id: `mem-20260101T000000Z-${String(index + 1).padStart(4, '0')}`,
+        alpha: 0.4 + (index % 5) * 0.1,
+        keywords: ['docker', '部署', '端口'],
+        createdAt: REAL_DAY_31 + index * 1000,
+        text: `MEM-${index}-部署 docker 端口`,
+      })
+    }
+    const { tool, laneCalls } = makeRealEnv(dir, { folders, withLanes: true })
+    const seen = []
+    const pages = []
+    let offset = 0
+    for (let guard = 0; guard < 20; guard += 1) {
+      const value = await tool.execute({ keywords: '部署 docker 端口', limit: 3, offset }, exec())
+      assert.equal(value.mode, 'fair')
+      assert.ok(value.found <= 3, `a page never exceeds the requested limit (got ${value.found})`)
+      pages.push({ offset: value.offset, found: value.found, hasMore: value.hasMore, nextOffset: value.nextOffset })
+      seen.push(...value.added)
+      if (!value.hasMore) break
+      assert.equal(value.nextOffset, offset + value.found, 'nextOffset advances by the page size')
+      offset = value.nextOffset
+    }
+    assert.equal(pages.length, 10, '30 candidates / limit 3 = 10 pages')
+    assert.equal(seen.length, 30, 'every candidate is returned exactly once across pages')
+    assert.equal(new Set(seen).size, 30, 'no duplicate id across pages')
+    for (const folder of folders) assert.ok(seen.includes(folder.id), `missing ${folder.id}`)
+    assert.equal(pages.at(-1).hasMore, false, 'the last page reports hasMore=false')
+    for (const page of pages.slice(0, -1)) assert.equal(page.hasMore, true, 'non-last pages report hasMore=true')
+
+    // B-01: the engine returns the unchanged lane snapshot and the adapter must
+    // NOT commit it (the next page has to see the same snapshot; a commit would
+    // let recall state drift between pages).
+    assert.equal(laneCalls.commits.length, 0, 'no commitRecallLanes on the paginated path')
+    assert.equal(laneCalls.context, 10, 'each page reads the lane snapshot')
+
+    // Page stability: repeating one page after others never changes it.
+    const firstAgain = await tool.execute({ keywords: '部署 docker 端口', limit: 3, offset: 0 }, exec())
+    const firstPage = pages[0]
+    assert.equal(firstAgain.found, firstPage.found)
+    assert.equal(firstAgain.hasMore, firstPage.hasMore)
+    assert.equal(new Set(firstAgain.added).size, 3, 'a page is always three distinct ids')
+  })
+})
+
+test('B-01: an offset past the candidate count is an empty page with hasMore=false (no throw)', async () => {
+  await withRelMemoryDir(async (dir) => {
+    const folders = []
+    for (let index = 0; index < 5; index += 1) {
+      folders.push({ id: `mem-20260101T000000Z-${String(index + 1).padStart(4, '0')}`, alpha: 0.6, keywords: ['docker', '部署', '端口'], text: `MEM-${index}` })
+    }
+    const { tool } = makeRealEnv(dir, { folders, withLanes: true })
+    const value = await tool.execute({ keywords: '部署 docker 端口', limit: 3, offset: 2500 }, exec())
+    assert.equal(value.found, 0)
+    assert.equal(value.hasMore, false)
+    assert.equal(value.offset, 2500)
+    assert.equal(value.misses, undefined, 'an out-of-range page is not a strike')
+    // The engine covers the "10,000 candidates, offset 2500 is not empty" case
+    // (test/recall-1.4.1-regressions.test.mjs); the adapter forwards offset/limit
+    // untouched, which this call proves.
+  })
+})
+
+test('B-01: legacy mode keeps the historical call shape (no paginate option)', async () => {
+  const engine = makeEngine(successResult([makeAddition()], {}, { page: { offset: 0, limit: 3, returned: 1, candidates: 1, hasMore: false } }))
+  const cfg = makeConfig({ recall: { enabled: true, mode: 'legacy' } })
+  const tool = new MemoryRecallTool(makePlugin({ engine, cfg }))
+  await tool.execute({ keywords: 'docker', limit: 3 }, exec())
+  assert.equal(engine.calls.length, 1)
+  assert.equal(engine.calls[0].options.paginate, undefined, 'legacy must not receive opts.paginate')
+})
+
+test('B-01: fair mode passes paginate:true together with offset/limit', async () => {
+  const engine = makeEngine(successResult([], { matchedFolders: 0 }, {}))
+  const cfg = makeConfig({ recall: { enabled: true, mode: 'fair' } })
+  const tool = new MemoryRecallTool(makePlugin({ engine, cfg }))
+  await tool.execute({ keywords: 'docker', limit: 3, offset: 6 }, exec())
+  assert.equal(engine.calls.length, 1)
+  assert.equal(engine.calls[0].options.paginate, true)
+  assert.equal(engine.calls[0].options.offset, 6)
+  assert.equal(engine.calls[0].options.limit, 3)
 })

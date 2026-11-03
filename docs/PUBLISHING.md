@@ -1,5 +1,13 @@
 # 发布 dsh-rofm（维护者手册）
 
+> **当前版本：1.4.2（2026-11-03）**——`package.json` 与 `engine/package.json` 必须都为 `1.4.2`
+> （`tools/release.mjs` 的预检会强制两者一致，并校验 `CHANGELOG.md` 已有 `## [1.4.2]` 段）。
+> 1.4.2 是**隐私修复版（patch）**：`config.json` 移除维护者的 QQ 号与本机路径（迁移到 git 忽略的
+> `config.local.json`），并合并此前未单独发布的内容——1.4.1（archive floor / 类别词保证 / 1.4.0 审计修复）与
+> 1.5.0（`memory_group_recall` 私聊→群聊只读 + `compat.crossChat`）。
+> **上一发布：1.3.0（2026-10-31；npm 上正被 1.4.2 取代）**；1.4.0 / 1.4.1 / 1.5.0 从未单独发布到 npm
+> （内容全部并入 1.4.2）。本手册中标注 "v1.4.1 起" 的机制在 1.4.2 继续沿用。
+
 本文件记录把 `dsh-rofm` 发布到 **GitHub** 与 **npm** 的完整流程。
 仓库已具备：MIT `LICENSE`、`.gitignore`（忽略 `memory/` 运行时数据与本地噪音）、
 `CHANGELOG.md`、GitHub Actions CI（`.github/workflows/ci.yml`），以及一条命令完成发版的
@@ -18,7 +26,7 @@
 它把这一段原样作为 GitHub Release 正文，并用标题里的版本号做校验）：
 
 ```md
-## [1.4.0] — 2026-11-01
+## [1.4.2] — 2026-11-03
 
 一句话说明本次发布。
 
@@ -27,14 +35,20 @@
 - …
 ```
 
+> 示例用当前版本 **1.4.2**；下一次发布时把版本号/日期换成目标版本即可（脚本按 `package.json` 的当前版本
+> 与 `CHANGELOG.md` 里 `## [<版本>]` 段落做校验，版本是数据、不是写死在脚本里的常量）。
+
 ### 1.2 执行
 
 ```bash
 # 递增补丁版本并发布（--title 会进 commit message 与 GitHub Release 名称）
 node tools/release.mjs --bump patch --title "一句话标题" --yes
 
-# 或者显式指定版本
-node tools/release.mjs --version 1.4.0 --title "一句话标题" --yes
+# 递增补丁版本（1.4.2 → 1.4.3 即 patch）
+node tools/release.mjs --bump minor --title "一句话标题" --yes
+
+# 或者显式指定版本（必须大于当前版本；当前 1.4.2）
+node tools/release.mjs --version 1.4.2 --title "一句话标题" --yes
 
 # 先看看会发生什么：跑完所有检查并打印计划，但不改任何东西
 node tools/release.mjs --bump patch --title "一句话标题" --dry-run
@@ -47,10 +61,11 @@ node tools/release.mjs --resume --yes
 
 1. **预检**：git 工作区干净、当前分支为 `main`、本地不在 `origin/main` 之后、
    `package.json` 与 `engine/package.json` 版本一致、`CHANGELOG.md` 有目标版本段落、
-   tag / npm 版本 / GitHub Release 都不存在（`--resume` 时允许已存在）；
+   tag / npm 版本 / GitHub Release 都不存在（`--resume` 时允许已存在；**v1.4.1 起** `--resume` 会校验
+   tag 对应提交里的 `package.json` 版本与待发布版本一致，`--allow-dirty` 也做同样校验）；
 2. **检查**：`node --test`、`node test/simulate.mjs`、`node tools/selfcheck.mjs`、
    `node engine/cli.mjs --help`，以及 `npm pack --dry-run` 的文件清单
-   （确认包内只有 `memory/.gitkeep`，没有会话数据/测试文件）；
+   （确认包内只有 `memory/.gitkeep`，没有会话数据/测试文件；`--dry-run` 不执行任何网络操作）；
 3. **提交 + tag**：同时更新两个 `package.json` 的版本号，提交
    `release: dsh-rofm <版本> — <标题>`，打 annotated tag `v<版本>`；
 4. **推送**：`git push origin main` + `git push origin v<版本>`；
@@ -118,8 +133,8 @@ node tools/release.mjs --resume --yes
    `git config --global credential.helper manager` 记住）；或 `GITHUB_TOKEN` 环境变量；
 4. npm 认证：`~/.npmrc` 里有 `//registry.npmjs.org/:_authToken`（`npm whoami` 能返回用户名）。
    账号开启 2FA 也没关系：发布时按提示在浏览器确认一次即可；
-5. 仓库设置建议：Description「DSH 长期记忆插件：上下文超阈值时归档最早对话，之后按关键词+
-   重要性概率自动回忆。」，Topics：`dsh`、`dsh-plugin`、`deepseek-harness`、`memory`、
+5. 仓库设置建议：Description「DSH 长期记忆插件：上下文超阈值时归档最早对话，之后按关键词与
+   确定性优先级 α 自动回忆（支持时间/事件约束）。」，Topics：`dsh`、`dsh-plugin`、`deepseek-harness`、`memory`、
    `recall`、`long-term-memory`、`context-window`、`compaction`；开启 Issues，
    可选 Discussions / Dependabot。
 
@@ -136,11 +151,17 @@ node tools/release.mjs --resume --yes
 6. GitHub → Releases → Draft a new release：选 `v<版本>` tag，把 CHANGELOG 对应段落贴进说明；
    GitHub 会自动提供源码 zip/tar。
 
-> 装 `gh` CLI 也可以辅助（`gh release create v1.4.0 --notes-file <文件>`），
+> 装 `gh` CLI 也可以辅助（`gh release create v<版本> --notes-file <文件>`），
 > 但仓库自带脚本不依赖它。
 
 ## 4. 发布前自检清单
 
+- [ ] **隐私/config.local 检查（v1.4.1 起强制，v1.4.2 沿用）**：跟踪的 `config.json` 里
+  `compat.ownerIds`（QQ 主人号）与 `compat.mediaRoots`（本机 onebot 媒体根路径）必须保持为空 `[]`；
+  本机个人值写在 gitignored 的 `config.local.json`（合并顺序 `DEFAULT ← config.json ← config.local.json ←
+  row config`），**不要提交**。发布前跑 `node tools/privacy-check.mjs`（失败即停下），并用 `git diff`
+  确认没有真实 QQ 号 / 用户目录路径 / 会话 id 进入提交。使用方可自行填写，或用 profile 层
+  （`cordis.patch.yml` 的 `config:`）覆盖——覆盖是按字段深合并，见 README §3；
 - [ ] 无个人路径/用户名/会话 id/审计记录等隐私内容（当前文件与完整 git 历史）；
 - [ ] 无 token / 密码 / 私钥；
 - [ ] `LICENSE`、`README`、`CHANGELOG`、`CONTRIBUTING` 齐全；
@@ -148,10 +169,27 @@ node tools/release.mjs --resume --yes
 - [ ] 跨平台检查项已过：`test/portability.test.mjs` 全绿、README §2.4「跨平台支持」与
   `docs/SPEC.md` 的 Platform and path contract 与当前代码一致（见 `docs/VERIFICATION.md` §19）；
 - [ ] `node tools/selfcheck.mjs` 在本机真实数据上 `0 failed`（历史遗留只允许 WARN）；
+- [ ] 若新增/删除测试：已同步 `tools/gate-baseline.json` 的 `minFullSuiteTests`（当前 **1026**；
+  e2e-adapter 12 / e2e-real-data 8 不变），且 `node tools/verify-1.4.0.mjs`（历史命名）= **8/8 PASS**；
 - [ ] 版本号已在 `package.json`、`engine/package.json`、`CHANGELOG.md`、git tag 四处一致
-  （前三个 + tag 冲突由脚本强制检查）；
+  （当前 **1.4.2**；前三个 + tag 冲突由脚本强制检查）；
 - [ ] `memory/` 只有 `.gitkeep`，`git status` 干净；
 - [ ] `npm pack --dry-run` 预演通过，包内只有 `memory/.gitkeep`（无会话数据 / 无测试目录）。
 
 > `node tools/release.mjs --dry-run` 已经覆盖上面「检查」类的大部分条目；
 > 隐私/密钥类检查仍需人工过一遍 git 历史。
+
+## 隐私检查（v1.4.1 起强制，v1.4.2 沿用）
+
+发布前必须确认仓库内**没有任何个人信息**（QQ 号、本机绝对路径、昵称、真实会话样本）：
+
+```bash
+node tools/privacy-check.mjs
+```
+
+- 失败会列出具体问题；`config.json` 的 `compat.ownerIds` / `compat.mediaRoots` 必须为空；
+- 个人值放在被 git 忽略的 `config.local.json`，不要提交；
+- 测试夹具（`test/fixtures/**`）必须是脱敏样本；不要提交真实会话内容/截图；
+- 首次发布前请检查 `git log -S"<你的 QQ 号>"` / `git log -S"<你的用户名>"`：若历史已有泄漏，
+  需要重写历史并 force-push（并处理已发布到 npm/GitHub 的旧版本），
+  

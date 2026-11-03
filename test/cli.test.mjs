@@ -10,6 +10,18 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { after, test } from 'node:test'
 import * as engineApi from '../engine/index.js'
+import {
+  GATE_BASELINE_ERROR,
+  GATE_LIMITS,
+  STEPS,
+  applyNodeTestLimits,
+  countStaticTestCases,
+  deriveGateLimits,
+  parseNodeTestFailures,
+  parseNodeTestSummary,
+  readGateBaseline,
+  summarizeTotals,
+} from '../tools/verify-1.4.0.mjs'
 
 const REPO_ROOT = path.resolve(fileURLToPath(new URL('..', import.meta.url)))
 const CLI = path.join(REPO_ROOT, 'engine', 'cli.mjs')
@@ -450,4 +462,122 @@ test('cli: --event rejects an over-long label', () => {
   const bad = runCli(['recall', '--text', '旅行', '--event', 'x'.repeat(201), '--dir', path.join(root, 'memory')])
   assert.equal(bad.status, 1)
   assert.match(bad.stderr, /--event/)
+})
+
+// ---------------------------------------------------------------------------
+// v1.4.1 F-01/F-03/T-09 — tools/verify-1.4.0.mjs must not be false-green
+// ---------------------------------------------------------------------------
+
+const GATE = path.join(REPO_ROOT, 'tools', 'verify-1.4.0.mjs')
+
+test('gate: the spec reporter summary (ℹ tests N) is parsed', () => {
+  const spec = ['ℹ tests 919', 'ℹ suites 0', 'ℹ pass 917', 'ℹ fail 0', 'ℹ cancelled 0', 'ℹ skipped 2', 'ℹ todo 0'].join('\n')
+  assert.deepEqual(parseNodeTestSummary(spec), { tests: 919, pass: 917, fail: 0, skipped: 2, cancelled: 0, todo: 0 })
+})
+
+test('gate: the TAP reporter summary (# tests N) is parsed too (F-03)', () => {
+  const tap = ['1..919', '# tests 919', '# suites 0', '# pass 917', '# fail 0', '# cancelled 0', '# skipped 2', '# todo 0'].join('\n')
+  assert.deepEqual(parseNodeTestSummary(tap), { tests: 919, pass: 917, fail: 0, skipped: 2, cancelled: 0, todo: 0 })
+  assert.equal(parseNodeTestSummary('no summary here'), null, 'an unparsable run must stay detectable')
+})
+
+test('gate: failures are extracted from both reporters (F-03)', () => {
+  const spec = ['✖ handle: a failing case (12.3ms)', '✖ handle: a failing case (12.3ms)'].join('\n')
+  assert.deepEqual(parseNodeTestFailures(spec), ['handle: a failing case'], 'spec failures, de-duplicated')
+  const tap = ['not ok 1 - handle: tap failing case', 'not ok 2 - another case'].join('\n')
+  assert.deepEqual(parseNodeTestFailures(tap), ['handle: tap failing case', 'another case'], 'TAP failures')
+  assert.deepEqual(parseNodeTestFailures('✔ all good (1.0ms)'), [])
+})
+
+test('gate: a green suite with removed tests fails the limit check (F-01)', () => {
+  const full = STEPS.find((step) => step.id === 'unit-tests')
+  assert.ok(full, 'the gate has a full-suite step')
+  assert.deepEqual(applyNodeTestLimits(full, { tests: full.minTests, pass: full.minTests - 2, fail: 0, skipped: 2, cancelled: 0, todo: 0 }), [])
+  // The audit T-01/V-01 scenario: one test file removed and e2e skipped.
+  const shrunkCount = full.minTests - 53
+  const shrunk = applyNodeTestLimits(full, { tests: shrunkCount, pass: shrunkCount - 11, fail: 0, skipped: 11, cancelled: 0, todo: 0 })
+  assert.ok(
+    shrunk.some((problem) => problem.includes(`expected at least ${full.minTests} test(s), got ${shrunkCount}`)),
+    shrunk.join('; '),
+  )
+  assert.ok(shrunk.some((problem) => problem.includes(`expected at most ${full.maxSkipped} skipped test(s), got 11`)), shrunk.join('; '))
+})
+
+// ---------------------------------------------------------------------------
+// V-01: the full-suite floor must track the real suite (not a stale constant)
+// ---------------------------------------------------------------------------
+
+test('gate: tools/gate-baseline.json records the current suite floor (V-01)', () => {
+  assert.equal(GATE_BASELINE_ERROR, null, String(GATE_BASELINE_ERROR))
+  const baseline = readGateBaseline()
+  assert.equal(baseline.ok, true, baseline.error)
+  const scan = countStaticTestCases()
+  assert.ok(scan.files >= 40, `static scan must see the test files (got ${scan.files})`)
+  assert.ok(scan.cases >= 900, `static scan must see the declared cases (got ${scan.cases})`)
+  assert.ok(baseline.value.minFullSuiteTests >= scan.cases * 0.95, 'the recorded baseline must not be stale-low vs the test files')
+  assert.ok(GATE_LIMITS.minFullSuiteTests >= baseline.value.minFullSuiteTests, 'effective floor >= recorded floor')
+  assert.ok(GATE_LIMITS.minFullSuiteTests >= GATE_LIMITS.staticFloor, 'effective floor >= static floor')
+  assert.ok(GATE_LIMITS.minFullSuiteTests > 919, 'V-01: the floor must be above the historical 919 constant')
+})
+
+test('gate: deleting a whole test file drops below the floor and FAILS (V-01)', () => {
+  const baseline = readGateBaseline().value
+  const full = STEPS.find((step) => step.id === 'unit-tests')
+  const count = baseline.minFullSuiteTests
+  assert.deepEqual(applyNodeTestLimits(full, { tests: count, pass: count - 2, fail: 0, skipped: 2, cancelled: 0, todo: 0 }), [])
+  // Deleting test/recall-index.test.mjs (53 cases) leaves the suite above the
+  // historical 919 constant but MUST fail the real floor.
+  const afterDeletion = count - 53
+  assert.ok(afterDeletion > 919, `the V-01 scenario: ${afterDeletion} tests is still > the old 919 floor`)
+  const problems = applyNodeTestLimits(full, { tests: afterDeletion, pass: afterDeletion - 2, fail: 0, skipped: 2, cancelled: 0, todo: 0 })
+  assert.ok(
+    problems.some((problem) => problem.includes(`expected at least ${count} test(s), got ${afterDeletion}`)),
+    problems.join('; '),
+  )
+  // deriveGateLimits: a stale-low recorded baseline is raised by the static scan;
+  // the stricter of the two always wins.
+  assert.equal(deriveGateLimits({ minFullSuiteTests: 0 }, 1000).minFullSuiteTests, 980)
+  assert.equal(deriveGateLimits({ minFullSuiteTests: 1000 }, 500).minFullSuiteTests, 1000)
+})
+
+test('gate: skipping the e2e suites fails the gate (F-01)', () => {
+  for (const id of ['e2e-adapter', 'e2e-real-data']) {
+    const step = STEPS.find((candidate) => candidate.id === id)
+    assert.ok(step, `gate step ${id} exists`)
+    assert.equal(step.maxSkipped, 0, `${id} must never skip`)
+    const skipped = applyNodeTestLimits(step, { tests: step.minTests, pass: 0, fail: 0, skipped: step.minTests, cancelled: 0, todo: 0 })
+    assert.ok(skipped.some((problem) => /expected at most 0 skipped test\(s\)/.test(problem)), skipped.join('; '))
+    const deleted = applyNodeTestLimits(step, { tests: 2, pass: 2, fail: 0, skipped: 0, cancelled: 0, todo: 0 })
+    assert.ok(deleted.some((problem) => /expected at least/.test(problem)), deleted.join('; '))
+  }
+  assert.ok(GATE_LIMITS.minE2eRealDataTests >= 8, 'the real-data e2e file keeps its documented cases')
+})
+
+test('gate: a failing summary is detected by the limit check', () => {
+  const full = STEPS.find((step) => step.id === 'unit-tests')
+  const problems = applyNodeTestLimits(full, { tests: 919, pass: 916, fail: 3, skipped: 0, cancelled: 0, todo: 0 })
+  assert.ok(problems.some((problem) => /3 failing test\(s\)/.test(problem)))
+})
+
+test('gate: totals count every test once, e2e re-runs are not added (T-09)', () => {
+  const rows = [
+    { countsInTotals: true, summary: { tests: 919, pass: 917, fail: 0, skipped: 2 } },
+    { countsInTotals: false, summary: { tests: 12, pass: 12, fail: 0, skipped: 0 } },
+    { countsInTotals: false, summary: { tests: 8, pass: 8, fail: 0, skipped: 0 } },
+  ]
+  const totals = summarizeTotals(rows)
+  assert.equal(totals.nodeTestCases, 919, 'unique cases only')
+  assert.equal(totals.nodeTestPass, 917)
+  assert.equal(totals.nodeTestSkipped, 2)
+  assert.equal(totals.nodeTestCasesSummed, 939, 'summed value kept separate (919+12+8)')
+  assert.equal(totals.nodeTestSteps, 3)
+})
+
+test('gate: --help exits 0 and documents the anti-false-green limits; bad args exit 2', () => {
+  const help = spawnSync(process.execPath, [GATE, '--help'], { cwd: REPO_ROOT, encoding: 'utf8' })
+  assert.equal(help.status, 0, help.stderr)
+  assert.match(help.stdout, /minimum test count/)
+  assert.match(help.stdout, /spec and TAP reporter/)
+  const bad = spawnSync(process.execPath, [GATE, '--bogus'], { cwd: REPO_ROOT, encoding: 'utf8' })
+  assert.equal(bad.status, 2)
 })

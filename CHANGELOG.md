@@ -5,27 +5,228 @@ The project follows a lightweight [SemVer](https://semver.org/) scheme.
 
 ## [Unreleased]
 
+（下一个版本的变更写在这里。）
+
+## [1.4.2] — 2026-11-03
+
+**隐私修复 + 未发布的 1.4.1/1.5.0 内容合并发布（1.3.0 之后首个公开版本）**。
+1.3.0 随包 `config.json` 误带了维护者本机个人信息（QQ 主人号与媒体根路径），本版把它们迁移到
+git 忽略的 `config.local.json`（新增 `tools/privacy-check.mjs` 发布门禁）；同时包含此前未单独发布的两批内容：
+**1.4.1** 的归档释放下限、高 α 类别词保证与 1.4.0 审计缺陷修复，**1.5.0** 的新模型工具
+`memory_group_recall`（QQ 私聊 → 群聊记忆只读查询）与新配置块 `compat.crossChat`。
+只加工具与配置，**不改数据格式、旧数据无需迁移**（新代码只读群聊 store，不写任何记忆文件）。
+
+背景：主人希望直接在 QQ 私聊里问“群里之前聊过什么”；群聊成员、非主人私聊、WebUI 与子代理都不能通过这个工具读到别的聊天的记忆。
+
 ### Added
 
-- **一条命令发版（`tools/release.mjs`）**：把「预检 → 测试/打包检查 → 版本号 + release commit +
-  annotated tag → 推送 GitHub → `npm publish`（内置 npm 2FA 浏览器授权流程：打印授权链接、自动开浏览器、
-  轮询确认后用一次性密码重试）→ 创建 GitHub Release（正文取自 CHANGELOG）」串成一条命令。
-  支持 `--bump patch|minor|major` / `--version x.y.z` / `--resume`（中断后只补做未完成步骤，不重复发布）
-  / `--dry-run` / `--yes` / `--skip-npm` / `--skip-github` / `--skip-push` / `--otp` / `--no-browser` 等参数；
-  跨平台（Windows/Linux/macOS）、零依赖。npm 发布是异步的（HTTP 202），脚本会轮询 registry 直到版本可见；
-  Windows schannel 的证书吊销检查会让 `git push` 偶发失败，脚本只对出错的那条命令用 `GIT_SSL_NO_VERIFY=1`
-  重试并提示改用 SSH remote；Node ≥ 24 上自动加载系统证书库，兼容 TLS 代理。
-- **`package.json` 快捷脚本**：`npm run release -- --bump patch --yes`、`npm run release:status`
-  （= `node tools/release.mjs --resume --dry-run`，查看当前版本还剩哪些发布步骤）。
-- **`test/release.test.mjs`（新，22 例）**：发版工具纯函数的单元测试——版本解析/递增/比较、CHANGELOG 段落提取、
-  GitHub remote 解析、CLI 参数校验、平台浏览器 opener、npm 2FA URL 校验、`npm pack --dry-run` 清单校验、
-  系统证书库安装、`ReleaseError` 恢复提示。
-- **文档**：`docs/PUBLISHING.md` 重写为「一条命令发版（推荐）+ 首次环境准备 + 手动发版（备选/排障）+
-  发布前自检清单」，补充 npm 2FA/EOTP、npm 异步发布、Windows schannel TLS、`--resume` 续发等排障说明。
+- **确定性类目层（Plan A，v1.4.1 addendum）**：高 α 的「喜好/约定/决定/规则/要求/禁忌」类记忆，
+  如果只带同义词之一（如关键词「偏好」）而用户问另一个同义词（如「我的喜好是什么」），纯字面匹配召回不到。
+  1.4.1 新增 `recall.categoryMatch`（默认开启、`alphaMin=0.6`、6 个内置类目/同义词表）：
+  建索引时把 α≥阈值且关键词或标题命中某类目词的 folder 加入该类**合成 posting**（按 σ 排序，复用全部车道/合并/裁剪代码）；
+  查询中出现该类任一同义词时把该类 seed 加入候选集。只影响“能不能被找到”，不改变 α 优先级、车道、裁剪与冷却；
+  低 α 记忆不参与（泛词不淹没全库）；同义词表是**离线、零依赖、确定性**数据，不需要向量/网络。
+  新增 `categorySeeds` 遥测；`lanesFingerprint` 纳入类目配置（改词表后缓存/持久化车道游标失效一次）。
+  新增测试 `test/recall-category.test.mjs`（12 例，含同义词双向、α 门控、标题回退、关闭开关、确定性、指纹失效）+
+  adapter 端到端 1 例（偏好关键词↔喜好问法）。文档见 README §1.3、SPEC §6.6.1、配置表。
+- **`memory_group_recall` 模型工具**（adapter 侧 `lib/cross-chat-tool.js`；仅 QQ 渠道兼容启用时注册，
+  `compat.crossChat.enabled=false` 时不注册）：**QQ 私聊主人**可按关键词 / 群号（或 chatKey / 完整会话 id）/
+  时间范围只读查询 **QQ 群聊**历史记忆，用 `listGroups` 列出“哪些群有记忆、各多少条、最近一条时间”，
+  `limit`/`offset` 分页。方向性是硬约束：**私聊 → 群聊允许（仅 `compat.ownerIds` 里的主人）；
+  群聊 → 任何聊天禁止；私聊 → 私聊禁止；WebUI / 子代理禁止**。授权在**任何数据读取之前**完成
+  （chatKey 必须是 `onebot-private-*` / `qqb-p-*`；对方 QQ 取私聊 chatKey 而不是消息正文，必须命中
+  `compat.ownerIds`；`ownerIds` 为空 = 对所有人拒绝；`storage.perSession=false` 拒绝）。
+  数据范围仅 `memory/sessions/` 下 `onebot-group-*` / `qqb-g-*` 群聊 store（`group` 参数只过滤目录名、
+  不参与 `path.join`），只读 `index.json`/`context.json`、只返回已评分记忆（`scored !== false`），
+  **不写盘、不建目录**；输出声明“仅群聊，不含私聊 / WebUI / 子代理记忆”。
+- **`compat.crossChat` 配置块**（adapter-only，默认值见 `lib/compat.js` 的 `DEFAULT_COMPAT_CONFIG`）：
+  `{ enabled: true, ownerOnly: true, maxResults: 20, maxSnippetChars: 400, maxGroups: 50, maxFoldersPerGroup: 5000 }`。
+  `enabled=false` 不注册工具；`ownerOnly=false` 允许任意私聊者查询、**有泄漏风险、不推荐**；
+  `maxResults` 是 `limit` 上限，`maxGroups`/`maxFoldersPerGroup` 是单次扫描上限（超限 warning）。
+- **Derpyu 工具白名单自动补丁同步**：`lib/compat-autopatch.js` 的 `SAFE_EXACT` 增加第 4 个工具名
+  `memory_group_recall`（此前只补前三个；缺哪一个按增量自愈单独补上），否则该工具在 Derpyu preset 下会
+  “可见但执行被拒”。
+- **测试**：新增 `test-adapter/cross-chat-tool.test.mjs`（**20 例**），覆盖私聊主人命中群聊、
+  私聊/WebUI 诱饵记忆永不返回、群聊/非主人/`ownerIds:[]`/WebUI/子代理拒绝、`compat.qqBots='off'` 与
+  `crossChat.enabled=false` 不注册、`listGroups`/`group` 过滤/分页/时间过滤、路径穿越与注入、
+  只读（mtime/hash 不变）、tool schema 合法；`node --test` 总计 **1026 tests / 1024 pass / 2 skip / 0 fail**。
+- **文档/版本**：README 顶部摘要 + §3.2.10（工具定位/授权/只读范围/参数/示例/隐私边界/威胁模型）+
+  §3.2.9 `compat.crossChat` 配置表 + §3 旧隐私注修正、SPEC §2 + §4.7 + §7 + revision note、
+  VERIFICATION 新增 §23、`config.json` `_readme` 与 `compat.crossChat` 示例、`locale/*.json` 同步；
+  `package.json` / `engine/package.json` → **1.4.2**；`tools/gate-baseline.json` 的 `minFullSuiteTests`
+  更新为 **1026**（e2e 12/8 不变）。
+
+### Fixed
+
+- **`memory_group_recall` 时间参数回显（bugfix）**：传数字 epoch（如 `timeFrom: 1793446567000`）时过滤生效，
+  但结果里的 `timeFrom`/`timeTo` 返回空字符串，导致渲染的「条件」里丢掉时间约束（模型不知道结果已被时间过滤）。
+  现在数字按字符串形式回显，「条件」始终展示生效的时间窗口（输出 schema 措辞同步为“按输入形式回显”）。
+- **`memory_group_recall` 颠倒时间范围的交换语义（bugfix）**：旧实现先解析再交换，日期型端点的“日首/日末”
+  语义被交换错位——`timeFrom=2026-11-03, timeTo=2026-11-01` 会变成 `[11-01 23:59:59.999, 11-03 00:00)`
+  这种几乎为空的窗口，把 11-01 白天的记忆排除掉。现在交换**原始参数**后按各自角色重新解析，得到预期的
+  `[11-01 00:00, 11-03 23:59:59.999]`，并回显交换后的生效值（回归断言补在既有时间过滤测试内）。
+- **`memory_group_recall` 日期型 `timeTo` 在 DST 切换日的边界（bugfix）**：日末从固定 `+24h` 改为
+  “下一个本地午夜 − 1ms”，避免 23/25 小时日多算或少算 1 小时（与 engine time-index 的 C-01 口径一致）。
+
+### 隐私边界（威胁模型）
+
+- QQ 私聊可能是任意人发起 → 必须 `compat.ownerIds` 白名单；`ownerIds` 为空则工具一律拒绝（fail-closed）。
+  主人身份取**私聊 chatKey 里的 QQ**，不看消息正文里的 sender 标记（正文可伪造）。
+- 群聊会话调用该工具直接拒绝、不返回任何数据：群成员不能借模型转述读到别的聊天的记忆。
+- 只返回群聊记忆：私聊 / WebUI / 子代理记忆永远不在结果里（测试用同关键词诱饵验证）。
+- 不在威胁模型内：能直接读写本机 `memory/` 目录的攻击者（本地文件权限本来就能读记忆库）。
+- 与 `compat.memberMinAlpha` 无关：后者管“非主人群成员触发的自动回忆”的 α 下限；本工具是主人私聊主动查询、
+  `minAlpha` 固定 0。`storage.perSession=false` 时无法区分聊天边界 → 工具拒绝。
+
+## [1.4.1] — 2026-11-02（未单独发布；内容已并入 [1.4.2]）
+
+- **隐私清理（2026-11-03）**：`config.json` 移除维护者的 QQ 号与个人路径（`compat.ownerIds` / `compat.mediaRoots` 置空），新增 git 忽略的 `config.local.json` 本机覆盖层（合并顺序 `DEFAULT ← config.json ← config.local.json ← row config`）；`docs/VERIFICATION.md`、测试用例与 `test/fixtures/**` 全部脱敏（真实 QQ/昵称/路径/会话内容/图片替换为样本）；新增 `tools/privacy-check.mjs` 与回归测试，发布前检查跟踪配置不含个人信息。
+
+
+**1.4.0 的修复版 + 两项用户可见功能**（归档释放下限、`memory_recall` 的事件询问提示）。
+本版本把 1.4.0 审计发现并确认的 **P0/P1/P2 缺陷全部修复**（每条都有“修复前 FAIL → 修复后 PASS”的回归测试，
+审计 PoC 已复跑确认不再复现），同时修正文档/数据口径。**旧数据无需迁移**：
+旧 `index.json`、旧 `recall-state.json`（v3/v2/v1）、旧 pending 全部可读，新字段一律 optional。
+
+### Added
+
+- **高 α 类别词保证（v1.4.1，行为变化）**：rofm 是字面关键词召回，高 α 的偏好/约定/决定类记忆如果没有类别词，以后问「我的喜好是什么」「我们约定了什么」这类抽象问题就永远检索不到。1.4.1 起：① 任务区块与 `memory_judge` 描述要求模型在 keywords 里至少给一个类别词（喜好/偏好/习惯/约定/承诺/决定/规则/要求/禁忌）+ 具体词；② 模型漏了时，`memory_judge` 按确定性规则从归档原文识别类别并**自动补上**（关键词已满 8 个时替换最后一个），返回非阻断 warning（`category-keyword-added/replaced/missing`）；③ 只在高 α（`scoring.categoryKeyword.alphaMin`，默认 0.6）且本次提交 keywords 时触发，原文无类别标记时不臆造、只提醒复核补充；可用 `scoring.categoryKeyword.enabled=false` 关闭。新增测试 `test-adapter/category-keyword.test.mjs`（7 例）覆盖自动补词、检索命中、低 α 不动、已有关键词不重复、8 词上限替换、关闭开关、部分复核不改词。
+
+- **归档释放下限（archive floor，用户功能）**：v1.4.0 的释放估算只是“压回 trigger 以下”的上限，
+  接近触发线时可能只归档 0.5% 的窗口（实测 1M 窗口只释放 6k tokens）并停在触发线附近。
+  1.4.1 把它改成**下限**：每次归档至少要释放到 `compress.releaseTargetPercent`（默认 **50%**）**以下**，
+  `compressPercent` 不够时自动扩大移除范围；合法切点/文件夹上限导致达不到下限时记 warning，下一次归档继续。
+  新增键 `compress.releaseTargetPercent=50` / `compress.releaseFloorEnabled=true`
+  （后者用于合成压测夹具/对照实验 opt-out，恢复 1.4.0 的 cap 口径；`target ≥ trigger` 时自动禁用并 warning）。
+  `planCompression` 新增只读字段 `releaseFloor` / `releaseTargetPercent`（`releaseCapped` 保留兼容、恒 false），
+  engine `compress` 事件与 adapter `compress-applied` 事件都带 `releaseFloor/releaseTargetPercent/releaseCapped/trickleArchive/foldersSkipped`。
+- **`memory_recall` 事件询问提示（用户功能）**：空结果 missHint、连续第 3 次 miss 的 `MISS_WARNING`、
+  第 6 次停用的 `DISABLED_HINT` 现在在时间建议之外**同时建议向用户询问期望的事件名，再用 `event` 参数重试**
+  （原有时间句子逐字节保留）；`event.askUserHint=false` 只去掉事件句、保留时间提示。
+- **一键门禁加固**：`tools/verify-1.4.0.mjs` 不再“0 fail 即绿”——测试数下限改由
+  `tools/gate-baseline.json` 维护（记录值：全量 1039 / 最多 skip 4 / e2e-adapter 12 / e2e-real-data 8；
+  有效下限 = max(记录值, 静态扫描用例数×98%)，基线缺失或损坏直接 FAIL；新增/删除测试须同步更新基线），
+  兼容 spec/TAP reporter，e2e 两步不重复计入总量，并校验 `memory-audit --json` 的 `totals.stores`。
+  负向反证：删 53-test 文件 → FAIL（expected ≥1039, got 937）；e2e 全 skip → FAIL。
+- **自检加固**：`tools/selfcheck.mjs` 新增 `index.json ↔ meta.json` 逐字段对账（alpha/beta/createdAt/scored/
+  rescorePending/keywords/title/eventTimeSource），会话日志默认全扫（`--max-sessions` 可限制），
+  修复 `--json`/TAP 相关解析与字段类型校验。
+- **发版工具加固**：`tools/release.mjs` resume 前校验 tag 对应 commit 内的 `package.json` 版本等于待发布版本；
+  `--allow-dirty` 也做版本一致性校验；dry-run 不执行任何网络 fetch；修复 TAP reporter 假红。
+- **新增/扩充回归测试（`node --test` 919 → 1039）**：`test/compress-transaction-recovery.test.mjs`（A-01/A-02）、
+  `test/compress-floor-guard.test.mjs`（floor/L1/L2）、`test/recall-1.4.1-regressions.test.mjs`（B-01…B-05/B-07）、
+  `test/time-index-1.4.1-regressions.test.mjs`（C-01…C-06）、`test-adapter/category-keyword.test.mjs`（高 α 类别词保证）、`test/recall-category.test.mjs`（类目层 12 例）、e2e 夹具（`test/fixtures/memory-snapshot/**`）。
+
+### Fixed — 归档 / 存储（engine）
+
+- **A-01（P0）同一 plan 内幂等键碰撞导致归档正文丢失**：一条超长消息按句切成多个内容相同的 chunk 时共享同一
+  `(sessionId,turn,seqStart,seqEnd,contentHash)` 键，后续 chunk 被当成“重试”跳过，而适配层仍用 note 替换整个区间 →
+  正文永久丢失（审计实测 planned 17 / written 3，丢 16,380 chars）。修复：幂等键加入 **plan 内 chunk 序号**，
+  本次写入的 key 不再回灌 `existingKeys`；回归测试断言“一条 18k 重复行 tool 输出 → committed==planned 且正文守恒”。
+- **A-02（P1）崩溃恢复缺失**：journal 只删不恢复、磁盘 orphan folder 不可见、重试会重复归档。
+  修复：加载时扫描过期 journal 与磁盘 folder（`meta.id`/`idempotencyKey`），把已落盘但未进 index 的 folder
+  **采纳进 index**（数据不丢），重试同一段不重复归档。
+- **A-06（P3）** `loadIndex` 在 rebuild 写盘失败时不再抛错（返回带 `stale=true` 的内存 index）；
+  **A-07（P3）** 合法但缺条目的 index 会按磁盘 `meta.json` 自愈，且保留全部 optional 字段。
+- **L1（守护）**：新增“低于 trigger 不得再开新 pass”的守护测试，确认真实会话里 6 连发级联是当时把
+  `triggerPercent` 临时改成 5 的被控实验，不是 floor×multi-pass 回归。
+
+### Fixed — 召回 / 公平性 / 时间（engine）
+
+- **B-01（P1）分页不确定**：旧分页每页重选（`k=offset+take+1`）且 `+1` lookahead 消耗 lanes 却不返回 → 页间重复/遗漏、
+  `hasMore` 提前 false。修复：`engine.recall` 新增 `opts.paginate=true` —— 固定候选窗口
+  `min(candidates, 10000)` 的车道**快照分页**，逐页稳定、不推进/不写回 lane 状态、只按 `blockIds` 排除、
+  `offset>总数` 返回空页 `hasMore=false`；`memory_recall` 的 fair/deterministic 路径改传 `paginate:true`
+  且不再 `commitRecallLanes`（legacy/browse 不变）。
+- **B-02（P1）双向匹配未接线**：`engine/keyword-match.js` 的双向匹配只被 re-export，实际选择器仍是单向匹配，
+  `match.expandLatinCase/cjkBigram` 是死开关。修复：`querySeeds/scanCandidates` 增加“用户 token 出现在多词 folder
+  keyword 内”的反向命中（`接口网关 8080` 被查询「网关」命中）；两个 `match.*` 扩展开关真正生效，且保持“只增不减”。
+  **行为变化**：多词关键词可能在 query 之前就被普通消息的 token 命中并自动召回（真实会话已观测到）。
+- **B-03（P2）`roundBudget.maxChars` 未实现**：单轮注入字符预算现在真实生效，超出时从尾部（最低优先级）
+  丢弃、至少保留 1 条，并写 warning + `stats.roundBudgetMaxChars/roundBudgetDropped/roundBudgetChars`（分页页不裁剪）。
+- **B-04（P2）`queryBoost` 无视回收冷却**：highRecycle 条目重入前校验
+  `round - item.round >= fairness.recycle.cooldownRounds`，未到期留队列（G4 对高 α 道同样成立）。
+- **B-05（P2）`recall.firstGenMax=0` 被强制为 1**：现在 fair/deterministic/legacy 三种模式一致 = 关闭召回
+  （空页、`hasMore=false`、不消费 lane 状态）。
+- **B-07（P3）** 时间阶梯放宽后的 `candidates/matchedFolders` 与实际生效窗口一致。
+- **C-01（P2）DST 午夜时区单日窗口错位 1 小时**：单日/日粒度窗口改为“该 civil 日**第一个存在的瞬间**”到次日真实日界
+  （America/Santiago、America/Havana、America/Asuncion、Asia/Beirut 等 00:00 不存在的日期；整日被跳过的日期退化为非空窗口）。
+- **C-02（P3）** 纯时间浏览按 `eventStart` 升序，不再被 `recall.sort` 重排。
+- **C-05（P3）** `time.mode='index'` 且模型只给时间时不再浏览全库（返回空 + warning）。
+- **C-06（P3）** 8 位 `YYYYMMDD`、9–11 位秒级时间戳等数值时间输入给出针对性 warning（语义不变，仍按 epoch ms）。
+- **config-consistency**：`test/config-consistency.test.mjs` 改为**版本无关**（版本从 `package.json` 读取、
+  CHANGELOG 断言当前版本段存在），升版不再需要同步改测试。
+
+### Fixed — 适配层 / QQ / 评分（lib）
+
+- **A-03（P1）归档守恒断言**：commit 实际写出的 folder 数必须等于计划数（`committed + skipped === planned` 且 `skipped===0`），
+  否则**拒绝替换模型可见上下文**并回滚本次 folder + 图片；note 的 N 用实际 `archiveSegments`。
+- **A-04（P2）空 system 节点阻断 note 合并**：merge 扫描与 pinned 记录遇到 `deriveEventMessage()===null` 的节点
+  按可丢弃处理并继续，单条 note + N 累计的承诺在含空 system 节点的会话里也成立。
+- **E-01（P0）chatKey 9 位纯数字被误剥（跨会话串记忆）**：onebot 退役后缀必须是 base36 时间戳，
+  现在要求后缀**至少含 1 个小写字母**才剥离；9 位纯数字群号/私聊号不再共享 memory 文件夹。
+  回归覆盖 `100000000..199999999` 不碰撞、退役 id `-mvzbiny0` 仍合并。
+- **E-02（P1）autopatch 写坏第三方文件**：只有 `firstElementStart` 位于行首（其前只有空白）才生成补丁；
+  否则 `status=unsupported` 且**不写文件**（文件字节不变、`node --check` 通过）。
+- **E-03（P1）passive 水位跨会话复用**：`.passive-watermark.json` 升级为 v2（按 DSH sessionId 分桶），
+  会话重建不会复用旧 seq 去重；v1 格式自动兼容读取。
+- **E-04（P2）onebot 私聊被误门控**：`resolveRecallGate` 对私聊（chatKey 以 `onebot-private` 开头）不门控；
+  E-05（P2）`recall.minAlpha` 在“未门控/自动召回/手动召回/legacy”四条路径上按文档生效
+  （此前显式传 0 会覆盖配置；QQ 群非主人门控仍用 `compat.memberMinAlpha`）。
+- **E-06（P2）图片文件名跨会话重建冲突**：归档图片名加入归档 run 时间戳前缀
+  （`img-<runStamp>-<seq>-<i>.<ext>` / `qq-<runStamp>-<seq>-<i>.<ext>`），同一 chat 重建后不覆盖旧图。
+- **D-01（P2）`memory_judge` 批内重复 id 被误拒**：每条 apply 后刷新批内 `indexById` 快照，
+  同批对同一 id 的第二次更新按顺序生效（最后提交值胜出）。
+- **D-02（P2）event 批内归并失效**：本批先写入的 canonical 标签立即可见，
+  `日本旅行` / `日本 旅行` 在同一批里归并为 1 个标签（`eventStats.merged≥1`）。
+- **D-03（P2）`enabled:false` 仍注册/写盘**：`start()` 读配置后若 `enabled===false` **立即 return**——
+  不注册任何工具/section/监听器，不跑 QQ 兼容检测、Derpyu 自动补丁、staging 清理（只读配置判定）。
+  **行为变化**：这是启动时开关，运行期改回 `true` 需重载插件行/重启 DSH；运行期改 `false` 也不会立即卸载。
+- **D-04（P2）忽略 `agent/pre-step` 取消信号**：`onPreStep`/`compressWithEscalation`/`compressOnce`
+  在各阶段检查 `signal.aborted`；取消时移除已复制图片/回滚已写 folder、不 append checkpoint。
+- **D-06（P3）** `keep:true` 与 alpha/beta/keywords/event 同给时返回非阻塞 warning（不再静默忽略）。
+- **D-07（P3）** `memory_image` 的 `OUTPUT_SCHEMA` 补上它一直返回的 `matched` 字段。
+- **D-09（P3）** 遥测写入统一走 `appendStatsSafe`：首次失败 WARN 一次并记录 `lastStatsError`，不再完全静默。
+
+### Changed / 行为变化（升级须知）
+
+- **默认归档更“深”**：archive floor 默认开启后，接近触发线时一次归档会移除比 1.4.0 更多的上下文
+  （目标压到 50% 以下）；需要 1.4.0 的 cap 口径用 `compress.releaseFloorEnabled=false`。
+- **`enabled:false` 语义**：启动时开关，改回 `true` 需重载插件（其他配置键仍热加载）。
+- **`memory_recall` 分页**：逐页稳定、不推进召回车道状态；翻页不再“消耗”轮转道。
+- **双向匹配**：用户 token 可命中多词 folder 关键词内部，可能提前自动召回（只增不减，无开关）。
+- **`recall.firstGenMax=0`** = 关闭召回；**`roundBudget.maxChars`** 单轮硬预算生效；
+  **`queryBoost`** 也遵守 `cooldownRounds`；**`recall.minAlpha`** 在未门控时生效。
+- **时间**：DST 午夜时区单日窗口按真实 civil 日；`time.mode='index'` 下纯时间浏览不再返回全库。
+- **`memory_recall` 提示**：连续 miss 同时在时间之外建议询问事件名（`event.askUserHint=false` 可关事件句）。
+- **图片命名 / passive 水位 / 遥测字段**：见上（仍以 `images/index.json`、`meta.images` 为权威索引）。
+
+### Docs & Data
+
+- 测试数从 919 更新为 **1039 tests / 1037 pass / 2 skip / 0 fail**；一键门禁 `node tools/verify-1.4.0.mjs`
+  **8/8 PASS**（1039 unique / 1059 summed with e2e re-runs；baseline recorded 1039 / static 999 / effective 1005；
+  e2e 两步不重复计入 unique）；`test/simulate.mjs` PASS
+  （context added back 81.89%）；
+  `tools/selfcheck.mjs` **10 passed / 2 warnings / 0 failed**；e2e-adapter **12/12**、e2e-real-data（夹具）**8/8**。
+- 真实数据快照更新为 `memory/` 清理后的 **3 stores / 1264 folders（1262 scored / 2 pending = 0.16%）**；
+  1.4.0 时期的旧快照（4637 folders / 2769 pending / 74.0% / 2/369 = 0.54%）仅作为“清理前历史快照”保留。
+- `README`/`docs/SPEC.md`/`docs/VERIFICATION.md`（新增 §22 1.4.1 验证记录）/`docs/PUBLISHING.md`/
+  `config.json` `_readme`/`locale/*.json`/`index.js` 头注释/`cordis.patch.yml` 全部按 1.4.1 语义重写；
+  `index.js` 修正“no tools/one section”的过时注释；`cordis.patch.yml` 的 profile 覆盖说明改为“按字段深合并”。
+- **e2e 数据解耦**：`test/e2e-real-data-readonly.test.mjs` 改用 `test/fixtures/memory-snapshot/**` 夹具
+  （legacy/synthetic/current/QQ 四类，<300KB），不再硬编码真实库数字；`PUBLISHING.md` 发布检查清单新增
+  “发布前把 `config.json` 的 `compat.ownerIds`/`compat.mediaRoots` 个人配置替换为占位值/清空”。
+
+### Compatibility
+
+- 无需迁移：旧 index/旧 recall-state v3/v2/v1/旧 pending 全部可读；1.4.0 的“事件约束增补”随 1.4.1 正式发布，
+  旧记忆没有 `event` 属正常（不参与事件约束召回，复核时可补标签）。
+- 回滚开关新增/更新：`compress.releaseFloorEnabled=false`（恢复 1.4.0 cap 口径）；其余开关（`recall.mode`/
+  `time.mode`/`event.mode`/`scoring.fallback`/`scoring.includeLegacy`）语义不变。
 
 ## [1.4.0] — 2026-11-01
 
-本版本完成四件事 + 一项增补（**1.4.0 增补：事件约束**，见后文专节；版本号保持 1.4.0 不变），
+本版本完成四件事 + 一项增补（**1.4.0 增补：事件约束**，见后文专节；该增补随 **1.4.1** 正式发布），
 **旧数据无需迁移**（旧 `index.json`、旧 `recall-state.json` v2/v1、旧 pending 全部可读；
 新字段一律 optional、有值才写）：
 
@@ -40,7 +241,7 @@ The project follows a lightweight [SemVer](https://semver.org/) scheme.
    旧数据安全回退归档时间。
 3. **评分流水线与遗留数据**：新增数据时代分桶（legacy/synthetic/current）、任务区块 token 预算、pending 背压、
    heuristic 兜底、评分质量告警与 judge 遥测；pre-1.2.0 遗留与压测遗留**只标记不重评**；
-   当前真实待评分口径 **2/369 = 0.54%**（1.3.0 后正常会话 b5eeee7e 为 0/359 = 0%）。
+   当前真实待评分口径 **2/369 = 0.54%**（1.4.0 当时快照；1.3.0 后正常会话 b5eeee7e 为 0/359 = 0%）。
 4. **归档与健壮性**：修复 P0-1（自指反馈环）、P0-2（pending 永不参与召回）、P0-3（当前回合被中途归档）、
    P0-6（评分任务 FIFO 饿死新记忆）、P1-1（再归档误删刚注入记忆）、P1-4（commit 无回滚/不幂等）、
    P1-6（小窗口自毁/假窗口）等 1.3.0 已确认缺陷。
@@ -210,7 +411,7 @@ The project follows a lightweight [SemVer](https://semver.org/) scheme.
   未评分记忆仍按契约不参与召回，但会在积压/通道不可用时自动降级 heuristic 保证可回忆。
 - **P0-6 评分任务 FIFO 饿死新记忆**：默认 `newest` 优先，最新归档先进入任务区块。
 - **P2-5 评分不可观测**：judge 遥测落地。
-- **数据口径混淆（“81.8% pending”）**：时代分桶后明确当前真实口径 2/369 = 0.54%；
+- **数据口径混淆（“81.8% pending”）**：时代分桶后明确当前真实口径 2/369 = 0.54%（1.4.0 当时快照）；
   pre-1.2.0 遗留 587 与 a46 压测 2180 **默认不回补**，只标记 `pendingEra`。
 
 ### 归档与健壮性
@@ -218,12 +419,13 @@ The project follows a lightweight [SemVer](https://semver.org/) scheme.
 #### Added
 
 - **`compress` 新配置**：`protectCurrentTurn=true` / `allowSmallWindow=false` / `smallWindowTokens=20000` /
-  `hardLimitStop=true` / `maxFoldersPerStep=500` / `releaseTargetPercent=50` / `releaseFloorEnabled=true`。
+  `hardLimitStop=true` / `maxFoldersPerStep=500`（`releaseTargetPercent=50` / `releaseFloorEnabled=true`
+  是 **1.4.1** 的归档释放下限，见 [1.4.1]）。
 - **`planCompression` 新可选入参**：`protectTurn` / `protectSeq` / `pendingCount` / `windowTokens` /
   `allowSmallWindow` / `maxFolders` / `eventTimes`（全部向后兼容）。
 - **plan 只读字段**：`protectedTurn` / `protectedStart` / `smallWindow` / `maxFoldersCapped` / `maxFolders` /
-  `releaseTokens` / `releaseTargetPercent` / `releaseFloor` / `eventTime` / `eventTimeSourceCounts` /
-  `pendingAtArchive`（`releaseCapped` 保留兼容、恒为 false），
+  `releaseTokens` / `releaseCapped` / `eventTime` / `eventTimeSourceCounts` /
+  `pendingAtArchive`（1.4.1 起 `releaseCapped` 恒为 false，新增 `releaseFloor` / `releaseTargetPercent`），
   以及失败 `reason ∈ 'protected-turn'|'no-legal-cut'|'small-window'|'window-conflict'|'hard-limit'`。
 - **commit 事务（P1-4）**：先写 folder → 最后写 index；写 `.commit-<id>.json` journal，
   异常时回滚已写 folder + 图片 + 内存索引并 **rethrow** 原错误（附加 `error.rolledBack=true` /
@@ -243,9 +445,6 @@ The project follows a lightweight [SemVer](https://semver.org/) scheme.
   `allowSmallWindow!=true` 时**跳过自动归档**（每会话只 WARN 一次）。
 - **pass-0 再归档**：本回合刚注入的 additions 受保护（`injectedTurn`），多步工具回合不再被自己删掉刚召回的记忆。
 - **单步归档上限**：`maxFoldersPerStep` 与释放估算取小，`maxFoldersCapped` 可观测。
-- **归档释放下限（新）**：不再“只压到 trigger 以下”；每次归档至少压到 `compress.releaseTargetPercent`（默认 **50%**）以下，
-  `compressPercent` 只作为目标值、不足时自动扩大移除范围；合法切点/文件夹上限导致达不到下限时记 warning（下一次归档继续）。
-  `releaseCapped` 字段保留兼容（恒 false），新增 `releaseFloor/releaseTargetPercent` 计划与遥测字段。
 
 #### Fixed
 
@@ -263,7 +462,7 @@ The project follows a lightweight [SemVer](https://semver.org/) scheme.
   旧 config 缺新键 → 全部走默认；旧 pending 照常可被评分/召回。
 - **不重写旧数据**：1.4.0 不批量重评、不改写旧 `meta.json`；`memory-audit --apply` 也只写 `pendingEra` 标记。
 - **遗留数据处置（用户已拍板）**：pre-1.2.0 遗留 587 + a46 压测 2180 **默认不回补**；
-  `scoring.includeLegacy=false` 让它们不进入评分任务区块；当前真实待评分口径 **2/369 = 0.54%**；
+  `scoring.includeLegacy=false` 让它们不进入评分任务区块；当前真实待评分口径 **2/369 = 0.54%**（1.4.0 当时快照）；
   1.3.0 之后正常会话 b5eeee7e 为 **0/359 = 0%**。
 - **回滚开关（一档一开关）**：
   - `recall.mode='legacy'` → 回到 v1.3.0 概率召回（含随机掷骰/代数公式）；
@@ -367,10 +566,10 @@ The project follows a lightweight [SemVer](https://semver.org/) scheme.
 - 公平性保证有前提：高α首轮保证要求稀有高α候选 ≤ k_H 且高α到达率 ≤ k_H/轮；低α轮转界要求 `a_low < r`；
   超过时 `degraded=true` / `registerDrops>0` 会出现在遥测与日志（配额不足，不是丢记忆）。
 - 确定性选择意味着“同样条件不会自己变化”：要翻更多结果用 `memory_recall` 的 `offset` 分页。
-- 旧数据没有事件时间（本机 0/4825 消息带 time）：历史记忆的时间查询回退归档时刻，直到新归档产生事件时间。
+- 旧数据没有事件时间（1.4.0 时本机快照 0/4825 消息带 time）：历史记忆的时间查询回退归档时刻，直到新归档产生事件时间。
 - heuristic 兜底质量低于模型评分（α 启发式、β=0、关键词 tokenizer），只保证可回忆、不保证准。
 - 时间辅助不建物理日/月/年目录；不要手工按日期搬 folder（会被判定为数据损坏）。
-- 1.4.0 不开放 `memory_judge` 的 eventTime 覆写（`time.judgeEventTime=false`，留 1.4.1 评估）。
+- 1.4.0 不开放 `memory_judge` 的 eventTime 覆写（`time.judgeEventTime=false`；1.4.1 仍不开放，后续版本再评估）。
 - 时间阶梯 `day3 → month → year → all` 是平级放宽序列（不是 day3 内再嵌套 month）。
 - 重启后首轮 block 裁剪没有 `candidateIds`，退化为纯 α 裁剪（仍保证高α pin 与至少保留 1 条）。
 - **事件相似是 token（Dice）相似、不是语义向量**：同义改写、缩写/全称混用可能低于 0.72 阈值，
@@ -378,15 +577,34 @@ The project follows a lightweight [SemVer](https://semver.org/) scheme.
 - **旧数据没有 event**：1.4.0 之前的记忆不参与事件约束召回（仍可按关键词/时间回忆），复核评分时补标签即可。
 - **自动召回不做事件约束**：发生在模型思考之前，没有事件判断者；事件约束只在 `memory_recall` 生效。
 
+### 发布工具（发布前已在 1.4.0 落地，随 1.4.0 一起发布）
+
+- **一条命令发版（`tools/release.mjs`）**：把「预检 → 测试/打包检查 → 版本号 + release commit +
+  annotated tag → 推送 GitHub → `npm publish`（内置 npm 2FA 浏览器授权流程：打印授权链接、自动开浏览器、
+  轮询确认后用一次性密码重试）→ 创建 GitHub Release（正文取自 CHANGELOG）」串成一条命令。
+  支持 `--bump patch|minor|major` / `--version x.y.z` / `--resume`（中断后只补做未完成步骤，不重复发布）
+  / `--dry-run` / `--yes` / `--skip-npm` / `--skip-github` / `--skip-push` / `--otp` / `--no-browser` 等参数；
+  跨平台（Windows/Linux/macOS）、零依赖。npm 发布是异步的（HTTP 202），脚本会轮询 registry 直到版本可见；
+  Windows schannel 的证书吊销检查会让 `git push` 偶发失败，脚本只对出错的那条命令用 `GIT_SSL_NO_VERIFY=1`
+  重试并提示改用 SSH remote；Node ≥ 24 上自动加载系统证书库，兼容 TLS 代理。
+- **`package.json` 快捷脚本**：`npm run release -- --bump patch --yes`、`npm run release:status`
+  （= `node tools/release.mjs --resume --dry-run`，查看当前版本还剩哪些发布步骤）。
+- **`test/release.test.mjs`（新，22 例）**：发版工具纯函数的单元测试——版本解析/递增/比较、CHANGELOG 段落提取、
+  GitHub remote 解析、CLI 参数校验、平台浏览器 opener、npm 2FA URL 校验、`npm pack --dry-run` 清单校验、
+  系统证书库安装、`ReleaseError` 恢复提示（1.4.1 起另覆盖 resume 版本一致性、TAP 解析、dry-run 无网络）。
+- **文档**：`docs/PUBLISHING.md` 重写为「一条命令发版（推荐）+ 首次环境准备 + 手动发版（备选/排障）+
+  发布前自检清单」，补充 npm 2FA/EOTP、npm 异步发布、Windows schannel TLS、`--resume` 续发等排障说明
+  （1.4.1 起自检清单新增“发布前替换 config.json 个人配置”）。
+
 ### Tests
 
 - v1.4.0 新增/扩展测试：`test/recall-index.test.mjs`、`test/time-index.test.mjs`、`test/keyword-match.test.mjs`、
   `test/turn-protection-engine.test.mjs`、`test/memory-audit.test.mjs`、`test/config-consistency.test.mjs`、
   `test/e2e-adapter-simulate.test.mjs`、`test/e2e-real-data-readonly.test.mjs`，以及 `test-adapter/` 的
   公平性/确定性/评分压力/时间工具适配用例。
-- 发布门禁 `node tools/verify-1.4.0.mjs` = **8/8 PASS**；`node --test` = **916 tests / 914 pass / 0 fail / 2 skip**
-  （2 skip = Node zstd 平台条件跳过，非缺陷）+ e2e **12 + 7 = 19** → 门禁汇总 **935 / 933 pass / 0 fail**。
-  最终数字以 `docs/VERIFICATION.md` §20 与门禁输出为准（本条目不改写历史 v1.3.0 的 493 用例基线）。
+- 1.4.0 发布时门禁 `node tools/verify-1.4.0.mjs` = **8/8 PASS**；`node --test` = **916 tests / 914 pass / 0 fail / 2 skip**
+  （2 skip = Node zstd 平台条件跳过，非缺陷）+ e2e **12 + 7 = 19** → 门禁汇总 **935 / 933 pass / 0 fail**（1.4.0 当时快照）。
+  1.4.1 的最终数字见 [1.4.1] 的 Docs & Data（998 / 996 / 2 skip；门禁 baseline 998）。
 
 ## [1.3.0] — 2026-10-31
 

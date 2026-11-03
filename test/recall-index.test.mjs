@@ -28,6 +28,7 @@ import {
   trimBlock,
 } from '../engine/recall-index.js'
 import { buildEventIndex, resolveEventQuery } from '../engine/event-index.js'
+import { matchKeywords } from '../engine/keyword-match.js'
 import { countKeywordMatches, keywordMatches, normalizeText } from '../engine/tokenize.js'
 
 // ---------------------------------------------------------------------------
@@ -275,7 +276,8 @@ test('querySeeds: AC seeds agree with engine/tokenize.js keywordMatches (fuzz 20
       }
       folders.push(folder(`m${at}`, next(), at, keywords))
     }
-    const index = buildRecallIndex(folders, makeCfg())
+    const cfg = makeCfg()
+    const index = buildRecallIndex(folders, cfg)
     const parts = []
     for (let at = 0; at < 4; at += 1) {
       const chosen = pick(next, vocab)
@@ -283,12 +285,32 @@ test('querySeeds: AC seeds agree with engine/tokenize.js keywordMatches (fuzz 20
     }
     parts.push('请检查 Docker 的 feature_flag 端口 8080，node.js v2.3')
     const text = normalizeText(parts.join('；'))
+    // v1.3.0 direction is a strict subset: every keyword keywordMatches() accepts
+    // must still be seeded (no regression).
+    const direction1 = new Set()
+    for (const keyword of index.postings.keys()) {
+      // Plan A adds synthetic category postings; they are seeds, not keywords.
+      if (keyword.startsWith('')) continue
+      if (keywordMatches(text, keyword, 'contains')) direction1.add(keyword)
+    }
+    // v1.4.1 wires direction 2 (bidirectional match) into querySeeds; the
+    // authoritative predicate is engine/keyword-match.js, so the expected seed
+    // set is "direction 1 ∪ direction 2".
     const expected = new Set()
     for (const keyword of index.postings.keys()) {
-      if (keywordMatches(text, keyword, 'contains')) expected.add(keyword)
+      if (keyword.startsWith('')) continue
+      if (matchKeywords(text, [keyword], cfg).matchCount > 0) expected.add(keyword)
     }
-    const seeds = querySeeds(index, parts.join('；'), makeCfg())
-    assert.deepEqual(new Set(seeds.seeds), expected, `trial ${trial}: ${JSON.stringify(seeds.seeds)}`)
+    for (const keyword of direction1) assert.ok(expected.has(keyword), `direction-1 regression: ${keyword}`)
+    const seeds = querySeeds(index, parts.join('；'), cfg)
+    // Plan A: synthetic category seeds are generated separately from the AC
+    // keyword seeds; compare the keyword part of the seed set only.
+    const keywordSeeds = new Set(seeds.seeds.filter((seed) => !seed.startsWith('')))
+    assert.deepEqual(keywordSeeds, expected, `trial ${trial}: ${JSON.stringify(seeds.seeds)}`)
+    for (const seed of seeds.seeds) {
+      if (!seed.startsWith('')) continue
+      assert.ok(seed.startsWith('cat:'), `unknown synthetic seed ${JSON.stringify(seed)}`)
+    }
     // deterministic + deduped + sorted
     assert.deepEqual(querySeeds(index, parts.join('；'), makeCfg()).seeds, seeds.seeds)
     assert.equal(new Set(seeds.seeds).size, seeds.seeds.length)
@@ -733,7 +755,7 @@ test('register: 2-round TTL — expired entries are dropped, fresh ones are inje
   assert.ok(!fresh.pendingHigh.includes('target'))
 })
 
-test('queryBoost: a high-α memory evicted from the block is re-admitted when matched again', () => {
+test('queryBoost: a high-α memory evicted from the block is re-admitted when matched again (after the cooldown)', () => {
   const cfg = makeCfg()
   const index = buildRecallIndex([
     folder('target', 0.9, 1, ['needle']),
@@ -742,7 +764,9 @@ test('queryBoost: a high-α memory evicted from the block is re-admitted when ma
   const base = emptyLanes()
   const ledger = new Set(['target'])
   base.highRecycle = [{ id: 'target', round: 3 }]
-  const result = selectRecall(index, 'needle', { cfg, lanes: base, round: 4, ledger })
+  // B-04: G4 cooldown (15 rounds) must elapse before the queryBoost lane may
+  // re-inject the evicted memory (round 20 - round 3 = 17 >= 15).
+  const result = selectRecall(index, 'needle', { cfg, lanes: base, round: 20, ledger })
   const pick = result.picks.find((item) => item.id === 'target')
   assert.ok(pick, JSON.stringify(lanePickIds(result)))
   assert.equal(pick.lane, 'queryBoost')
@@ -753,9 +777,33 @@ test('queryBoost: a high-α memory evicted from the block is re-admitted when ma
   const offCfg = makeCfg({ recall: { fairness: { queryBoost: false } } })
   const offLanes = emptyLanes()
   offLanes.highRecycle = [{ id: 'target', round: 3 }]
-  const offResult = selectRecall(index, 'needle', { cfg: offCfg, lanes: offLanes, round: 4, ledger: new Set(['target']) })
+  const offResult = selectRecall(index, 'needle', { cfg: offCfg, lanes: offLanes, round: 20, ledger: new Set(['target']) })
   assert.ok(!lanePickIds(offResult).includes('target'))
   assert.equal(offResult.stats.reInjections, 0)
+})
+
+test('B-04 G4: queryBoost honours the recycle cooldown (gap < cooldownRounds is not re-injected)', () => {
+  const cooldown = 15
+  const cfg = makeCfg({ recall: { fairness: { recycle: { cooldownRounds: cooldown, maxPerRound: 1 } } } })
+  const index = buildRecallIndex([folder('target', 0.9, 1, ['needle']), folder('other', 0.5, 2, ['needle'])], cfg)
+  const ledger = new Set(['target'])
+  for (const round of [4, 10, 17]) {
+    const lanes = emptyLanes()
+    lanes.highRecycle = [{ id: 'target', round: 3 }]
+    const result = selectRecall(index, 'needle', { cfg, lanes, round, ledger })
+    assert.ok(
+      !lanePickIds(result).includes('target'),
+      `round ${round}: gap ${round - 3} < cooldown ${cooldown} must keep the item queued (picks=${JSON.stringify(lanePickIds(result))})`,
+    )
+    assert.deepEqual(lanes.highRecycle, [{ id: 'target', round: 3 }], 'the unripe item stays in highRecycle')
+    assert.equal(result.stats.reInjections, 0)
+  }
+  // Gap exactly `cooldown` re-admits (round 18 - round 3 = 15).
+  const lanes = emptyLanes()
+  lanes.highRecycle = [{ id: 'target', round: 3 }]
+  const ripe = selectRecall(index, 'needle', { cfg, lanes, round: 3 + cooldown, ledger })
+  assert.ok(lanePickIds(ripe).includes('target'), JSON.stringify(lanePickIds(ripe)))
+  assert.equal(ripe.stats.reInjections, 1)
 })
 
 test('recycle: evicted low-α memory returns only after the cooldown', () => {
@@ -1327,11 +1375,14 @@ test("exact matchMode: seeds use token equality and selection stays consistent",
   ]
   const index = buildRecallIndex(folders, cfg)
   assert.equal(index.matchMode, 'exact')
-  // token equality only: the 4-char phrase is not produced by tokenize's exact mode
+  // Direction 1 in exact mode is token equality only (the 4-char phrase is not a
+  // token of the text). B-02 (1.4.1) additionally wires direction 2 (a user token
+  // inside a multi-token folder keyword) into every matchMode, so the two
+  // multi-token CJK keywords are seeded as well.
   const seeds = querySeeds(index, '接口网关 docker 接口网关 8080', cfg).seeds
-  assert.deepEqual(seeds, ['docker'])
-  assert.deepEqual(selectSigma(index, seeds, { k: 10 }).picked.map((item) => item.id), ['c'])
-  assert.equal(countCandidates(index, seeds), 1)
+  assert.deepEqual(seeds, ['docker', '接口网关', '接口网关 8080'])
+  assert.deepEqual(selectSigma(index, seeds, { k: 10 }).picked.map((item) => item.id), ['a', 'b', 'c'])
+  assert.equal(countCandidates(index, seeds), 3)
 })
 
 test('trimBlock: maxWindowPercent (windowTokens) also caps the block chars', () => {
@@ -1369,18 +1420,24 @@ test('register + timeIds: a deferred memory outside the window is kept, not drop
 
 test('queryBoost: unmatched evicted high-α entries stay in the pool for later rounds', () => {
   const cfg = makeCfg()
-  // Make the keyword common (posting > τ) so rareHigh cannot pre-empt queryBoost.
+  // Make the keyword common (posting > τ) so rareHigh cannot pre-empt queryBoost;
+  // the fillers have a *higher* σ than the recycled target so the σ-hi lane can
+  // never pick it before the queryBoost lane is allowed to (k=1).
   const folders = [folder('target', 0.9, 1, ['deploy_keyword'])]
-  for (let at = 0; at < 12; at += 1) folders.push(folder(`filler${at}`, 0.1, 10 + at, ['deploy_keyword']))
+  for (let at = 0; at < 12; at += 1) folders.push(folder(`filler${at}`, 0.95, 10 + at, ['deploy_keyword']))
   const index = buildRecallIndex(folders, cfg)
   const lanes = emptyLanes()
   lanes.highRecycle = [{ id: 'target', round: 1 }]
-  const miss = selectRecall(index, 'unrelated text', { cfg, lanes, round: 2, ledger: new Set() })
+  const miss = selectRecall(index, 'unrelated text', { cfg, lanes, round: 2, ledger: new Set(), k: 1 })
   assert.ok(!lanePickIds(miss).includes('target'))
   assert.deepEqual(lanes.highRecycle, [{ id: 'target', round: 1 }])
-  const hit = selectRecall(index, 'deploy_keyword', { cfg, lanes, round: 3, ledger: new Set() })
+  // B-04 (1.4.1): the high-α item is re-admitted only after cooldownRounds=15.
+  const tooEarly = selectRecall(index, 'deploy_keyword', { cfg, lanes, round: 3, ledger: new Set(), k: 1 })
+  assert.ok(!lanePickIds(tooEarly).includes('target'), 'gap 2 < cooldown must keep it queued')
+  assert.deepEqual(lanes.highRecycle, [{ id: 'target', round: 1 }])
+  const hit = selectRecall(index, 'deploy_keyword', { cfg, lanes, round: 16, ledger: new Set(), k: 1 })
   const pick = hit.picks.find((item) => item.id === 'target')
-  assert.ok(pick)
+  assert.ok(pick, JSON.stringify(lanePickIds(hit)))
   assert.equal(pick.lane, 'queryBoost')
   assert.deepEqual(lanes.highRecycle, [])
 })

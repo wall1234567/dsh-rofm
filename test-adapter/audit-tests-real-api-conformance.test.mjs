@@ -351,6 +351,12 @@ function overridesFor(memoryDir, patch = {}) {
     keywords: { min: 3, max: 8 },
     storage: { dir: memoryDir, perSession: false },
     logging: { enabled: true, verbose: true },
+    // v1.4.2: QQ compat can register one extra tool (`memory_group_recall`) and
+    // one extra `session/event` listener. This suite pins the plain (no-QQ)
+    // adapter shape, so force compat off — exactly like plugin-mock.test.mjs —
+    // instead of letting a developer machine's real DSH profile change the
+    // expected tool count. Compat itself is covered by compat-*.test.mjs.
+    compat: { qqBots: 'off' },
     ...patch,
   }
 }

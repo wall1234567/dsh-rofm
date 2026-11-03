@@ -245,6 +245,64 @@ function dayStartInstant(ms, timeZone) {
   return instant
 }
 
+/**
+ * First existing instant of the local civil day `{year, month, day}` — the
+ * "zoned day boundary" primitive (C-01, 1.4.1).
+ *
+ * `instantForCivil(00:00)` alone is wrong when 00:00 does not exist (DST jump at
+ * midnight: America/Santiago, America/Havana, America/Asuncion, Asia/Beirut, …):
+ * it resolves to the previous wall time (e.g. the day before 23:00) and the
+ * computed window then covers the wrong day. Here the target day is matched by
+ * civil date, so the result is the first instant that really belongs to it
+ * (e.g. 01:00 local when 00:00 was skipped). A whole skipped civil day
+ * (Pacific/Apia 2011-12-30) resolves to the first instant after the gap.
+ *
+ * @param {{year:number, month:number, day:number}} civil
+ * @param {string} timeZone
+ * @returns {number} epoch ms (NaN for a non-finite target)
+ */
+function zonedCivilDayStart(civil, timeZone) {
+  const target = { year: civil.year, month: civil.month, day: civil.day }
+  const fakeMidnight = utcFromCivil(target)
+  if (!Number.isFinite(fakeMidnight)) return NaN
+  const dayIndex = civilDayIndex(target)
+  // Start from a rough local-midnight candidate, then walk by minutes until the
+  // civil date matches (a DST jump is at most a few hours).
+  let instant = fakeMidnight - offsetAt(fakeMidnight, timeZone)
+  let guard = 0
+  while (guard < 2880 && dayIndexOf(instant, timeZone) < dayIndex) {
+    instant += 60000
+    guard += 1
+  }
+  while (guard < 5760 && dayIndexOf(instant, timeZone) > dayIndex) {
+    instant -= 60000
+    guard += 1
+  }
+  if (dayIndexOf(instant, timeZone) !== dayIndex) {
+    // Whole civil day skipped: the nearest existing instant is the first one
+    // after the gap.
+    while (guard < 8640 && dayIndexOf(instant, timeZone) < dayIndex) {
+      instant += 60000
+      guard += 1
+    }
+    return instant
+  }
+  // Walk back to the first existing instant of the day (handles ambiguous /
+  // repeated midnight after a fall-back transition).
+  for (let step = 0; step < 180; step += 1) {
+    if (dayIndexOf(instant - 60000, timeZone) !== dayIndex) break
+    instant -= 60000
+  }
+  return instant
+}
+
+/** First instant of the *next* local calendar day (zoned day end). */
+function nextZonedDayStart(ms, timeZone) {
+  const index = dayIndexOf(ms, timeZone)
+  if (!Number.isFinite(index)) return NaN
+  return zonedCivilDayStart(civilFromDayIndex(index + 1), timeZone)
+}
+
 /** First instant of the local calendar month containing `ms`. */
 function monthStartInstant(ms, timeZone) {
   const civil = civilAt(ms, timeZone)
@@ -1092,7 +1150,10 @@ function resolveQueryEndpoint(value, requestedUnit, timezone) {
       end = addZonedMonths(start, 12, timezone)
     } else {
       start = dayStartInstant(instant, timezone)
-      end = addZonedDays(start, 1, timezone)
+      // C-01: the day *end* must be the next zoned day boundary, not
+      // "start + 1 day wall clock" (which drifts by 1h when 00:00 is skipped).
+      end = nextZonedDayStart(start, timezone)
+      if (!(end > start)) end = addZonedDays(start, 1, timezone)
     }
     return { kind, unit, start, end }
   }
@@ -1106,8 +1167,9 @@ function resolveQueryEndpoint(value, requestedUnit, timezone) {
     const start = instantForCivil({ year: parsed.year, month: 1, day: 1 }, timezone)
     return { kind, unit: 'year', start, end: addZonedMonths(start, 12, timezone) }
   }
-  const start = instantForCivil({ year: parsed.year, month: parsed.month, day: parsed.day }, timezone)
-  return { kind, unit: 'day', start, end: addZonedDays(start, 1, timezone) }
+  // C-01: zoned day boundary = the first instant that exists on that civil day.
+  const start = zonedCivilDayStart({ year: parsed.year, month: parsed.month, day: parsed.day }, timezone)
+  return { kind, unit: 'day', start, end: nextZonedDayStart(start, timezone) }
 }
 
 /** Number of local calendar days the half-open window `[from, to)` covers. */
@@ -1141,6 +1203,37 @@ function clampSingleUnitFuture(window, nowMs, warnings) {
   warnings.push('timeQuery: future time clamped to now')
   window.from = nowMs
   window.to = nowMs
+}
+
+/**
+ * C-06 (1.4.1): defensive warnings for numeric time inputs that are probably not
+ * epoch *milliseconds* — a compact `YYYYMMDD` date (`20261102`) or a 10-digit
+ * seconds timestamp (`1793446567`). Both used to be silently interpreted as
+ * 1970-01-xx epoch ms with only the generic "no granularity" hint. Warning only:
+ * the parsing semantics are unchanged (the docs say "epoch milliseconds").
+ */
+function epochShapeHint(value, label, warnings) {
+  const raw = typeof value === 'number' ? String(value) : typeof value === 'string' ? value.trim() : ''
+  if (!NUMBER_SHAPE_RE.test(raw)) return
+  const text = raw.replace(/^[+-]/, '')
+  if (/^\d{8}$/.test(text)) {
+    const year = Number(text.slice(0, 4))
+    const month = Number(text.slice(4, 6))
+    const day = Number(text.slice(6, 8))
+    if (year >= 1900 && year <= 2999 && month >= 1 && month <= 12 && day >= 1 && isValidCalendarDate(year, month, day)) {
+      warnings.push(
+        `timeQuery.${label}: ${JSON.stringify(value)} looks like YYYYMMDD; use "YYYY-MM-DD" for a calendar day ` +
+          '(numeric input is interpreted as epoch milliseconds)',
+      )
+      return
+    }
+  }
+  if (/^\d{9,11}$/.test(text) && Number(text) < 1e11) {
+    warnings.push(
+      `timeQuery.${label}: ${JSON.stringify(value)} looks like a seconds timestamp; numeric input is interpreted as ` +
+        'epoch milliseconds (multiply by 1000 for seconds)',
+    )
+  }
 }
 
 function resolveNow(input, now) {
@@ -1217,6 +1310,9 @@ export function normalizeTimeQuery(input, cfg, now) {
     warnings.push('timeQuery: no timeFrom/timeTo supplied; time constraint disabled')
     return result
   }
+  // C-06: try to catch the two common "this is not epoch ms" mistakes.
+  if (hasFrom && detectGranularity(input.timeFrom) === 'epoch') epochShapeHint(input.timeFrom, 'timeFrom', warnings)
+  if (hasTo && detectGranularity(input.timeTo) === 'epoch') epochShapeHint(input.timeTo, 'timeTo', warnings)
   const fromEndpoint = hasFrom ? resolveQueryEndpoint(input.timeFrom, requestedUnit, timezone) : null
   const toEndpoint = hasTo ? resolveQueryEndpoint(input.timeTo, requestedUnit, timezone) : null
   if (hasFrom && !fromEndpoint) warnings.push(`timeQuery.timeFrom: cannot parse ${describeValue(input.timeFrom)}; ignored`)
@@ -1245,7 +1341,11 @@ export function normalizeTimeQuery(input, cfg, now) {
       // An epoch without granularity carries no usable window width: fall back
       // to the configured minimum range (days) starting at that local day.
       from = dayStartInstant(endpoint.start, timezone)
-      to = addZonedDays(from, timeConfig.minRangeDays, timezone)
+      const fromIndex = dayIndexOf(from, timezone)
+      to = Number.isFinite(fromIndex)
+        ? zonedCivilDayStart(civilFromDayIndex(fromIndex + timeConfig.minRangeDays), timezone)
+        : addZonedDays(from, timeConfig.minRangeDays, timezone)
+      if (!(to > from)) to = addZonedDays(from, timeConfig.minRangeDays, timezone)
       level = 'day'
       warnings.push(`timeQuery: epoch input without granularity; using a ${timeConfig.minRangeDays}-day window`)
     }

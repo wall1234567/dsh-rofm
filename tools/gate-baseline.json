@@ -1,0 +1,11 @@
+{
+  "version": "1.4.2",
+  "updatedFor": "dsh-rofm 1.4.2 release gate",
+  "minFullSuiteTests": 1039,
+  "maxFullSuiteSkipped": 4,
+  "minE2eAdapterTests": 12,
+  "maxE2eAdapterSkipped": 0,
+  "minE2eRealDataTests": 8,
+  "maxE2eRealDataSkipped": 0,
+  "_update": "Run `node --test`; set minFullSuiteTests to the reported `tests` count whenever tests are added or removed (keep the e2e minimums in sync too). The gate fails below the recorded floor and below 98% of the statically scanned test declarations, so a deleted test file cannot stay green."
+}

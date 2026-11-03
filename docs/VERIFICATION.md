@@ -12,8 +12,9 @@
 > **v1.2.0 的当前行为与验证数字以 §17 为准**（§1 的数字已同步到 v1.2.0）。
 > **v1.3.0 的跨平台验证与当前测试数字见 §19**；§1/§17/§18 的数字是 v1.2.x 的历史记录，
 > 不再代表当前版本（数字统一以 `npm test` 实测为准，不在文档里写死）。
-> **v1.4.0 的验证记录见 §20**：确定性召回/公平性、时间辅助、小窗口、数据时代、兼容与性能；
-> 该节数字为 2026-11-01 23:10 本机实测（并行收尾期可能漂移，最终门禁数字由 Lead 冻结）。
+> **v1.4.0 的验证记录见 §20**（确定性召回/公平性、时间辅助、小窗口、数据时代、兼容与性能）——
+> §20/§21 是 **v1.4.0 的历史记录**（2026-11-01/02 实测，数字已过时，仅作历史留档）。
+> **当前版本 v1.4.1 的最终验证记录见 §22**（2026-11-02 实测，含全量测试/门禁/自检/e2e/数据快照）。
 
 ## 1. 自动化测试
 
@@ -938,10 +939,11 @@ macOS 专项处理：APFS 大小写不敏感由 **`realpath` 归一化**吸收�
   但跨平台手工拷贝/改名可能产生重复项；
 - 内存/磁盘性能与 locale 无关，但 CI runner 与真实 DSH 桌面环境的性能差异仍可能存在。
 
-## 20. v1.4.0 验证记录（2026-11-01）
+## 20. v1.4.0 验证记录（2026-11-01，历史留档）
 
-> **口径说明**：本节是 **v1.4.0 发布验证记录**（环境：Windows 11、Node v24.21.0、DSH 自带运行时、
-> 仓库 `<home>\Desktop\dsh-rofm`；真实库 21 个 store / 3742 folders）。数字为 2026-11-01 收尾实测；
+> **本节是 v1.4.0 发布时的验证记录（历史留档，数字已过时）**；当前版本 v1.4.1 的最终记录见 §22。
+> 环境：Windows 11、Node v24.21.0、DSH 自带运行时、
+> 仓库 `<repo>`；真实库 21 个 store / 3742 folders）。数字为 2026-11-01 收尾实测；
 > 一键门禁 `node tools/verify-1.4.0.mjs` 是最终可复现的发布口径（8 步全部 exit 0 才算 PASS）。
 > 所有对真实 `memory/` 的操作**只读**，写盘测试全部使用 `os.tmpdir()` 临时目录。
 >
@@ -959,12 +961,14 @@ macOS 专项处理：APFS 大小写不敏感由 **`realpath` 归一化**吸收�
 | 4 | `node engine/cli.mjs --help` | exit 0 | ~0.1 s |
 | 5 | `node tools/memory-audit.mjs --json` | exit 0（真实库只读；四套口径见 §20.5） | ~0.1 s |
 | 6 | `node tools/time-view.mjs --help` | exit 0（只读时间视图） | ~0.1 s |
-| 7 | `node --test test/e2e-adapter-simulate.test.mjs` | **8 tests / 8 pass / 0 fail** | ~4 s |
-| 8 | `node --test test/e2e-real-data-readonly.test.mjs` | **6 tests / 6 pass / 0 fail** | ~5–8 s |
+| 7 | `node --test test/e2e-adapter-simulate.test.mjs` | **12 tests / 12 pass / 0 fail**（v1.4.1；1.4.0 时为 8） | ~4 s |
+| 8 | `node --test test/e2e-real-data-readonly.test.mjs` | **8 tests / 8 pass / 0 fail**（v1.4.1 夹具版；1.4.0 时为 6） | ~2–8 s |
 | — | `node --test test/release.test.mjs test/config-consistency.test.mjs` | 30 / 30 pass（release 段存在性 + 配置/版本一致性） | <1 s |
 
-**一键门禁**：`node tools/verify-1.4.0.mjs`（= `npm run verify`）→ **8/8 PASS**，汇总
-`node:test cases 850 / 848 pass / 0 fail`，`RESULT: PASS`，exit 0。
+**一键门禁**：`node tools/verify-1.4.0.mjs`（= `npm run verify`）→ **8/8 PASS**，`RESULT: PASS`，exit 0。
+> 历史注记：本行在 1.4.0 收尾稿里曾把门禁汇总写成 `850 / 848 pass`（更早文案残留），
+> 与同节 916/935 的数字冲突；v1.4.1 起门禁只打印 **unique** 用例数与 summed 数（见 §22），
+> 不再出现该口径。
 `npm run check` 是等价展开：`node --test` + simulate + selfcheck + cli --help + memory-audit --json +
 time-view --help（不含 e2e，e2e 由 verify 覆盖）。CI 另在 Linux/Windows/macOS × Node 20/22/24 上跑矩阵
 （见 §19.2；v1.4.0 未改动 CI 结构）。
@@ -1003,7 +1007,7 @@ v1.4.0 新增/扩展测试文件（当前用例数，`node --test <file>` 实测
   adapter 级 `60 rounds of picks are identical across a plugin restart (recall-state v3 round-trip)` 通过。
 - **block 高α占比 ≥0.85**：v1.4.0 优先级裁剪保证“block 里同时有低α时绝不裁高α”（`G3` 用例断言
   `G3: block trim evicts low α first (60 low + 10 high, trim 4 => 4 low)`）；设计阶段仿真
-  （`<workspace>\output\rofm-recall-fairness\fairness-results.json`，非本轮重跑）的 FAIR-DRI block
+  （`D:\workspace\output\rofm-recall-fairness\fairness-results.json`，非本轮重跑）的 FAIR-DRI block
   高α占比为 **86–97%**（≥0.85 门槛满足），v1.3.0 legacy 约 **22%**；同一仿真里高α“被查询到即首轮可见”
   FAIR-DRI **100%/100%**、legacy **13%/29%**、纯 DRI+sticky ledger **18–43%**（说明 sticky ledger
   单独使用会把“block 被裁”变成永久遗忘，这正是 1.4.0 必须配查询重入/寄存器的原因）。
@@ -1086,8 +1090,9 @@ v1.4.0 新增/扩展测试文件（当前用例数，`node --test <file>` 实测
 
 ### 20.5 数据时代 / 遗留数据验证（口径 A–D）
 
-`node tools/memory-audit.mjs --json`（真实库只读，2026-11-01 收尾实测）与
-`node tools/selfcheck.mjs` / `node tools/recall-report.mjs --json` **三方输出一致**：
+`node tools/memory-audit.mjs --json`（真实库只读，**2026-11-01 历史快照**；2026-11-02 清理测试/压测数据后
+当前真实库为 3 stores / 1264 folders / 2 pending = 0.16%，见 §22）与
+`node tools/selfcheck.mjs` / `node tools/recall-report.mjs --json` **三方输出一致**（下列数字为历史快照）：
 
 ```json
 { "totals": { "folders": 3742, "scored": 973, "pending": 2769, "pendingPercent": 74, "currentPendingPercent": 0.54 },
@@ -1186,7 +1191,7 @@ v1.4.0 新增/扩展测试文件（当前用例数，`node --test <file>` 实测
   onebot / Derpyu 的真机回合（含群成员门控 + 图片归档）沿用 v1.3.0 的验证结论（§19）；
 - **e2e 长会话是 fake host 模拟**（`test/e2e-adapter-simulate.test.mjs`，720 消息上跑真实 adapter 路径），
   不是真人 700 turn 会话；真实宿主时序差异仍可能暴露未模拟的边界；
-- **公平性仿真的 legacy/DRI 对比数字来自设计阶段工件**（`<workspace>\output\rofm-recall-fairness`），
+- **公平性仿真的 legacy/DRI 对比数字来自设计阶段工件**（`D:\workspace\output\rofm-recall-fairness`），
   不是 1.4.0 发布前在本机重跑的；本机验证的是公平性**性质**（G1–G5 用例）与遥测；
 - **时间数据**：旧库 0 个 event 字段，1.4.0 之前的历史记忆按“归档时刻”近似事件时间；
   新归档开始才有真实事件区间（本机现有会话尚未产生 1.4.0 归档样本）；
@@ -1202,11 +1207,10 @@ v1.4.0 新增/扩展测试文件（当前用例数，`node --test <file>` 实测
   **§21 为「事件约束」增补验证**（最终 916 / 914 pass / 2 skip，门禁 935 / 933）；
   发布门禁以 `node tools/verify-1.4.0.mjs` 输出为准。
 
-## 21. 1.4.0 增补：事件约束验证记录（2026-11-02）
+## 21. 1.4.0 增补：事件约束验证记录（2026-11-02，历史留档；该增补随 1.4.1 发布）
 
-> **口径说明**：本节是 v1.4.0 **未发布增补「事件约束」**的验证记录（版本号仍为 1.4.0）。
-> 数字为收尾实测；`node --test` 全量在 Lead 最终门禁前仍可能新增用例（收尾前快照
-> **916 tests / 914 pass / 0 fail / 2 skip**），门禁结论 **0 fail**。
+> **口径说明**：本节是「事件约束」增补的验证记录（随 **1.4.1** 发布；1.4.0 tag 不含该增补）。
+> 数字为 v1.4.0 时代的历史快照（`node --test` 916 / 914 pass / 2 skip），**已被 §22 取代**。
 > 环境同 §20：Windows 11 / Node v24.21.0；真实 `memory/` 全程只读。
 
 ### 21.1 测试与门禁
@@ -1290,4 +1294,155 @@ CJK bigram + CJK 单字），`≥ event.similarity.threshold=0.72` 视为“双�
   （`memory_recall` / CLI `--event`）。
 - CLI `--event` 有 200 字符长度上限（超长报参数错误）；工具侧超长同样按参数错误处理。
 - 与时间约束一致：事件约束只作用于第一代候选，`hops` 后代沿用同一约束集。
+
+## 22. v1.4.1 验证记录（2026-11-02，历史留档；当前版本记录见 §23）
+
+> **环境**：Windows 11、Node v24.21.0（DSH 自带运行时）、仓库 `<repo>`。
+> 所有写盘测试用 `os.tmpdir()`；真实 `memory/` 在验证期间只读（清理测试/压测数据由 cleanup-data 单独执行，
+> 隔离目录 `<out>/quarantine-memory/` 可恢复）。
+> 本节数字均来自本机同一次收尾运行；命令可直接复跑。
+
+### 22.1 最终数字（2026-11-02）
+
+| 项 | 实测值 | 命令 |
+|---|---|---|
+| 全量测试 | **1039 tests / 1037 pass / 0 fail / 2 skip**（2 skip = Node zstd 平台条件跳过） | `node --test` |
+| 一键门禁 | **8/8 PASS**，`RESULT: PASS`，exit 0；**1039 unique（1059 summed with e2e re-runs）** node:test 用例；baseline recorded 1039 / static 999 / effective 1005 | `node tools/verify-1.4.0.mjs` |
+| 门禁分步 | unit 998（~55–78s）/ simulate PASS / selfcheck PASS / cli-help PASS / memory-audit PASS / time-view PASS / e2e-adapter **12/12** / e2e-real-data（夹具）**8/8** | 同上 |
+| 自检 | **10 passed / 2 warnings / 0 failed**（检测到两个 QQ 插件，12 条 check 行；2 WARN = 历史会话日志遗留注记 + recall fairness 的 degraded 观测） | `node tools/selfcheck.mjs` |
+| 模拟 | PASS（`context added back 81.89 %`、`chars added back 7083`；legacy 回归口径） | `node test/simulate.mjs` |
+| e2e | adapter **12/12**；real-data 夹具 **8/8**（`test/fixtures/memory-snapshot/**`，<300KB） | `node --test test/e2e-*.test.mjs` |
+
+### 22.2 真实数据快照（2026-11-02，清理测试/压测数据后）
+
+| 指标 | 值 | 来源 |
+|---|---|---|
+| stores | **3**（`session-7bc15160` / `session-b5eeee7e` / `qqb-g-1134030529`） | `node tools/selfcheck.mjs` |
+| folders | **1264**（index 与磁盘一致；1262 scored / **2 pending = 0.16%**） | 同上 |
+| 时代分桶 | legacy 0 / synthetic 0 / current 1264（历史快照 legacy 587 / synthetic 2180 已隔离） | `node tools/memory-audit.mjs --json` |
+| 事件标签 | **565/1264** folder 带标签，1 个去重事件（`rofm 1.4.0 开发`） | `node tools/selfcheck.mjs` |
+| 时间索引 | 3 stores / 1264 folders / 50 条交叉核对；mode=constrain, timezone=Asia/Shanghai | 同上 |
+| 图片 / stats | 0 archived image(s)；124 stats line(s) | 同上 |
+
+> 历史快照（仅作“清理前”参考，**不要当当前口径**）：2026-11-01 文档快照 3742 folders / 2769 pending /
+> 74.0% / 2/369 = 0.54%；清理前最终大盘 22 stores / 4637 folders / 2769 pending / 59.7% / current 2/1264 = 0.16%。
+
+### 22.3 修复验证矩阵（要点）
+
+- **P0/P1 全部修复且审计 PoC 复跑不再复现**：A-01（plan 幂等键/正文守恒）、A-02（崩溃恢复）、
+  E-01（9 位 chatKey 跨会话）、E-02（autopatch 写坏文件）、E-03（passive 水位）、B-01（分页）、
+  B-02（双向匹配）、A-03（守恒断言）、A-04（空 system note 合并）——修复前 FAIL → 修复后 PASS 的
+  回归测试见 `test/compress-transaction-recovery.test.mjs`、`test/recall-1.4.1-regressions.test.mjs`、
+  `test/time-index-1.4.1-regressions.test.mjs`、`test/compress-floor-guard.test.mjs`、
+  `test-adapter/scoped-config-idempotent.test.mjs` 等。
+- **门禁负向证明**：测试数下限由 `tools/gate-baseline.json` 维护（记录值：全量 1039 / 最多 skip 4 /
+  e2e 12/8；有效下限 = max(记录值, 静态扫描用例数×98%)；基线缺失或损坏直接 FAIL；
+  **新增/删除测试必须同步更新基线**）。反证通过：删掉一个 53-test 文件 → FAIL（expected ≥1039, got 937）；
+  e2e 全部 skip → FAIL；伪造失败 → FAIL；TAP reporter 输出可解析；resume 版本校验覆盖。
+- **scopedConfig 幂等**：现场嵌套目录 `memory/sessions/session-7bc15160.../sessions/session-7bc15160.../`
+  已隔离到 `quarantine-stray-nested-20261102-235448/`（未删除；旧目录可删/忽略，无需迁移）。
+- **版本**：`package.json` / `engine/package.json` = **1.4.1**；`test/config-consistency.test.mjs` 版本无关，
+  升版后 `node --test` 仍 0 fail。
+
+### 22.4 复跑命令
+
+```bash
+export PATH="/c/Users/user/.dsh/dsh-runtimes/dsh-primary-runtime/dependencies/node/bin:$PATH"
+cd /c/Users/user/Desktop/dsh-rofm
+node --test
+node tools/verify-1.4.0.mjs
+node tools/selfcheck.mjs
+node test/simulate.mjs
+node --test test/e2e-adapter-simulate.test.mjs
+node --test test/e2e-real-data-readonly.test.mjs
+node tools/memory-audit.mjs --json
+```
+
+## 23. v1.4.2 验证记录（2026-11-03，当前版本）
+
+> **环境**：Windows 11、Node v24.21.0（DSH 自带运行时）、仓库 `<repo>`。
+> 所有写盘测试使用 `os.tmpdir()`；真实 `memory/` 在验证期间只读。
+> 本节数字来自实现 + 测试 + 文档全部 landed 后的最终收尾运行；命令可直接复跑。
+> §22 保留为 1.4.1 历史记录（1005 tests），其 1.4.1 段落、类别词保证与隐私/config.local 内容不变。
+
+### 23.1 最终数字（2026-11-03）
+
+| 项 | 实测值 | 命令 |
+|---|---|---|
+| 全量测试 | **1026 tests / 1024 pass / 0 fail / 2 skip**（2 skip = Node zstd 平台条件跳过） | `node --test` |
+| 新增用例 | **20 例**（`test-adapter/cross-chat-tool.test.mjs`） | `node --test test-adapter/cross-chat-tool.test.mjs` |
+| 一键门禁 | **8/8 PASS**，`RESULT: PASS`，exit 0；**1026 unique（1046 summed with e2e re-runs）** node:test 用例；**1024 pass / 2 skip / 0 fail**；baseline recorded **1026** / static **1020** / effective floor **1026** | `node tools/verify-1.4.0.mjs` |
+| 门禁分步 | unit-tests **1026**（38.2s，机器负载不同）/ simulate PASS / selfcheck PASS / cli-help PASS / memory-audit PASS / time-view PASS / e2e-adapter **12/12** / e2e-real-data（夹具）**8/8** | 同上 |
+| 自检 | **10 passed / 2 warnings / 0 failed**（检测到两个 QQ 插件；2 WARN = 历史会话日志遗留注记 + recall fairness 的 degraded 观测，与 1.4.1 口径一致；autopatch 行显示 4 个工具名均已放行） | `node tools/selfcheck.mjs` |
+| 模拟 | PASS（`context added back 81.89 %`、`chars added back 7083`；legacy 回归口径） | `node test/simulate.mjs` |
+| 基线 | `tools/gate-baseline.json`：`minFullSuiteTests` **1005 → 1026**；`maxFullSuiteSkipped` 4、e2e-adapter 12 / e2e-real-data 8 不变 | — |
+
+门禁原始输出要点（本机实测，exit 0）：
+
+```text
+[PASS] privacy — tracked config has no machine-local values
+[PASS] node --test (full suite) (1026 tests / 1024 pass / 0 fail / 2 skip)
+[PASS] node test/simulate.mjs
+...
+[PASS] node --test test/e2e-adapter-simulate.test.mjs (12 tests / 12 pass / 0 fail / 0 skip)
+[PASS] node --test test/e2e-real-data-readonly.test.mjs (8 tests / 8 pass / 0 fail / 0 skip)
+baseline: recorded 1026, static 1020 declared -> full-suite floor 1026 (update tools/gate-baseline.json when tests change)
+steps: 8/8 PASS · node:test cases: 1026 unique (1046 summed with e2e re-runs) / 1024 pass / 0 fail / 2 skip
+RESULT: PASS
+```
+
+新增的 20 例覆盖：tool definition/schema、私聊主人命中群聊、私聊+WebUI 诱饵零泄漏、未评分 folder
+不可见、群聊/非主人/`ownerIds:[]`/WebUI/子代理拒绝（且授权先于 IO）、`listGroups`、`group` 过滤、
+`limit`/`offset` 分页、`timeFrom/timeTo`（epoch/date-only/非法输入）、路径穿越/注入、只读（hash/mtime）、
+`compat.crossChat` 默认值与 clamp、注册门控（compat off / `crossChat.enabled=false` / 有 `tools` service）。
+
+### 23.2 安全矩阵（新工具 `memory_group_recall`）
+
+数据来自 `test-adapter/cross-chat-tool.test.mjs`（20 例）+ 独立 verify 与红队复核（本次发布工作区的
+`verify/verification.md`、`security-review.md`，均 PASS）。
+
+| 场景 | 预期 | 结果 |
+|---|---|---|
+| `onebot-private-<owner>` 查询群聊记忆 | 允许；结果带来源群号/α/标题/片段；不含私聊/WebUI 诱饵 | PASS |
+| `qqb-p-<owner>`（Derpyu 私聊主人） | 允许 | PASS |
+| `onebot-group-*` 群聊会话调用 | 拒绝、不返回任何数据 | PASS |
+| `qqb-g-*` 群聊会话调用 | 拒绝 | PASS |
+| 非主人私聊（如 `onebot-private-888`） | 拒绝 | PASS |
+| `compat.ownerIds: []` | 拒绝并提示写 `config.local.json`（fail-closed） | PASS |
+| WebUI（`session-*`）/ 子代理 / 无 session | 拒绝；`memoryDir` getter 证明**授权前不读 store** | PASS |
+| 诱饵：私聊 store / WebUI store 放同关键词记忆 | 结构化结果与 render 文本中都不出现；`scored:false` 不可见 | PASS |
+| 路径穿越/注入：`group:'../../x'` / `'..\\..'` / 控制字符 query | 不抛未处理异常、不读越界、不泄漏路径 | PASS |
+| 只读 | 执行前后群 store 所有文件 hash/mtime 不变、无新文件产生 | PASS |
+| 时间过滤（`timeFrom/timeTo`）与非法时间 | 正常过滤（`eventStart ?? createdAt`）；非法输入 warning 不崩 | PASS |
+| `listGroups` / `group` 过滤 / `limit`+`offset` clamp 与分页 | 只列群、只匹配指定群（群号/chatKey/轮换会话 id）、分页提示正确 | PASS |
+| 注册门控 | `compat.qqBots='off'` 与 `crossChat.enabled=false` 不注册（仍 3 工具）；compat 启用时 4 工具且端到端可用；缺 `tools` service 静默降级 | PASS |
+| `compat.crossChat` 配置 | 默认值、clamp（maxResults 1..20 / snippet 80..2000 / maxGroups 1..500 / maxFolders 1..100000）、`ownerOnly=false` 泄漏 warning | PASS |
+| tool definition | parameters 为严格 object schema（`additionalProperties:false`、全部可选）、output schema + render、`timeoutMs: 10000`、`isConcurrencySafe` | PASS |
+
+### 23.3 配置 / 文档一致性
+
+- `package.json` / `engine/package.json` = **1.4.2**；`node --test test/config-consistency.test.mjs` **8/8 PASS**
+  （版本从 `package.json` 读取、要求 CHANGELOG 有非空 `[1.4.2]`、README §3 / SPEC §2 文档值与 engine 默认一致、
+  `PRODUCT_OVERRIDES` 仍只有 time/event 三个产品覆盖）。
+- `config.json` 增 `compat.crossChat` 示例块 + `_readme` 隐私边界说明；`compat.ownerIds` / `compat.mediaRoots`
+  仍为空（fail-closed），个人值走 gitignored `config.local.json`；`node tools/privacy-check.mjs` PASS。
+- `locale/zh.json` / `locale/en.json` 描述补 v1.4.2 能力一句；README/SPEC/CHANGELOG/VERIFICATION 无方向性
+  错误描述（不会声称群聊会话也能用、或会返回私聊/WebUI 记忆；grep 复核见 §23.4）。
+- `tools/gate-baseline.json` 的 `minFullSuiteTests` = **1026**，与最终 `node --test` 的 `tests` 数一致
+  （e2e 最小数 12/8 不变）；门禁输出 `baseline: recorded 1026, static 1020 declared -> full-suite floor 1026`。
+
+### 23.4 复跑命令
+
+```bash
+export PATH="<node-bin>:$PATH"   # 本机 Node bin 目录
+cd <repo>
+node --test
+node tools/verify-1.4.0.mjs
+node tools/selfcheck.mjs
+node test/simulate.mjs
+node --test test-adapter/cross-chat-tool.test.mjs
+node tools/privacy-check.mjs
+# 文档方向性错误描述复核（README/SPEC/CHANGELOG 应无输出；"不会返回私聊"等否定句不算）：
+grep -rn "群聊也可\|群聊也能查\|私聊数据会返回\|群聊会话也能用" README.md docs/SPEC.md CHANGELOG.md
+```
 

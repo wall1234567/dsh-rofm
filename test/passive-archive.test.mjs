@@ -183,6 +183,15 @@ function readWatermarkFile(memoryDir) {
   return JSON.parse(fs.readFileSync(path.join(memoryDir, '.passive-watermark.json'), 'utf8'))
 }
 
+/**
+ * Archived seqs of one DSH session from the v2 per-session watermark (E-03).
+ * `session-1` is the default id of {@link fakeSession}.
+ */
+function watermarkSeqs(memoryDir, sessionId = 'session-1') {
+  const watermark = readWatermarkFile(memoryDir)
+  return watermark.sessions?.[sessionId]?.archivedSeqs ?? []
+}
+
 // ---------------------------------------------------------------------------
 // extractShadowedMessages
 // ---------------------------------------------------------------------------
@@ -305,11 +314,11 @@ test('handle: archives the shadowed conversation into the scoped memory dir (heu
   assert.equal(archiveEvent.scoreMode, 'heuristic')
   assert.equal(archiveEvent.watermarkWritten, true)
 
-  // Watermark: exactly the archived message seqs.
+  // Watermark: exactly the archived message seqs of this session (v2 format).
   const watermark = readWatermarkFile(memoryDir)
-  assert.equal(watermark.version, 1)
-  assert.deepEqual(watermark.archivedSeqs, [1, 2])
-  assert.deepEqual(watermark.folderIds, [folderId])
+  assert.equal(watermark.version, 2)
+  assert.deepEqual(watermarkSeqs(memoryDir), [1, 2])
+  assert.deepEqual(watermark.sessions['session-1'].folderIds, [folderId])
   assert.ok(Number.isFinite(watermark.updatedAt))
   const leftovers = fs.readdirSync(memoryDir).filter((name) => name.endsWith('.tmp'))
   assert.deepEqual(leftovers, [], 'the watermark is written atomically (tmp + rename)')
@@ -355,7 +364,7 @@ test('handle: a partially overlapping event archives only the new messages', () 
   const folder = readFolder(memoryDir, second.folderIds[0])
   assert.equal(folder.messages.length, 2)
   assert.ok(folder.messages[0].content.includes('postgres'))
-  assert.deepEqual(readWatermarkFile(memoryDir).archivedSeqs, [1, 2, 4, 5])
+  assert.deepEqual(watermarkSeqs(memoryDir), [1, 2, 4, 5])
   assert.equal(loadIndex(memoryDir, cfg).folders.length, 2)
 })
 
@@ -425,13 +434,17 @@ test('handle: a corrupt watermark file degrades to empty and is repaired', () =>
 
   const result = new PassiveArchiver(host).handle(session, summary)
   assert.equal(result.archived, 2, 'corrupt watermark must not block archiving')
-  const watermark = readWatermarkFile(memoryDir)
-  assert.deepEqual(watermark.archivedSeqs, [1, 2], 'the repaired watermark is valid JSON')
+  assert.deepEqual(watermarkSeqs(memoryDir), [1, 2], 'the repaired watermark is valid JSON')
 
-  // A valid-but-messy watermark is normalized rather than trusted blindly.
+  // A valid-but-messy v2 watermark is normalized rather than trusted blindly.
   fs.writeFileSync(
     path.join(memoryDir, '.passive-watermark.json'),
-    JSON.stringify({ archivedSeqs: ['x', -1, 1, 1], folderIds: [null, 'mem-1'], updatedAt: 'soon' }),
+    JSON.stringify({
+      version: 2,
+      sessions: { 'session-1': { archivedSeqs: ['x', -1, 1, 1], folderIds: [null, 'mem-1'] } },
+      folderIds: [null, 'mem-1'],
+      updatedAt: 'soon',
+    }),
     'utf8',
   )
   // The messy entry `1` survives normalization, so only message 2 is new.
@@ -439,7 +452,7 @@ test('handle: a corrupt watermark file degrades to empty and is repaired', () =>
   const session2 = fakeSession(events2)
   const second = new PassiveArchiver(host).handle(session2, events2[events2.length - 1])
   assert.equal(second.archived, 1)
-  assert.deepEqual(readWatermarkFile(memoryDir).archivedSeqs, [1, 2], 'invalid entries are dropped, valid seqs kept')
+  assert.deepEqual(watermarkSeqs(memoryDir), [1, 2], 'invalid entries are dropped, valid seqs kept')
 })
 
 test('handle: storage.maxFolders is refused, not partially written', () => {
@@ -464,10 +477,10 @@ test('handle: storage.maxFolders is refused, not partially written', () => {
   assert.equal(second.reason, 'storage.maxFolders')
   assert.equal(second.skipped, 'storage.maxFolders')
   assert.equal(loadIndex(memoryDir, cfg).folders.length, 1, 'the cap is never exceeded')
-  assert.deepEqual(readWatermarkFile(memoryDir).archivedSeqs, [1, 2], 'a refused folder does not advance the watermark')
+  assert.deepEqual(watermarkSeqs(memoryDir), [1, 2], 'a refused folder does not advance the watermark')
 })
 
-test('handle: a rebuilt session with the same chat key shares the memory dir and watermark', () => {
+test('handle: a rebuilt session with the same chat key shares the memory dir but archives its own span (E-03)', () => {
   const { events, summary } = conversation()
   const base = tempDir()
   const cfg = loadConfig(undefined, {})
@@ -484,14 +497,50 @@ test('handle: a rebuilt session with the same chat key shares the memory dir and
   const sharedDir = path.join(base, 'qqb-g-42')
   assert.ok(fs.existsSync(path.join(sharedDir, '.passive-watermark.json')))
 
+  // Regression (E-03): the rebuilt session restarts its event seqs at 1, so the
+  // old session's watermark must NOT suppress its compaction — that used to lose
+  // the new session's shadowed conversation permanently (`skipped=already-archived`).
   const rebuilt = archiver.handle(sessionB, summary)
-  assert.equal(rebuilt.archived, 0, 'the rebuilt session reuses the same watermark')
-  assert.equal(rebuilt.skipped, 'already-archived')
-  assert.equal(loadIndex(sharedDir, cfg).folders.length, 1)
+  assert.equal(rebuilt.archived, 2, 'the rebuilt session archives its own 2 messages')
+  assert.equal(rebuilt.skipped, undefined)
+  assert.equal(loadIndex(sharedDir, cfg).folders.length, 2, 'the shared chat dir keeps both archives')
+  assert.deepEqual(watermarkSeqs(sharedDir, 'session-old'), [1, 2])
+  assert.deepEqual(watermarkSeqs(sharedDir, 'session-rebuilt'), [1, 2])
+
+  // Replaying the rebuilt session's own event is still a no-op.
+  const replay = archiver.handle(sessionB, summary)
+  assert.equal(replay.archived, 0)
+  assert.equal(replay.skipped, 'already-archived')
+  assert.equal(loadIndex(sharedDir, cfg).folders.length, 2, 'no duplicate folder on replay')
 
   const sessionC = { ...fakeSession(events), id: 'session-other', chatKey: 'qqb-g-43' }
   assert.equal(archiver.handle(sessionC, summary).archived, 2, 'another chat keeps its own memory dir')
   assert.equal(loadIndex(path.join(base, 'qqb-g-43'), cfg).folders.length, 1)
+})
+
+test('handle: a legacy v1 watermark cannot suppress a rebuilt session but still degrades safely', () => {
+  const { events, summary } = conversation()
+  const base = tempDir()
+  const cfg = loadConfig(undefined, {})
+  const { host } = fakeHost({
+    cfg,
+    memoryDirFor: (session) => path.join(base, session.chatKey),
+    chatKeyFor: (session) => session.chatKey,
+  })
+  const sharedDir = path.join(base, 'qqb-g-42')
+  fs.mkdirSync(sharedDir, { recursive: true })
+  // v1 format: one global seq list, no session id (cannot be attributed).
+  fs.writeFileSync(
+    path.join(sharedDir, '.passive-watermark.json'),
+    JSON.stringify({ version: 1, archivedSeqs: [1, 2], folderIds: ['mem-old'], updatedAt: 1 }),
+    'utf8',
+  )
+  const rebuilt = { ...fakeSession(events), id: 'session-rebuilt', chatKey: 'qqb-g-42' }
+  const result = new PassiveArchiver(host).handle(rebuilt, summary)
+  assert.equal(result.archived, 2, 'unattributable legacy seqs must not hide a rebuilt session')
+  const stored = readWatermarkFile(sharedDir)
+  assert.deepEqual(stored.sessions['session-rebuilt'].archivedSeqs, [1, 2])
+  assert.ok(stored.version >= 2)
 })
 
 test('handle: unsupported events and broken sessions/hosts never throw', () => {
@@ -556,5 +605,5 @@ test('handle: telemetry failure does not break archiving', () => {
   assert.equal(result.archived, 2)
   assert.equal(result.folderIds.length, 1)
   assert.equal(loadIndex(memoryDir, cfg).folders.length, 1)
-  assert.deepEqual(readWatermarkFile(memoryDir).archivedSeqs, [1, 2])
+  assert.deepEqual(watermarkSeqs(memoryDir), [1, 2])
 })

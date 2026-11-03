@@ -702,20 +702,30 @@ test(`long session (${LONG_TURNS} turns × 3 messages = ${LONG_TURNS * 3} messag
     assert.ok(folderIds.size > 0, `the judged store contains a folder with the rare keyword ${marker}`)
     // The rare-topic folder must be injected by the first query (same turn) or
     // the immediately following turn — plan §3.2.1 G1 "rare word high-α same round".
+    // v1.4.1 B-02 makes the matching bidirectional: the query marker's token may
+    // also match the *inside* of a multi-word folder keyword, so a high-α rare
+    // folder can legitimately be injected by an ordinary earlier message that
+    // merely mentions one token (e.g. 「端口」 for 「赤霄端口」). G1 only requires
+    // the memory to be available by the first query, not to first appear after it.
     const injected = [...folderIds]
       .map((id) => ({ id, turn: run.firstSeenTurnByFolder.get(id) }))
       .filter((entry) => Number.isFinite(entry.turn))
     assert.ok(injected.length > 0, `the ${marker} folder was injected at some turn`)
-    const first = injected.sort((left, right) => left.turn - right.turn)[0]
+    const inBlockAtQuery = injected.filter((entry) => query.additions.includes(entry.id))
     assert.ok(
-      first.turn - query.turn >= 0 && first.turn - query.turn <= 1,
-      `high-α ${marker} folder appears within one turn of the first query (query turn ${query.turn}, injected turn ${first.turn})`,
+      inBlockAtQuery.length > 0,
+      `the ${marker} folder is still in the injected block on the query turn ${query.turn}`,
+    )
+    const first = inBlockAtQuery.sort((left, right) => left.turn - right.turn)[0]
+    assert.ok(
+      first.turn <= query.turn + 1,
+      `high-α ${marker} folder is already injected by the first query (query turn ${query.turn}, first injected turn ${first.turn}; ` +
+        'B-02 two-way matching may inject it earlier via a partial keyword token)',
     )
     // The injected folder is high α (the mock judge gave rare topics 0.95).
     const entry = index.folders.find((folder) => folder.id === first.id)
     assert.ok(entry, `the injected folder ${first.id} is in the index`)
     assert.ok(Number(entry.alpha) >= 0.9, `the ${marker} folder is high α (got ${entry.alpha})`)
-    assert.ok(!query.additions.includes('__never__'), 'sanity')
   }
   // The recall block is rendered as a system-prompt section the model sees.
   const recalledBlock = recallText(capture, session)

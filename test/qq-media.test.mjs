@@ -99,7 +99,7 @@ test('MEDIA_EXTENSIONS is the frozen image whitelist', () => {
 })
 
 test('parseMediaPaths extracts a Windows drive path from a onebot annotation', () => {
-  const filePath = String.raw`<home>\AppData\Roaming\media\onebot\media_1730000000_ab12cd34.jpg`
+  const filePath = String.raw`C:\Users\example\AppData\Roaming\media\onebot\media_1730000000_ab12cd34.jpg`
   const text = `<user_message qq="10001" nickname="小明">[图片:${filePath}] 看看这张图</user_message>`
   assert.deepEqual(parseMediaPaths(text), [filePath])
 })

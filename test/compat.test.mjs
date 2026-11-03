@@ -305,6 +305,47 @@ test('stripOnebotSuffix only strips in-epoch base36 values and never empties the
   assert.deepEqual(stripOnebotSuffix(''), { base: '', suffix: '' })
 })
 
+// v1.4.1 (E-01, P0): a decimal-only suffix is a chat id, never a base36
+// timestamp. 9-digit group/private ids starting with 1 used to be stripped and
+// collapsed every one of those chats into `onebot-group` / `onebot-private`.
+test('E-01: 9-digit decimal chat ids are never stripped as retire timestamps', () => {
+  // Exhaustive over a boundary window plus a wide deterministic sample of the
+  // whole 100000000..199999999 collision range (all 1e8 values used to collide;
+  // the rule is character-based, so the sample proves the range).
+  const chatKeys = new Set()
+  const check = (id) => {
+    const parsed = parseSessionChatKey(`onebot-group-${id}`)
+    assert.equal(parsed.suffix, '', String(id))
+    assert.equal(parsed.chatKey, `onebot-group-${id}`)
+    assert.deepEqual(stripOnebotSuffix(`group-${id}`), { base: `group-${id}`, suffix: '' })
+    chatKeys.add(parsed.chatKey)
+  }
+  for (let id = 100000000; id < 100002000; id += 1) check(id)
+  for (let id = 100000000; id < 200000000; id += 1000003) check(id)
+  check(199999999)
+  check(200000000) // first digit 2 as a control
+  assert.equal(chatKeys.size, 2101, 'every sampled chat id keeps a distinct chat key')
+
+  // Every decimal suffix length is rejected, not just 9 digits.
+  for (const digits of ['1234567', '12345678', '123456789', '1234567890', '12345678901']) {
+    assert.deepEqual(stripOnebotSuffix(`group-${digits}`), { base: `group-${digits}`, suffix: '' })
+  }  // A real base36 retire timestamp still strips (its suffix has letters).
+  assert.equal(stripOnebotSuffix(`group-123456789-${NOW_SUFFIX}`).suffix, NOW_SUFFIX)
+})
+
+test('E-01: the retired id from the audit still merges into its chat', () => {
+  // `-mvzbiny0` is a real `Date.now().toString(36)` value from 1.3.0 history.
+  const retired = parseSessionChatKey('onebot-group-123456789-mvzbiny0')
+  assert.equal(retired.chatKey, 'onebot-group-123456789')
+  assert.equal(retired.suffix, 'mvzbiny0')
+  // The active session of the same chat must map to the same memory folder.
+  const base = parseSessionChatKey('onebot-group-123456789')
+  assert.equal(base.chatKey, retired.chatKey)
+  // Two different 9-digit groups stay separate.
+  assert.notEqual(parseSessionChatKey('onebot-group-123456789').chatKey, parseSessionChatKey('onebot-group-123456780').chatKey)
+  assert.notEqual(parseSessionChatKey('onebot-private-123456789').chatKey, parseSessionChatKey('onebot-private-100000001').chatKey)
+})
+
 test('parseSessionChatKey: Derpyu ids drop the 32-hex rebuild suffix', () => {
   const hex = 'a'.repeat(32)
   const rebuilt = parseSessionChatKey(`qqb-g-123456-${hex}`)
@@ -395,6 +436,28 @@ test('resolveRecallGate: memberMinAlpha=0 (or invalid) disables the gate', () =>
   assert.equal(resolveRecallGate({ mode: COMPAT_MODES.ONEBOT, text, compat: {} }).minAlpha, 0)
 })
 
+// v1.4.1 (E-04, P2): dsh-onebot-qq wraps *every* inbound message (private too),
+// so the sender marker alone cannot distinguish a group member from the owner.
+test('resolveRecallGate: a onebot private chat is never gated (E-04)', () => {
+  const compat = { ownerIds: [], memberMinAlpha: 0.5 }
+  // Real dsh-onebot-qq private message shape (inbound.js wraps all chat kinds).
+  const privateText = '<user_message qq="123456789" nickname="主人">\n帮我记一下周五开会\n</user_message>'
+  for (const sessionId of ['onebot-private-123456789', 'onebot-private-100000001']) {
+    const gate = resolveRecallGate({ mode: COMPAT_MODES.ONEBOT, sessionId, text: privateText, compat })
+    assert.equal(gate.gated, false, `${sessionId} must stay ungated`)
+    assert.equal(gate.minAlpha, 0)
+  }
+  // The same marker in a group chat of a non-owner is still gated (control).
+  const group = resolveRecallGate({ mode: COMPAT_MODES.ONEBOT, sessionId: 'onebot-group-123456789', text: privateText, compat })
+  assert.equal(group.gated, true)
+  assert.equal(group.minAlpha, 0.5)
+  // An explicit chatKey works as well (callers that already resolved it).
+  assert.equal(resolveRecallGate({ mode: COMPAT_MODES.ONEBOT, chatKey: 'onebot-private-42', text: privateText, compat }).gated, false)
+  // OwnerIds containing the sender still bypass the gate in a group.
+  const owner = resolveRecallGate({ mode: COMPAT_MODES.ONEBOT, sessionId: 'onebot-group-123456789', text: privateText, compat: { ownerIds: ['123456789'], memberMinAlpha: 0.5 } })
+  assert.equal(owner.gated, false)
+})
+
 // ------------------------------------------- trigger kinds / scoring mode
 
 test('mergeTriggerSourceKinds adds the onebot kind only when compat is enabled', () => {
@@ -427,7 +490,10 @@ test('resolveChannelScore: Derpyu degrades to heuristic until the patch is appli
   assert.equal(resolveChannelScore({ mode: COMPAT_MODES.DERPYU, compat: { channelScore: 'heuristic' }, autopatchApplied: true }), 'heuristic')
 })
 
-test('DERPYU_TOOL_NAMES is the documented three-name whitelist', () => {
-  assert.deepEqual([...DERPYU_TOOL_NAMES], ['memory_judge', 'memory_recall', 'memory_image'])
+test('DERPYU_TOOL_NAMES is the documented four-name whitelist (v1.4.2 adds memory_group_recall)', () => {
+  assert.deepEqual(
+    [...DERPYU_TOOL_NAMES],
+    ['memory_judge', 'memory_recall', 'memory_image', 'memory_group_recall'],
+  )
   assert.equal(Object.isFrozen(DERPYU_TOOL_NAMES), true)
 })

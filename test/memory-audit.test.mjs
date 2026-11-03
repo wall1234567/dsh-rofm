@@ -766,26 +766,24 @@ test('memory-audit: a stale pendingEra mark is trusted by the audit and correcte
   assert.equal(victimId, JSON.parse(fs.readFileSync(poisonedPath, 'utf8')).folders[0].id)
 })
 
-test('memory-audit: --apply on a temp copy of real sessions writes only index.json (source untouched)', (t) => {
-  const sessionsRoot = path.join(REAL_MEMORY, 'sessions')
-  if (!fs.existsSync(sessionsRoot)) {
-    t.skip('no real memory/ in this checkout')
-    return
-  }
-  const wanted = ['qqb-g-1134030529', 'session-82fa546a-c9b1-420b-908c-3f5694ffe814']
-  const names = wanted.filter((name) => fs.existsSync(path.join(sessionsRoot, name, 'index.json')))
-  if (names.length === 0) {
-    t.skip('the documented real sessions are not present')
-    return
-  }
-  // Copy (never move/write) the real sessions into a throw-away memory root.
+test('memory-audit: --apply on a temp copy of a fixture writes only index.json (source untouched)', () => {
+  // Self-contained fixture (no dependency on the mutable repo memory/): a
+  // QQ-style current store plus a 100-folder pre-1.2.0 legacy store, i.e. the
+  // same shape the old test copied out of the real store.
+  const source = path.join(makeTempDir(), 'source-memory')
+  writeStore(source, 'qqb-g-1134030529', [
+    ...Array.from({ length: 8 }, () => folderEntry({ createdAt: CURRENT_TS, scored: true })),
+    ...Array.from({ length: 2 }, () => folderEntry({ createdAt: CURRENT_TS, scored: false })),
+  ])
+  writeStore(source, 'session-legacy-fixture', [
+    ...Array.from({ length: 6 }, () => folderEntry({ createdAt: LEGACY_TS, scored: true })),
+    ...manyFolders(94, { createdAt: LEGACY_TS, scored: false }),
+  ])
+
+  // Copy (never move/write) the fixture into a throw-away memory root.
   const tempMemory = path.join(makeTempDir(), 'memory')
-  for (const name of names) {
-    fs.cpSync(path.join(sessionsRoot, name), path.join(tempMemory, 'sessions', name), { recursive: true })
-  }
-  const sourceMtimes = new Map(
-    names.map((name) => [name, fs.statSync(path.join(sessionsRoot, name, 'index.json')).mtimeMs]),
-  )
+  fs.cpSync(source, tempMemory, { recursive: true })
+  const sourceBefore = snapshotFiles(source)
   const before = snapshotFiles(tempMemory)
   const { status, json } = runJson(['--memory', tempMemory, '--apply'])
   assert.equal(status, 0, JSON.stringify(json.apply))
@@ -800,23 +798,21 @@ test('memory-audit: --apply on a temp copy of real sessions writes only index.js
     assert.equal(current.mtimeMs, snapshot.mtimeMs, `${file} must not be written by --apply`)
     assert.equal(Buffer.compare(current.bytes, snapshot.bytes), 0, `${file} bytes must not change`)
   }
-  assert.equal(after.get(path.join('sessions', names[0], 'index.json')).mtimeMs !== undefined, true)
 
-  // The marks follow the real folder data: qqb-g is current, 82fa546a is legacy.
+  // The marks follow the folder data: qqb-g is current, the legacy store is legacy.
   const qqbIndex = JSON.parse(fs.readFileSync(path.join(tempMemory, 'sessions', 'qqb-g-1134030529', 'index.json'), 'utf8'))
   assert.equal(qqbIndex.folders.every((folder) => folder.pendingEra === 'current'), true)
-  let legacyIndex = null
-  for (const name of names) {
-    if (!name.startsWith('session-82fa546a')) continue
-    legacyIndex = JSON.parse(fs.readFileSync(path.join(tempMemory, 'sessions', name, 'index.json'), 'utf8'))
-    assert.equal(legacyIndex.folders.every((folder) => folder.pendingEra === 'legacy'), true)
-    assert.equal(legacyIndex.folders.filter((folder) => folder.scored === false).length, 94)
-  }
-  if (legacyIndex === null) t.skip('82fa546a not present')
+  const legacyIndex = JSON.parse(fs.readFileSync(path.join(tempMemory, 'sessions', 'session-legacy-fixture', 'index.json'), 'utf8'))
+  assert.equal(legacyIndex.folders.every((folder) => folder.pendingEra === 'legacy'), true)
+  assert.equal(legacyIndex.folders.filter((folder) => folder.scored === false).length, 94)
 
-  // The REAL source files were never touched by the copy+apply round trip.
-  for (const [name, mtimeMs] of sourceMtimes) {
-    assert.equal(fs.statSync(path.join(sessionsRoot, name, 'index.json')).mtimeMs, mtimeMs, `${name} source index must not change`)
+  // The SOURCE fixture files were never touched by the copy+apply round trip.
+  const sourceAfter = snapshotFiles(source)
+  assert.deepEqual([...sourceAfter.keys()].sort(), [...sourceBefore.keys()].sort(), 'source file list unchanged')
+  for (const [file, snapshot] of sourceBefore) {
+    const current = sourceAfter.get(file)
+    assert.equal(current.mtimeMs, snapshot.mtimeMs, `${file} source mtime must not change`)
+    assert.equal(Buffer.compare(current.bytes, snapshot.bytes), 0, `${file} source bytes must not change`)
   }
 })
 

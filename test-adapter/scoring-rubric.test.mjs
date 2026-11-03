@@ -78,7 +78,8 @@ test('memory_judge: alpha parameter carries the preference rule; other parameter
   assert.ok(props.alpha.description.includes('省略表示不修改'))
   // beta / keywords / keep / reason / id descriptions are untouched.
   assert.equal(props.beta.description, '信赖度 -10~10；省略表示不修改')
-  assert.equal(props.keywords.description, '3~8 个关键词；待评分新记忆必填，复核已有记忆可省略')
+  assert.ok(props.keywords.description.includes('3~8 个关键词；待评分新记忆必填，复核已有记忆可省略'))
+  assert.ok(props.keywords.description.includes('类别词'), 'v1.4.1 category-word rule is model-visible')
   assert.equal(props.keep.description, 'true 表示保持现有 α/β 不变（复核时无需修改可用）')
   assert.equal(props.reason.description, '一句话理由（可选）')
   assert.equal(props.id.description, '记忆文件夹 id，例如 mem-20261025T071640Z-0001')

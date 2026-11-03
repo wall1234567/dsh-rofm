@@ -1,9 +1,8 @@
 /**
  * dsh-rofm engine — FAIR-DRI deterministic recall index and selector.
  *
- * Ported from the DRI reference implementation
- * (`<workspace>\output\rofm-deterministic-recall\recall-index.mjs`) and the
- * FAIR-DRI fairness simulation (`<workspace>\output\rofm-recall-fairness\sim.mjs`).
+ * Ported from the DRI reference implementation and the FAIR-DRI fairness
+ * simulation (both kept outside this repository as design artifacts).
  * The model and the proofs are in DESIGN.md / proof.md; the product spec is
  * docs/SPEC.md §6.
  *
@@ -37,6 +36,10 @@
  */
 
 import { extractKeywords, normalizeText, tokenize } from './tokenize.js'
+// B-02 (1.4.1): direction-2 matches are *generated* from the reverse token index
+// below and then verified with the authoritative bidirectional predicate, so the
+// product path and `engine/keyword-match.js` can never disagree.
+import { matchKeywords } from './keyword-match.js'
 
 // ---------------------------------------------------------------------------
 // constants / local defaults
@@ -62,10 +65,98 @@ const DEFAULT_FAIR = Object.freeze({
   recycle: Object.freeze({ enabled: true, cooldownRounds: 15, maxPerRound: 1 }),
 })
 
+/**
+ * Plan A (v1.4.1 addendum) local defaults for `cfg.recall.categoryMatch`.
+ * Mirrors engine/config.js DEFAULT_CONFIG exactly; the module stays usable
+ * without a validated config object.
+ */
+const DEFAULT_CATEGORY_MATCH = Object.freeze({
+  enabled: true,
+  alphaMin: 0.6,
+  classes: Object.freeze({
+    preference: Object.freeze({ label: '喜好', words: Object.freeze(['喜好', '偏好', '喜欢', '爱好', '口味', '讨厌', '厌恶', '习惯', '爱吃', '爱喝', '不喜欢']) }),
+    agreement: Object.freeze({ label: '约定', words: Object.freeze(['约定', '说好', '承诺', '以后都', '统一', '采用']) }),
+    decision: Object.freeze({ label: '决定', words: Object.freeze(['决定', '确定', '结论', '方案']) }),
+    rule: Object.freeze({ label: '规则', words: Object.freeze(['规则', '规范', '规定', '禁止', '必须']) }),
+    requirement: Object.freeze({ label: '要求', words: Object.freeze(['要求', '需求', '参数', '配置']) }),
+    taboo: Object.freeze({ label: '禁忌', words: Object.freeze(['禁忌', '忌讳']) }),
+  }),
+})
+
+/** Synthetic posting/seed prefix for the category layer (never user-visible). */
+const CATEGORY_SEED_PREFIX = '\u0002cat:'
+
+/** Whether a seed is a synthetic category seed. */
+function isCategorySeed(seed) {
+  return typeof seed === 'string' && seed.startsWith(CATEGORY_SEED_PREFIX)
+}
+
+/** Synthetic seed for one category class key. */
+function categorySeed(key) {
+  return CATEGORY_SEED_PREFIX + String(key)
+}
+
+/** Normalized `recall.categoryMatch` snapshot used by build/query. */
+function categoryConfigOf(cfg) {
+  const raw = cfg && cfg.recall && cfg.recall.categoryMatch
+  const source = raw && typeof raw === 'object' ? raw : DEFAULT_CATEGORY_MATCH
+  const alphaMin = clampAlpha(numberOr(source.alphaMin, DEFAULT_CATEGORY_MATCH.alphaMin))
+  const classesSource = source.classes && typeof source.classes === 'object' ? source.classes : DEFAULT_CATEGORY_MATCH.classes
+  const classes = []
+  for (const key of Object.keys(classesSource).sort()) {
+    const def = classesSource[key]
+    const rawWords = Array.isArray(def) ? def : def && typeof def === 'object' && Array.isArray(def.words) ? def.words : []
+    const words = []
+    for (const word of rawWords) {
+      if (typeof word !== 'string') continue
+      const normalized = normalizeText(word).trim()
+      if (normalized.length < 2 || words.includes(normalized)) continue
+      words.push(normalized)
+    }
+    if (words.length === 0) continue
+    const label = def && typeof def === 'object' && typeof def.label === 'string' && def.label.trim().length > 0 ? def.label.trim() : key
+    classes.push({ key: String(key), label, words })
+  }
+  return { enabled: source.enabled !== false && classes.length > 0, alphaMin, classes }
+}
+
+/** Category class keys whose word list occurs in one folder's keywords/title. */
+function classesForEntry(entry, category) {
+  const sources = []
+  for (const keyword of entry.keywords) sources.push(keyword)
+  const title = entry.folder && typeof entry.folder.title === 'string' ? normalizeText(entry.folder.title) : ''
+  if (title) sources.push(title)
+  if (sources.length === 0) return []
+  const hits = []
+  for (const cls of category.classes) {
+    for (const word of cls.words) {
+      if (word.length < 2) continue
+      let found = false
+      for (const source of sources) {
+        if (source.includes(word)) {
+          found = true
+          break
+        }
+      }
+      if (found) {
+        hits.push(cls.key)
+        break
+      }
+    }
+  }
+  return hits
+}
+
 /** Default per-round quota k (= cfg.recall.firstGenMax). */
 const DEFAULT_K = 10
 /** Hard safety cap for k / counts coming from configuration. */
 const MAX_K = 4096
+/**
+ * B-01 (1.4.1) pagination window cap: `engine.recall(..., {paginate:true})`
+ * selects a stable candidate window of `min(candidates, PAGINATE_MAX_K)` and
+ * slices pages out of it, independent of `offset`/`limit`.
+ */
+export const PAGINATE_MAX_K = 10000
 /** Hard safety cap for the rare-term seed scan (contract §5.1: scanCap). */
 const MAX_SCAN_CAP = 4096
 /** Absolute pop ceiling for one k-way merge (defensive; a merge always ends). */
@@ -266,6 +357,17 @@ export function lanesFingerprint(cfg) {
       },
     },
     matchMode: matchModeOf(cfg),
+    // Plan A: the category lexicon changes the candidate set, so changing it
+    // must invalidate the recall-index cache and the persisted lane cursors.
+    categoryMatch: (() => {
+      const category = categoryConfigOf(cfg)
+      if (!category.enabled) return { enabled: false }
+      return {
+        enabled: true,
+        alphaMin: category.alphaMin,
+        classes: category.classes.map((cls) => ({ key: cls.key, words: cls.words })),
+      }
+    })(),
   }
   return `cfg1|${stableSerialize(payload)}`
 }
@@ -427,6 +529,8 @@ function emptyIndex() {
     entries: [],
     byId: new Map(),
     postings: new Map(),
+    /** B-02 direction-2 reverse index: user token → multi-token folder keywords. */
+    tokenKeywords: new Map(),
     automaton: buildAutomaton([]),
     matchMode: 'contains',
     rareThreshold: Math.max(1, DEFAULT_FAIR.rareTerm.minPosting),
@@ -434,6 +538,63 @@ function emptyIndex() {
     builtAt: 0,
     signature: 'cfg1|empty',
   }
+}
+
+/** Remove Latin separators so "node.js" and "nodejs" compare equal. */
+function compactLatin(text) {
+  return String(text).replace(/[._\-+#]/g, '')
+}
+
+/**
+ * Reverse-index keys for one folder keyword (B-02 direction 2).
+ *
+ * A user token can only add a *new* match when the folder keyword has more than
+ * one component (space / separator / several tokens): a single-token keyword is
+ * already fully covered by the v1.3.0 direction (`keywordMatches`). Indexing only
+ * multi-token keywords keeps the reverse map small (the `expandLatinCase`
+ * expansion adds the compact/word-run forms on top).
+ */
+function direction2Keys(keyword, expandLatinCase) {
+  const keys = new Set()
+  const tokens = tokenize(keyword)
+  const multiToken = tokens.length > 1 || keyword.includes(' ') || /[._\-+#/]/.test(keyword)
+  if (!multiToken) return keys
+  for (const token of tokens) {
+    if (typeof token === 'string' && token.length >= 2) keys.add(token)
+  }
+  // Latin word runs inside a mixed keyword: "node.js" → node / js, so a user
+  // token "node" can seed it (direction 2 uses word boundaries, not equality).
+  for (const match of keyword.matchAll(/[a-z0-9_]+/g)) {
+    if (match[0].length >= 2) keys.add(match[0])
+  }
+  if (expandLatinCase) {
+    for (const key of [...keys]) {
+      const compact = compactLatin(key)
+      if (compact.length >= 2) keys.add(compact)
+    }
+    const compactKeyword = compactLatin(keyword)
+    if (compactKeyword.length >= 2) keys.add(compactKeyword)
+  }
+  return keys
+}
+
+/** Build the direction-2 reverse index: user token → folder keywords. */
+function buildTokenKeywordIndex(entries, cfg) {
+  const expandLatinCase = cfg && cfg.match && cfg.match.expandLatinCase === true
+  const index = new Map()
+  for (const entry of entries) {
+    for (const keyword of entry.keywords) {
+      for (const key of direction2Keys(keyword, expandLatinCase)) {
+        let list = index.get(key)
+        if (!list) {
+          list = []
+          index.set(key, list)
+        }
+        if (list[list.length - 1] !== keyword) list.push(keyword)
+      }
+    }
+  }
+  return index
 }
 
 /** Coerce a foreign index-looking object into a usable index. */
@@ -447,7 +608,13 @@ function normalizeIndex(index) {
     })
     return { ...index, byId }
   }
-  if (!index.automaton) return { ...index, automaton: buildAutomaton([...index.postings.keys()]) }
+  if (!index.automaton) {
+    return {
+      ...index,
+      automaton: buildAutomaton([...index.postings.keys()].filter((key) => !isCategorySeed(key))),
+      categoryMatch: index.categoryMatch && typeof index.categoryMatch === 'object' ? index.categoryMatch : categoryConfigOf(undefined),
+    }
+  }
   return index
 }
 
@@ -505,6 +672,35 @@ export function buildRecallIndex(folders, cfg) {
     }
   })
   for (const posting of postings.values()) posting.sort((left, right) => comparePriority(entries[left], entries[right]))
+  // Plan A: synthetic postings for the category layer. Only high-α entries take
+  // part (generic synonyms must not flood low-α memories); each posting is sorted
+  // by σ like every other posting, so all existing lanes/merge code work as-is.
+  const category = categoryConfigOf(cfg)
+  if (category.enabled) {
+    const classPostings = new Map()
+    entries.forEach((entry, at) => {
+      if (!(entry.alpha >= category.alphaMin)) return
+      let classes = null
+      try {
+        classes = classesForEntry(entry, category)
+      } catch {
+        classes = null
+      }
+      if (!Array.isArray(classes) || classes.length === 0) return
+      for (const key of classes) {
+        let posting = classPostings.get(key)
+        if (!posting) {
+          posting = []
+          classPostings.set(key, posting)
+        }
+        posting.push(at)
+      }
+    })
+    for (const [key, posting] of classPostings) {
+      posting.sort((left, right) => comparePriority(entries[left], entries[right]))
+      postings.set(categorySeed(key), posting)
+    }
+  }
   const folderCount = entries.length
   const rareThreshold = Math.max(
     effective.rareMinPosting,
@@ -519,7 +715,10 @@ export function buildRecallIndex(folders, cfg) {
     entries,
     byId,
     postings,
-    automaton: buildAutomaton([...postings.keys()]),
+    tokenKeywords: buildTokenKeywordIndex(entries, cfg),
+    // Category markers are synthetic posting keys, never literal text patterns.
+    automaton: buildAutomaton([...postings.keys()].filter((key) => !isCategorySeed(key))),
+    categoryMatch: category,
     matchMode,
     rareThreshold,
     folderCount,
@@ -558,6 +757,64 @@ export function querySeeds(index, userText, cfg) {
       if (!keyword || seen.has(keyword)) continue
       seen.add(keyword)
       seeds.push(keyword)
+    }
+  }
+  // --- B-02 (1.4.1): direction 2 of the bidirectional match ----------------
+  // v1.4.0 shipped the bidirectional predicate (`keyword-match.js`) but never
+  // wired it into the product path, so "接口网关 8080" was not recalled by a user
+  // saying only "网关". A user token that appears *inside* a multi-token folder
+  // keyword now seeds that keyword too. The reverse map is a candidate
+  // generator; `matchKeywords` is the authoritative filter, so the result is
+  // "direction 1 ∪ direction 2" (monotone: nothing v1.3.0 matched is removed)
+  // and stays deterministic (seeds are sorted below).
+  const tokenKeywords = safeIndex.tokenKeywords instanceof Map ? safeIndex.tokenKeywords : null
+  if (tokenKeywords && tokenKeywords.size > 0 && text) {
+    const expandLatinCase = !!(cfg && cfg.match && cfg.match.expandLatinCase === true)
+    const lookupKeys = new Set()
+    for (const token of tokenize(text)) {
+      if (!token || token.length < 2) continue
+      lookupKeys.add(token)
+      if (expandLatinCase) {
+        const compact = compactLatin(token)
+        if (compact.length >= 2) lookupKeys.add(compact)
+      }
+    }
+    for (const key of lookupKeys) {
+      const keywords = tokenKeywords.get(key)
+      if (!keywords || !keywords.length) continue
+      for (const keyword of keywords) {
+        if (!keyword || seen.has(keyword)) continue
+        // Verify with the authoritative bidirectional predicate (direction 2 +
+        // the opt-in `match.*` expansions); a reverse-map hit that the predicate
+        // rejects is simply not added.
+        if (matchKeywords(text, [keyword], cfg).matchCount === 0) continue
+        seen.add(keyword)
+        seeds.push(keyword)
+      }
+    }
+  }
+  // --- Plan A (v1.4.1 addendum): deterministic category layer -------------
+  // A query that uses a synonym of a closed category (喜好/偏好/喜欢…) seeds the
+  // synthetic posting of that class, so high-α memories whose keywords carry
+  // another synonym of the same class are still found — no embeddings, no
+  // network, fully deterministic. Only classes with a posting are seeded.
+  const category = safeIndex.categoryMatch && safeIndex.categoryMatch.enabled === true
+    ? safeIndex.categoryMatch
+    : categoryConfigOf(cfg)
+  if (category.enabled) {
+    for (const cls of category.classes) {
+      let hit = false
+      for (const word of cls.words) {
+        if (word.length >= 2 && text.includes(word)) {
+          hit = true
+          break
+        }
+      }
+      if (!hit) continue
+      const seed = categorySeed(cls.key)
+      if (seen.has(seed) || !safeIndex.postings.has(seed)) continue
+      seen.add(seed)
+      seeds.push(seed)
     }
   }
   seeds.sort(idCompare)
@@ -1157,7 +1414,11 @@ function normalizeKey(raw) {
  */
 export function serializeLanes(lanes) {
   try {
-    const safe = normalizeLaneState(lanes && typeof lanes === 'object' ? lanes : emptyLanes())
+    // Never mutate the caller's live lane object: `normalizeLaneState` repairs
+    // fields in place, and a pagination snapshot must stay byte-identical.
+    const safe = lanes && typeof lanes === 'object' && !Array.isArray(lanes)
+      ? deserializeLanes(lanes)
+      : emptyLanes()
     const frontier = []
     for (const [seed, record] of safe.frontier) {
       if (typeof seed !== 'string' || !record || typeof record !== 'object') continue
@@ -1294,6 +1555,7 @@ function emptySelectStats(round, mode) {
     filteredByTime: 0,
     filteredByEvent: 0,
     filteredByAlpha: 0,
+    categorySeeds: [],
     round,
     mode,
   }
@@ -1363,7 +1625,10 @@ export function selectRecall(index, userText, options = {}) {
   const fallbackRound = lanes.round + 1
   const round = Math.max(1, integerOr(opts.round, fallbackRound))
   lanes.round = round
-  const k = resolveK(opts.k, recall.firstGenMax)
+  // B-01: the pagination window is fixed by the caller (`min(candidates,
+  // PAGINATE_MAX_K)`), so the page slice is independent of offset/limit and the
+  // k safety clamp must not shrink it.
+  const k = opts.paginate === true ? clampInt(opts.k, 0, 0, PAGINATE_MAX_K) : resolveK(opts.k, recall.firstGenMax)
   const blockIds = toIdSet(opts.blockIds)
   const ledger = toIdSet(opts.ledger)
   const extraExclude = toIdSet(opts.excludeIds)
@@ -1378,6 +1643,7 @@ export function selectRecall(index, userText, options = {}) {
   const stats = emptySelectStats(round, mode)
 
   const seeds = querySeeds(safeIndex, userText, cfg).seeds
+  stats.categorySeeds = seeds.filter(isCategorySeed).map((seed) => seed.slice(CATEGORY_SEED_PREFIX.length))
   if (k <= 0 || entries.length === 0) {
     stats.hasMore = entries.length > 0 && seeds.length > 0
     stats.degraded = lanes.degraded === true
@@ -1503,6 +1769,15 @@ export function selectRecall(index, userText, options = {}) {
       if (entry.alpha < thetaHigh) continue // only high α is re-admitted here
       const matchedNow = windowSet.has(at)
       if (!matchedNow || pickedIds.has(entry.id) || blockIds.has(entry.id) || extraExclude.has(entry.id)) {
+        kept.push(item)
+        continue
+      }
+      // B-04 (1.4.1) G4 cooldown: a high-α memory evicted from the block may only
+      // be re-injected after `fairness.recycle.cooldownRounds` rounds (README
+      // G4 / SPEC §6.2: "same id injected twice has round distance ≥ cooldown").
+      // v1.4.0 read `item.round` nowhere and re-admitted on the very next hit.
+      const recycledRound = numberOr(item.round, 0)
+      if (effective.cooldownRounds > 0 && round - recycledRound < effective.cooldownRounds) {
         kept.push(item)
         continue
       }

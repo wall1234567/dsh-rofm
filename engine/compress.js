@@ -48,6 +48,7 @@ import {
   appendStats,
   beginCommitJournal,
   cleanupCommitJournals,
+  countFoldersOnDisk,
   ensureMemoryDir,
   finishCommitJournal,
   folderExists,
@@ -926,7 +927,27 @@ function collectFolderIdempotencyKeys(index, memoryDir, cfg, warnings) {
     return keys
   }
   const loadedFolders = index && Array.isArray(index.folders) ? index.folders : null
-  if (loadedFolders) return collect(loadedFolders)
+  if (loadedFolders) {
+    collect(loadedFolders)
+    // A-02 belt & braces: a folder can be on disk yet absent from the in-memory
+    // index (another process committed concurrently, or a journal was lost).
+    // Its `meta.json` carries the idempotency key, so scan the metas in that
+    // case (slow path, only on an observed index/disk mismatch).
+    try {
+      if (countFoldersOnDisk(memoryDir) > loadedFolders.length) {
+        if (Array.isArray(warnings)) {
+          warnings.push('commit: disk has folders missing from index.json; idempotency keys were re-read from folder metas')
+        }
+        for (const meta of scanFolderMetas(memoryDir)) {
+          const key = meta && typeof meta.idempotencyKey === 'string' ? meta.idempotencyKey : ''
+          if (key && typeof meta.id === 'string') keys.set(key, meta.id)
+        }
+      }
+    } catch {
+      /* best effort: the index snapshot is still usable */
+    }
+    return keys
+  }
   const reread = readIndex(memoryDir, cfg)
   if (reread && Array.isArray(reread.folders)) return collect(reread.folders)
   if (Array.isArray(warnings)) {
@@ -997,15 +1018,16 @@ export function commitCompression(plan, options = {}) {
   const cfg = options.cfg && typeof options.cfg === 'object' ? options.cfg : DEFAULT_CONFIG
   const memoryDir = options.memoryDir || resolveMemoryDir(cfg)
   ensureMemoryDir(memoryDir)
-  // Drop journals left behind by a crashed process. Folders are never deleted
-  // here: in-process rollback below owns that (and deletion could destroy an
-  // already committed archive).
+  // A-02 (1.4.1): loadIndex now *recovers* crashed commits (journal folderIds +
+  // orphan folders are adopted into the index) before any stale journal is
+  // dropped, so a killed archive is never written twice. Journals are cleaned
+  // up afterwards — only the leftovers that no longer describe missing folders.
+  const index = loadIndex(memoryDir, cfg)
   try {
     cleanupCommitJournals(memoryDir)
   } catch {
     /* telemetry/journal cleanup is best effort */
   }
-  const index = loadIndex(memoryDir, cfg)
   const planObject = plan && typeof plan === 'object' ? plan : {}
   const warnings = Array.isArray(planObject.warnings) ? planObject.warnings.slice() : []
   const folderPlans = Array.isArray(planObject.folders) ? planObject.folders : []
@@ -1036,7 +1058,16 @@ export function commitCompression(plan, options = {}) {
   let skipped = 0
   // P2/D2: collect keys from the index already loaded above (no meta scan, no
   // second index read); only a broken index falls back to the slow path.
+  // A-01 (1.4.1): this map is the **pre-commit snapshot** used for skip
+  // decisions. Keys written by *this* commit are never fed back into it: two
+  // chunks of the same plan can legitimately have identical
+  // (session, turn, seqStart, seqEnd, contentHash) — e.g. one long tool output
+  // split into identical repeated-line chunks — and were silently treated as a
+  // retry of each other (archived text loss).
   const existingKeys = idempotencyEnabled(options) ? collectFolderIdempotencyKeys(index, memoryDir, cfg, warnings) : new Map()
+  // Plan-order occurrences of every content key, so the idempotency key is
+  // unique inside one plan while a retry of the same plan reproduces it.
+  const planKeyOccurrences = new Map()
   const journalPath = beginCommitJournal(memoryDir, commitJournalId(options), {
     sessionId: options.sessionId !== undefined ? options.sessionId : null,
     turn: finiteNumberOrNull(options.turn),
@@ -1065,8 +1096,17 @@ export function commitCompression(plan, options = {}) {
 
       // P1-4: content-based idempotency first — a retry with a new `now`
       // (different createdAt / folder ids) must still not duplicate folders.
-      const idempotencyKey = folderIdempotencyKey(meta, folderPlan.messages, options)
-      if (idempotencyKey) meta.idempotencyKey = idempotencyKey
+      // A-01 (1.4.1): append the chunk's occurrence index inside this plan, so
+      // identical chunks written by *this* plan get distinct keys and are not
+      // mistaken for a retry (a retry replays the same order ⇒ same keys).
+      const baseIdempotencyKey = folderIdempotencyKey(meta, folderPlan.messages, options)
+      let idempotencyKey = baseIdempotencyKey
+      if (baseIdempotencyKey) {
+        const occurrence = planKeyOccurrences.get(baseIdempotencyKey) ?? 0
+        planKeyOccurrences.set(baseIdempotencyKey, occurrence + 1)
+        idempotencyKey = `${baseIdempotencyKey}#${occurrence}`
+        meta.idempotencyKey = idempotencyKey
+      }
       if (idempotencyKey && existingKeys.has(idempotencyKey)) {
         skipped += 1
         const existingId = existingKeys.get(idempotencyKey)
@@ -1079,6 +1119,12 @@ export function commitCompression(plan, options = {}) {
         }
         continue
       }
+      // Cross-version continuity: folders archived by 1.4.0 carry the
+      // unprefixed key, so the first occurrence also accepts the legacy form.
+      if (idempotencyKey && baseIdempotencyKey && existingKeys.has(baseIdempotencyKey)) {
+        skipped += 1
+        continue
+      }
 
       if (folderExists(memoryDir, id)) {
         let existingMeta = null
@@ -1089,9 +1135,10 @@ export function commitCompression(plan, options = {}) {
         }
         if (existingMeta && sameFolderContent(existingMeta, meta)) {
           skipped += 1
-          // Make sure a rebuilt/missing index still lists the folder.
+          // Make sure a rebuilt/missing index still lists the folder. The key is
+          // NOT added to `existingKeys`: that map is the pre-commit snapshot
+          // (A-01), and this folder belongs to the same span being retried.
           if (!index.folders.some((folder) => folder.id === id)) index.folders.push(indexEntryFromMeta(existingMeta))
-          if (idempotencyKey) existingKeys.set(idempotencyKey, id)
           continue
         }
         const remapped = allocateFolderId(memoryDir, cfg, index, Number.isFinite(meta.createdAt) ? meta.createdAt : Date.now())
@@ -1106,7 +1153,8 @@ export function commitCompression(plan, options = {}) {
       // Track the folder before touching the in-memory index: a failure below
       // must still roll back this folder (never leave a disk-only orphan).
       written.push(writtenFolder)
-      if (idempotencyKey) existingKeys.set(idempotencyKey, id)
+      // A-01: intentionally NOT recorded in `existingKeys` — the next chunk of
+      // this very plan must not be skipped because of it.
       index.folders.push(indexEntryFromMeta(writtenFolder.meta))
       index.nextCounter = Math.max(index.nextCounter || 1, counterFromFolderId(id) + 1)
     }

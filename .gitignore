@@ -17,3 +17,7 @@ Thumbs.db
 .env
 .env.*
 coverage/
+
+# v1.4.1 privacy: machine-local overrides (QQ owner ids, local media roots, …)
+config.local.json
+config.local.json.*

@@ -8,6 +8,7 @@
  */
 
 import assert from 'node:assert/strict'
+import { execFileSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import fs from 'node:fs'
 import os from 'node:os'
@@ -177,14 +178,14 @@ function derpyuDetection(profileDir) {
 // patchText：纯函数识别 + 注入
 // ---------------------------------------------------------------------------
 
-test('patchText：三名字已在 SAFE_EXACT 内 → already，不返回文本', () => {
+test('patchText：四名字已在 SAFE_EXACT 内 → already，不返回文本', () => {
   const result = patchText(patchedText())
   assert.equal(result.status, 'already')
   assert.equal(result.text, undefined)
   assert.equal(result.reason, undefined)
 })
 
-test('patchText：缺三名字 → patchable，插入行带标记且顺序/原有元素不变', () => {
+test('patchText：缺四名字 → patchable，插入行带标记且顺序/原有元素不变', () => {
   const text = upstreamText()
   const result = patchText(text)
   assert.equal(result.status, 'patchable')
@@ -194,14 +195,21 @@ test('patchText：缺三名字 → patchable，插入行带标记且顺序/原�
   for (const element of ["'ask_user_question'", "'todo_write'", 'const SAFE_EXACT = new Set([']) {
     assert.ok(patched.includes(element), `缺少原有内容：${element}`)
   }
-  // 三个新名字插在第一个元素之后、todo_write 之前，且各出现一次。
-  const positions = ["'ask_user_question'", "'memory_judge'", "'memory_recall'", "'memory_image'", "'todo_write'"].map((needle) =>
+  // 四个新名字插在第一个元素之后、todo_write 之前，且各出现一次。
+  const positions = [
+    "'ask_user_question'",
+    "'memory_judge'",
+    "'memory_recall'",
+    "'memory_image'",
+    "'memory_group_recall'",
+    "'todo_write'",
+  ].map((needle) =>
     patched.indexOf(needle),
   )
   for (let i = 1; i < positions.length; i += 1) assert.ok(positions[i - 1] < positions[i], '注入顺序错误')
   for (const name of AUTO_PATCH_TOOL_NAMES) assert.equal(patched.split(`'${name}'`).length - 1, 1, name)
   // 每行注入都带可识别的行尾标记。
-  assert.equal(patched.split(MARKER).length - 1, 3)
+  assert.equal(patched.split(MARKER).length - 1, 4)
   // 行径缩进与原元素一致（2 空格）。
   assert.ok(patched.includes(`  'memory_judge', ${MARKER}\n`))
   // 纯函数幂等：再解析一次即 already。
@@ -214,16 +222,16 @@ test('patchText：部分已存在 → 只补缺失项，不重复注入', () => 
   assert.equal(result.status, 'patchable')
   const patched = result.text
   for (const name of AUTO_PATCH_TOOL_NAMES) assert.equal(patched.split(`'${name}'`).length - 1, 1, name)
-  assert.equal(patched.split(MARKER).length - 1, 2)
+  assert.equal(patched.split(MARKER).length - 1, 3)
   assert.equal(patchText(patched).status, 'already')
 })
 
-test('patchText：names 参数可定制，且不会把默认三名字误判为 already', () => {
+test('patchText：names 参数可定制，且不会把默认四名字误判为 already', () => {
   const custom = patchText(upstreamText(), ['custom_memory_tool'])
   assert.equal(custom.status, 'patchable')
   assert.ok(custom.text.includes(`'custom_memory_tool', ${MARKER}`))
   assert.equal(patchText(custom.text, ['custom_memory_tool']).status, 'already')
-  // 默认三工具还没注入 → 仍可补（说明 already 判定只看 Set 内实际名字）。
+  // 默认四工具还没注入 → 仍可补（说明 already 判定只看 Set 内实际名字）。
   assert.equal(patchText(custom.text).status, 'patchable')
 })
 
@@ -242,6 +250,11 @@ test('patchText：结构不同（单行 Set / 非字符串元素 / 一行多元�
     "const SAFE_EXACT = new Set([\n  'ask_user_question', 'todo_write',\n])\n",
     "const SAFE_EXACT = new Set([\n  SAFE_EXTRA[0],\n])\n",
     "const SAFE_EXACT = new Set([\n  `ask_user_question`,\n])\n",
+    // v1.4.1 (E-02): first element on the same line as `new Set([` is legal JS
+    // but a whole-line insertion there used to write the `const …` prefix again
+    // (syntax error). D6: unknown shape → unsupported, never guess.
+    "const SAFE_EXACT = new Set(['ask_user_question',\n  'todo_write',\n])\n",
+    "const SAFE_EXACT = new Set([ 'ask_user_question',\n  'todo_write',\n])\n",
   ]
   for (const text of cases) {
     const result = patchText(text)
@@ -391,7 +404,7 @@ test('ensureAutopatch：首次检测到 Derpyu → 原子注入 + 备份 + 状�
   assert.equal(record.afterHash, sha256(readFile(f.packageFile)))
 })
 
-test('ensureAutopatch：上游已含三名字 → already，不备份、不写状态', () => {
+test('ensureAutopatch：上游已含四名字 → already，不备份、不写状态', () => {
   const f = makeFixture({ toolText: patchedText() })
   const beforeText = readFile(f.packageFile)
   const result = ensureAutopatch({
@@ -422,7 +435,48 @@ test('ensureAutopatch：重复调用 → already，文件/备份/状态都不变
   assert.equal(readFile(stateFile), stateAfterFirst)
 })
 
-test('ensureAutopatch：上游更新（hash 变化、三名字消失）→ 自愈重打并刷新记录', () => {
+// v1.4.2: a user who already ran v1.4.x has a qq-tool-restrict.mjs patched with
+// the three older names only. Derpyu's allowlist would reject the new
+// memory_group_recall tool, so the next startup must *incrementally* inject just
+// the missing name (while keeping a backup and refreshing the state record).
+test('ensureAutopatch：旧补丁只含 v1.4.2 前的三工具 → 增量补 memory_group_recall（备份 + 记录刷新）', () => {
+  const legacy = patchText(upstreamText(), ['memory_judge', 'memory_recall', 'memory_image'])
+  assert.equal(legacy.status, 'patchable')
+  const f = makeFixture({ toolText: legacy.text })
+  const beforeText = readFile(f.packageFile)
+  assert.equal(beforeText.includes("'memory_group_recall'"), false, 'fixture really predates the new tool')
+  assert.equal(patchText(beforeText).status, 'patchable', 'the plan sees a missing name')
+
+  const now = new Date('2026-11-03T09:00:00+08:00')
+  const result = ensureAutopatch({
+    memoryDir: f.memoryDir,
+    profileDir: f.profileDir,
+    detection: derpyuDetection(f.profileDir),
+    now,
+  })
+  assert.equal(result.status, 'patched', 'an older patch must be self-healed')
+  assert.ok(result.backupPath && fs.existsSync(result.backupPath))
+  assert.equal(readFile(result.backupPath), beforeText, 'backup is the pre-heal content')
+
+  const healed = readFile(f.packageFile)
+  for (const name of AUTO_PATCH_TOOL_NAMES) assert.equal(healed.split(`'${name}'`).length - 1, 1, name)
+  assert.equal(healed.split(MARKER).length - 1, 4, 'only the missing fourth name is injected, old lines are kept')
+  assert.equal(patchText(healed).status, 'already')
+
+  const record = readAutopatchState(f.memoryDir).patches[0]
+  assert.equal(record.beforeHash, sha256(beforeText))
+  assert.equal(record.afterHash, sha256(healed))
+  assert.equal(record.patchedAt, now.toISOString())
+
+  // Idempotent afterwards: second run is already, no extra backup.
+  assert.equal(
+    ensureAutopatch({ memoryDir: f.memoryDir, profileDir: f.profileDir, detection: derpyuDetection(f.profileDir) }).status,
+    'already',
+  )
+  assert.equal(listBackups(f.packageFile).length, 1)
+})
+
+test('ensureAutopatch：上游更新（hash 变化、四名字消失）→ 自愈重打并刷新记录', () => {
   const f = makeFixture()
   const options = { memoryDir: f.memoryDir, profileDir: f.profileDir, detection: derpyuDetection(f.profileDir) }
   assert.equal(ensureAutopatch({ ...options, now: new Date('2026-10-30T22:00:00+08:00') }).status, 'patched')
@@ -462,6 +516,39 @@ test('ensureAutopatch：结构不识别 → failed，文件字节不变、不产
   assert.equal(listBackups(f.packageFile).length, 0)
   assert.equal(fs.existsSync(path.join(f.memoryDir, '.compat-state.json')), false)
   assert.ok(warns.some((line) => line.includes('结构无法识别')))
+})
+
+// v1.4.1 (E-02, P1): legal JS with the first element on the `new Set([` line used
+// to be "patched" into a syntax error (the whole `const …` line was re-used as
+// indent). The file must stay byte-identical and remain valid JS.
+test('ensureAutopatch：首元素与 new Set([ 同行 → unsupported，文件不变且 node --check 通过 (E-02)', () => {
+  const f = makeFixture()
+  const inline = upstreamText().replace(
+    'const SAFE_EXACT = new Set([\n',
+    "const SAFE_EXACT = new Set(['ask_user_question',\n",
+  )
+  // Drop the now-duplicated first element line to keep the file valid JS.
+  const validInline = inline.replace("new Set(['ask_user_question',\n  'ask_user_question',\n", "new Set(['ask_user_question',\n")
+  assert.notEqual(validInline, upstreamText())
+  writeFile(f.packageFile, validInline)
+  const before = readFile(f.packageFile)
+  // The unpatched control must itself be valid JS, otherwise the assertion below
+  // would pass for the wrong reason.
+  assert.doesNotThrow(() => execFileSync(process.execPath, ['--check', f.packageFile], { stdio: 'pipe' }))
+
+  const warns = []
+  const result = ensureAutopatch({
+    memoryDir: f.memoryDir,
+    profileDir: f.profileDir,
+    detection: derpyuDetection(f.profileDir),
+    logger: { warn: (line) => warns.push(line), info: () => {} },
+  })
+  assert.equal(result.status, 'failed', 'an unknown shape must not be claimed as patched')
+  assert.match(result.reason, /^unsupported: /)
+  assert.equal(readFile(f.packageFile), before, 'the third-party file must be byte-identical')
+  assert.equal(listBackups(f.packageFile).length, 0)
+  assert.equal(fs.existsSync(path.join(f.memoryDir, '.compat-state.json')), false)
+  assert.doesNotThrow(() => execFileSync(process.execPath, ['--check', f.packageFile], { stdio: 'pipe' }))
 })
 
 test('ensureAutopatch：只读文件 → failed，文件不变且无临时文件残留', () => {
@@ -694,7 +781,7 @@ test('ensureAutopatch：不带参数调用不抛，返回结构化状态', () =>
   assert.ok('statePath' in result)
 })
 
-test('ensureAutopatch：写入后目标文件仍是合法文本（导出的三工具名可见于 SAFE_EXACT）', () => {
+test('ensureAutopatch：写入后目标文件仍是合法文本（导出的四工具名可见于 SAFE_EXACT）', () => {
   const f = makeFixture()
   const result = ensureAutopatch({
     memoryDir: f.memoryDir,

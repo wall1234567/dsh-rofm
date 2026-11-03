@@ -572,6 +572,53 @@ test('selfcheck: a corrupt stats.jsonl line fails the memory store check', () =>
   assert.equal(status, 1)
 })
 
+// ---------------------------------------------------------------------------
+// v1.4.1 F-05/T-13: index.json must agree with meta.json (recall reads index)
+// ---------------------------------------------------------------------------
+
+/** Corrupt the healthy store's index entry and return the selfcheck result. */
+function corruptedIndexResult(mutateEntry) {
+  const root = makeTempDir()
+  const store = createGoodStore(root)
+  const sessionsDir = createEmptySessionsDir(root)
+  const indexPath = path.join(store.storeDir, 'index.json')
+  const index = JSON.parse(fs.readFileSync(indexPath, 'utf8'))
+  mutateEntry(index.folders[0], store.meta)
+  writeJson(indexPath, index)
+  return runJson(['--memory-dir', store.memoryDir, '--sessions-dir', sessionsDir])
+}
+
+test('selfcheck: index.json↔meta.json field divergence fails the memory store check (F-05)', () => {
+  const cases = [
+    ['alpha', (entry) => { entry.alpha = 0.1 }],
+    ['scored', (entry) => { entry.scored = false }],
+    ['keywords', (entry) => { entry.keywords = ['other'] }],
+    ['beta', (entry) => { entry.beta = -4.2 }],
+  ]
+  for (const [field, mutate] of cases) {
+    const { status, json } = corruptedIndexResult(mutate)
+    const check = findCheck(json, 'memory store')
+    assert.equal(check.status, 'FAIL', `${field}: ${check.detail}`)
+    assert.ok(issueCodes(check).includes('index-meta-divergence'), `${field}: issues=${JSON.stringify(issueCodes(check))}`)
+    assert.equal(status, 1, `${field}: a stale index must fail the store check`)
+  }
+})
+
+test('selfcheck: index.json value types are validated (T-13)', () => {
+  for (const [field, mutate] of [
+    ['alpha', (entry) => { entry.alpha = 'high' }],
+    ['scored', (entry) => { entry.scored = 'false' }],
+    ['keywords', (entry) => { entry.keywords = 'not-an-array' }],
+    ['createdAt', (entry) => { entry.createdAt = 'yesterday' }],
+  ]) {
+    const { status, json } = corruptedIndexResult(mutate)
+    const check = findCheck(json, 'memory store')
+    assert.equal(check.status, 'FAIL', `${field}: ${check.detail}`)
+    assert.ok(issueCodes(check).includes('index-entry-field-type'), `${field}: issues=${JSON.stringify(issueCodes(check))}`)
+    assert.equal(status, 1)
+  }
+})
+
 test('selfcheck: an inconsistent recall-state snapshot fails the recall state check', () => {
   const { store, sessionsDir } = corruptStoreFixture((fixture) => {
     // A v2 snapshot whose ids array and additions array disagree.
@@ -606,12 +653,13 @@ test('selfcheck: a real v3 recall-state snapshot passes with zero issues', () =>
   assert.equal(json.exitCode, 0)
 })
 
-test('selfcheck: malformed v3 optional fields degrade (PASS, no issue) instead of FAIL', () => {
+test('selfcheck: malformed v3 optional fields are WARN (never FAIL) so corruption is visible', () => {
   const root = makeTempDir()
   const store = createGoodStore(root)
   const sessionsDir = createEmptySessionsDir(root)
   // Same shape lib/plugin.js has to tolerate: lanes/ledger/counters garbage,
-  // round not a number. They are optional v3 extras → ignored by selfcheck.
+  // round not a number. They degrade inside the adapter (never throw), so a
+  // WARN documents the corruption without failing the gate (audit T-15).
   writeRecallState(
     store.storeDir,
     recallStateV3Payload(store.meta, {
@@ -620,15 +668,24 @@ test('selfcheck: malformed v3 optional fields degrade (PASS, no issue) instead o
       lanes: 'garbage',
       ledger: 42,
       counters: 'nope',
+      degraded: 'yes',
     }),
   )
   const { status, json } = runJson(['--memory-dir', store.memoryDir, '--sessions-dir', sessionsDir])
   const check = findCheck(json, 'recall state')
-  assert.equal(check.status, 'PASS', check.detail)
-  assert.equal(check.data.issueTotal, 0, 'optional v3 extras are not validated by selfcheck')
-  assert.deepEqual(check.data.issues, [])
+  assert.equal(check.status, 'WARN', check.detail)
+  assert.ok(check.data.issueTotal >= 5, `expected one warning per malformed optional field, got ${JSON.stringify(check.data.issues)}`)
+  for (const code of ['recall-state-round', 'recall-state-lanes', 'recall-state-ledger', 'recall-state-counters', 'recall-state-degraded']) {
+    assert.ok(issueCodes(check).includes(code), `missing ${code} in ${JSON.stringify(issueCodes(check))}`)
+  }
   assert.equal(status, 0, 'a degraded optional field must not fail the self-check')
   assert.equal(json.summary.failed, 0)
+  // The empty sessions fixture adds its own WARN; only check statuses must be
+  // PASS/INFO for every other check.
+  assert.ok(json.summary.warnings >= 1)
+  for (const other of json.checks.filter((entry) => entry.name !== 'recall state' && entry.name !== 'session logs')) {
+    assert.notEqual(other.status, 'FAIL', `${other.name} must not fail because of a v3 optional field`)
+  }
 })
 
 test('selfcheck: v3 snapshots still validate the shared core fields', () => {
@@ -845,9 +902,66 @@ testIfZstd('selfcheck: --session limits the session-log check to one session id'
   assert.equal(status, 0, 'the bad session was not selected')
 })
 
+testIfZstd('selfcheck: by default every session log is scanned, so old corruption is found (F-06)', () => {
+  const root = makeTempDir()
+  const sessionsDir = path.join(root, 'sessions')
+  fs.mkdirSync(sessionsDir, { recursive: true })
+  const now = Date.now()
+  // 24 clean logs are newer; the broken one is the OLDEST log (the audit T-06
+  // case: the old default only looked at the 20 newest logs and missed it).
+  for (let index = 0; index < 24; index += 1) {
+    const file = writeSessionLog(sessionsDir, `session-clean-${String(index).padStart(2, '0')}`, singleArchiveEvents())
+    const when = new Date(now - (index + 1) * 60_000)
+    fs.utimesSync(file, when, when)
+  }
+  const brokenFile = writeSessionLog(sessionsDir, 'session-broken-oldest', singleArchiveEvents({ segments: 0 }))
+  const old = new Date(now - 60 * 60_000)
+  fs.utimesSync(brokenFile, old, old)
+
+  const { status, json } = runJson(['--memory-dir', path.join(root, 'memory'), '--sessions-dir', sessionsDir])
+  const check = findCheck(json, 'session logs')
+  assert.equal(check.data.scanned, 25, 'the default run must scan every log (0 = all)')
+  assert.equal(check.status, 'FAIL', check.detail)
+  assert.ok(issueCodes(check).includes('session-log-note-segments'), `issues: ${JSON.stringify(issueCodes(check))}`)
+  assert.equal(status, 1, 'old corruption must be found without extra flags')
+
+  // The bounded fast path still exists and is explicit (`--max-sessions N`).
+  const limited = runJson(['--memory-dir', path.join(root, 'memory'), '--sessions-dir', sessionsDir, '--max-sessions', '5'])
+  const limitedCheck = findCheck(limited.json, 'session logs')
+  assert.equal(limitedCheck.data.scanned, 5, '--max-sessions limits the scan on request')
+  assert.match(limitedCheck.detail, /5 of 25 log\(s\) scanned/)
+})
+
 // ---------------------------------------------------------------------------
 // v1.4.0 checks: pending era buckets / time index / recall fairness
 // ---------------------------------------------------------------------------
+
+test('selfcheck: a small current bucket with pending folders is a WARN, not a silent PASS (T-14)', () => {
+  const root = makeTempDir()
+  const sessionsDir = createEmptySessionsDir(root)
+  // 19 current folders (< the 20-folder judgement floor) with 10 pending: the
+  // percentage thresholds are not applied, but the backlog must be visible.
+  createMultiStore(root, {
+    sessionId: 'session-small-pending',
+    folders: Array.from({ length: 19 }, (_, index) => ({ createdAt: CURRENT_ERA_TS, scored: index >= 10 })),
+  })
+  const { status, json } = runJson(['--memory-dir', path.join(root, 'memory'), '--sessions-dir', sessionsDir])
+  const check = findCheck(json, 'pending era')
+  assert.equal(check.status, 'WARN', check.detail)
+  assert.match(check.detail, /current sample too small \(19 folder\(s\)/)
+  assert.match(check.detail, /10 pending folder\(s\) not judged at this sample size/)
+  assert.equal(status, 0, 'a WARN must not fail the self-check')
+
+  // A small bucket with zero pending stays PASS (nothing to judge).
+  const cleanRoot = makeTempDir()
+  createMultiStore(cleanRoot, {
+    sessionId: 'session-small-clean',
+    folders: Array.from({ length: 5 }, () => ({ createdAt: CURRENT_ERA_TS, scored: true })),
+  })
+  const clean = runJson(['--memory-dir', path.join(cleanRoot, 'memory'), '--sessions-dir', createEmptySessionsDir(cleanRoot)])
+  assert.equal(findCheck(clean.json, 'pending era').status, 'PASS', findCheck(clean.json, 'pending era').detail)
+})
+
 
 test('selfcheck: legacy+synthetic pending are INFO and a small current pending is PASS', () => {
   const root = makeTempDir()
@@ -1216,7 +1330,7 @@ test('selfcheck: documented environment-dependent output (neutral 8/1/0 vs QQ 11
   const profileDir = createQqProfile({
     onebot: true,
     derpyu: true,
-    toolRestrict: toolRestrictSource(['ask_user_question', 'todo_write', 'memory_judge', 'memory_recall', 'memory_image']),
+    toolRestrict: toolRestrictSource(['ask_user_question', 'todo_write', 'memory_judge', 'memory_recall', 'memory_image', 'memory_group_recall']),
   })
   const targetFile = path.join(profileDir, 'node_modules', 'qq-agent-presets', 'qq-tool-restrict.mjs')
   writeJson(path.join(store.memoryDir, '.compat-state.json'), compatStatePayload(targetFile))
@@ -1287,7 +1401,7 @@ test('selfcheck: a detected Derpyu with a patched whitelist and valid state pass
   const sessionsDir = createEmptySessionsDir(root)
   const profileDir = createQqProfile({
     derpyu: true,
-    toolRestrict: toolRestrictSource(['ask_user_question', 'todo_write', 'memory_judge', 'memory_recall', 'memory_image']),
+    toolRestrict: toolRestrictSource(['ask_user_question', 'todo_write', 'memory_judge', 'memory_recall', 'memory_image', 'memory_group_recall']),
   })
   const targetFile = path.join(profileDir, 'node_modules', 'qq-agent-presets', 'qq-tool-restrict.mjs')
   writeJson(path.join(store.memoryDir, '.compat-state.json'), compatStatePayload(targetFile))
@@ -1300,7 +1414,7 @@ test('selfcheck: a detected Derpyu with a patched whitelist and valid state pass
   assert.match(compat.detail, /detected: derpyu-qq-bridge/)
   const autopatch = findCheck(json, 'compat autopatch')
   assert.equal(autopatch.status, 'PASS', autopatch.detail)
-  assert.match(autopatch.detail, /memory_judge\/memory_recall\/memory_image present/)
+  assert.match(autopatch.detail, /memory_judge\/memory_recall\/memory_image\/memory_group_recall present/)
   assert.equal(autopatch.data.stateRecords, 1)
   assert.equal(autopatch.data.patched, true)
   // All three compat checks are present and counted, and none is a FAIL.

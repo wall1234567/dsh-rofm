@@ -123,8 +123,15 @@ const EXCLUDED_APPENDIX_MARKERS = [
 ]
 /** Role-scoped message event types and where their message payload lives. */
 const MESSAGE_EVENT_TYPES = new Set(['user/message', 'assistant/message', 'system/message', 'developer/message', 'tool/result'])
-/** Default number of (newest) session logs inspected when `--max-sessions` is absent. */
-const DEFAULT_MAX_SESSIONS = 20
+/**
+ * Default session-log sample size: 0 = scan every log.
+ *
+ * v1.4.1 (audit F-06/T-06): the old default of 20 newest logs hid a broken
+ * checkpoint note in any older session (and on the developer machine only
+ * 20/153 logs were checked). Scanning all logs costs a few seconds because the
+ * zstd frames must be decoded; `--max-sessions N` keeps the fast path.
+ */
+const DEFAULT_MAX_SESSIONS = 0
 /**
  * v1.3.0 compat: sample session ids and the stable chat key each must map to.
  *
@@ -183,8 +190,8 @@ Options:
                           fallback ~/.dsh/sessions)
   --session <id>          only inspect this session id (matches the session header
                           id and/or the session directory name)
-  --max-sessions <N>      inspect the N most recently modified session logs
-                          (default ${DEFAULT_MAX_SESSIONS}; 0 = all)
+  --max-sessions <N>      only inspect the N most recently modified session logs
+                          (default ${DEFAULT_MAX_SESSIONS === 0 ? 'all' : DEFAULT_MAX_SESSIONS}; pass a number to limit, 0 = all)
   --with-tests            also run \`node --test\` in the repository (slow)
   -h, --help              show this help
 
@@ -852,6 +859,114 @@ function validateFolderMeta(meta, dirName, storeLabel, issues, counts) {
   }
 }
 
+/**
+ * The recall-facing index entry a `meta.json` must produce (selfcheck's own
+ * reader, mirroring the documented store contract). The engine's recall path
+ * reads `index.json`, NOT `meta.json` — see `engine/store.js` `loadIndex`
+ * (index.json is the only truth; it is rebuilt only when missing/corrupt). So
+ * checking the meta schema alone can miss a stale/corrupt index that silently
+ * changes what gets recalled (audit T-05/T-13).
+ *
+ * @param {object} meta
+ * @returns {object} expected index fields
+ */
+function expectedIndexEntry(meta) {
+  const folder = meta && typeof meta === 'object' ? meta : {}
+  const stats = folder.stats && typeof folder.stats === 'object' && !Array.isArray(folder.stats) ? folder.stats : null
+  const finite = (value) => typeof value === 'number' && Number.isFinite(value)
+  const clampedBeta = finite(folder.beta) ? Math.min(10, Math.max(-10, folder.beta)) : 0
+  return {
+    createdAt: finite(folder.createdAt) ? folder.createdAt : 0,
+    alpha: finite(folder.alpha) ? folder.alpha : 0.01,
+    beta: Object.is(Math.round((clampedBeta + Number.EPSILON) * 10) / 10, -0) ? 0 : Math.round((clampedBeta + Number.EPSILON) * 10) / 10,
+    scored: folder.scored !== false,
+    rescorePending: folder.rescorePending === true,
+    keywords: Array.isArray(folder.keywords) ? folder.keywords.filter((keyword) => typeof keyword === 'string') : [],
+    chars: stats ? (finite(stats.chars) ? stats.chars : 0) : finite(folder.chars) ? folder.chars : 0,
+    tokens: stats ? (finite(stats.tokens) ? stats.tokens : 0) : finite(folder.tokens) ? folder.tokens : 0,
+    messageCount: stats ? (finite(stats.messages) ? stats.messages : 0) : finite(folder.messageCount) ? folder.messageCount : 0,
+    title: typeof folder.title === 'string' ? folder.title : '',
+  }
+}
+
+/**
+ * Compare one `index.json` entry against the `meta.json` it was derived from.
+ *
+ * Fails only when BOTH sides carry a value and they disagree (a present-but-
+ * different value is exactly the stale/corrupted index recall would use); a
+ * field missing from the legacy index shape is skipped instead of failing, so
+ * an upgrade never turns old-but-healthy stores red.
+ *
+ * @param {object} entry index.json folder entry
+ * @param {object} meta parsed meta.json
+ * @param {string} label `${storeLabel}/${id}`
+ * @param {IssueLog} issues
+ */
+function validateIndexMetaAgreement(entry, meta, label, issues) {
+  const expected = expectedIndexEntry(meta)
+  const checkNumber = (key) => {
+    if (entry[key] === undefined) return
+    if (typeof entry[key] !== 'number' || !Number.isFinite(entry[key])) {
+      issues.fail('index-entry-field-type', `${label}: index.${key}=${JSON.stringify(entry[key])} is not a finite number (recall reads index.json)`)
+      return
+    }
+    if (Math.abs(entry[key] - expected[key]) > 1e-9) {
+      issues.fail(
+        'index-meta-divergence',
+        `${label}: index.${key}=${JSON.stringify(entry[key])} differs from meta.json ${JSON.stringify(expected[key])} (recall reads index.json; the index is stale)`,
+      )
+    }
+  }
+  checkNumber('alpha')
+  checkNumber('beta')
+  checkNumber('createdAt')
+  if (entry.scored !== undefined) {
+    if (typeof entry.scored !== 'boolean') {
+      issues.fail('index-entry-field-type', `${label}: index.scored=${JSON.stringify(entry.scored)} is not a boolean (recall reads index.json)`)
+    } else if (entry.scored !== expected.scored) {
+      issues.fail(
+        'index-meta-divergence',
+        `${label}: index.scored=${JSON.stringify(entry.scored)} differs from meta.json scored=${JSON.stringify(expected.scored)} (recall reads index.json; the index is stale)`,
+      )
+    }
+  }
+  if (entry.rescorePending !== undefined && typeof entry.rescorePending !== 'boolean') {
+    issues.fail('index-entry-field-type', `${label}: index.rescorePending=${JSON.stringify(entry.rescorePending)} is not a boolean`)
+  } else if (entry.rescorePending !== undefined && entry.rescorePending !== expected.rescorePending) {
+    issues.fail('index-meta-divergence', `${label}: index.rescorePending differs from meta.json`)
+  }
+  if (entry.keywords !== undefined) {
+    if (!Array.isArray(entry.keywords) || !entry.keywords.every((keyword) => typeof keyword === 'string')) {
+      issues.fail('index-entry-field-type', `${label}: index.keywords is not an array of strings (recall reads index.json)`)
+    } else if (JSON.stringify(entry.keywords) !== JSON.stringify(expected.keywords)) {
+      issues.fail(
+        'index-meta-divergence',
+        `${label}: index.keywords=${JSON.stringify(entry.keywords.slice(0, 4))} differs from meta.json ${JSON.stringify(expected.keywords.slice(0, 4))} (recall reads index.json)`,
+      )
+    }
+  }
+  if (entry.title !== undefined && typeof entry.title !== 'string') {
+    issues.fail('index-entry-field-type', `${label}: index.title is not a string`)
+  }
+  for (const key of ['chars', 'tokens', 'messageCount']) {
+    if (entry[key] !== undefined && (typeof entry[key] !== 'number' || !Number.isFinite(entry[key]))) {
+      issues.fail('index-entry-field-type', `${label}: index.${key}=${JSON.stringify(entry[key])} is not a finite number`)
+    }
+  }
+  for (const [key, kind] of [
+    ['eventStart', 'number'],
+    ['eventEnd', 'number'],
+    ['pendingSince', 'number'],
+  ]) {
+    if (entry[key] !== undefined && (typeof entry[key] !== kind || !Number.isFinite(entry[key]))) {
+      issues.fail('index-entry-field-type', `${label}: index.${key}=${JSON.stringify(entry[key])} is not a finite number`)
+    }
+  }
+  if (entry.eventTimeSource !== undefined && typeof entry.eventTimeSource !== 'string') {
+    issues.fail('index-entry-field-type', `${label}: index.eventTimeSource=${JSON.stringify(entry.eventTimeSource)} is not a string`)
+  }
+}
+
 /** Inspect one store directory (index, folders, images, stats) — pushes issues. */
 function inspectStore(storeDir, memoryDir, issues, counts) {
   const storeLabel = path.relative(memoryDir, storeDir) || '.'
@@ -892,6 +1007,7 @@ function inspectStore(storeDir, memoryDir, issues, counts) {
   }
 
   const indexedIds = new Set()
+  const indexEntriesById = new Map()
   if (index) {
     for (const entry of index.folders) {
       if (entry === null || typeof entry !== 'object') {
@@ -908,6 +1024,7 @@ function inspectStore(storeDir, memoryDir, issues, counts) {
         continue
       }
       indexedIds.add(entry.id)
+      indexEntriesById.set(entry.id, entry)
       if (!isFile(path.join(storeDir, entry.id, 'meta.json'))) {
         issues.fail('index-entry-missing-folder', `${storeLabel}: index.json lists ${entry.id} but its meta.json is missing on disk`)
       }
@@ -938,6 +1055,8 @@ function inspectStore(storeDir, memoryDir, issues, counts) {
     const pendingBefore = counts.pending
     validateFolderMeta(parsed.value, name, storeLabel, issues, counts)
     if (counts.pending > pendingBefore) store.pending += 1
+    const indexEntry = indexEntriesById.get(name)
+    if (indexEntry !== undefined) validateIndexMetaAgreement(indexEntry, parsed.value, label, issues)
     if (index && !indexedIds.has(name)) {
       issues.fail('folder-not-indexed', `${label}: folder exists on disk but is absent from index.json`)
     }
@@ -1098,11 +1217,30 @@ function validateRecallState(state, label) {
   // byte-compatible (`block` / `ids` / `additions` — all validated below) and
   // adds the deterministic recall state: `round` (number), `configFingerprint`
   // (string), `lanes` (serialized LaneState object), `ledger` (id string array),
-  // `counters` (object) and `degraded` (boolean). Those extras are known
-  // optional fields and are deliberately NOT validated here: a bad optional
-  // field degrades inside the adapter (the "坏字段逐项降级不 throw" contract), so
-  // selfcheck must not FAIL or even warn on them — unknown fields are ignored.
-  // Only the shared core fields decide the check for both versions.
+  // `counters` (object) and `degraded` (boolean). Those extras degrade inside the
+  // adapter instead of throwing, so a bad optional field is a WARN (audit T-15:
+  // a corrupted snapshot should be visible, not silently reported as "valid"),
+  // never a FAIL. Only the shared core fields decide the check's PASS/FAIL.
+  if (state.version === 3) {
+    if (state.round !== undefined && (typeof state.round !== 'number' || !Number.isFinite(state.round))) {
+      warn('recall-state-round', `${label}: v3 round=${JSON.stringify(state.round)} is not a finite number`)
+    }
+    if (state.configFingerprint !== undefined && typeof state.configFingerprint !== 'string') {
+      warn('recall-state-fingerprint', `${label}: v3 configFingerprint is not a string`)
+    }
+    if (state.lanes !== undefined && (state.lanes === null || typeof state.lanes !== 'object' || Array.isArray(state.lanes))) {
+      warn('recall-state-lanes', `${label}: v3 lanes is not a serialized LaneState object`)
+    }
+    if (state.ledger !== undefined && (!Array.isArray(state.ledger) || !state.ledger.every((id) => typeof id === 'string'))) {
+      warn('recall-state-ledger', `${label}: v3 ledger is not an array of id strings`)
+    }
+    if (state.counters !== undefined && (state.counters === null || typeof state.counters !== 'object' || Array.isArray(state.counters))) {
+      warn('recall-state-counters', `${label}: v3 counters is not an object`)
+    }
+    if (state.degraded !== undefined && typeof state.degraded !== 'boolean') {
+      warn('recall-state-degraded', `${label}: v3 degraded is not a boolean`)
+    }
+  }
   if (state.version !== 2 && state.version !== 3) {
     fail('recall-state-version', `${label}: version=${JSON.stringify(state.version)} (expected 2 or 3)`)
   }
@@ -1303,6 +1441,12 @@ async function checkEraBuckets(report, memory) {
   let verdict = `within threshold${data.markedFolders > 0 ? `; marks ${data.markedFolders} (stale ${data.inconsistentMarks})` : ''}`
   if (current.folders < ERA_CURRENT_MIN_FOLDERS) {
     verdict = `current sample too small (${current.folders} folder(s) < ${ERA_CURRENT_MIN_FOLDERS}); thresholds not applied${data.markedFolders > 0 ? `; pendingEra marks ${data.markedFolders} (stale ${data.inconsistentMarks})` : ''}`
+    // T-14: a small bucket is not judged, but pending folders inside it must not
+    // be silently reported as "within threshold" — surface it as a WARN.
+    if (current.pending > 0) {
+      status = 'WARN'
+      verdict += `; ${current.pending} pending folder(s) not judged at this sample size`
+    }
   } else if (data.currentPendingPercent !== null && data.currentPendingPercent > ERA_CURRENT_FAIL_PERCENT) {
     status = 'FAIL'
     verdict = `current pending above the FAIL line${marksText}`

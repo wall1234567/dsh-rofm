@@ -228,6 +228,98 @@ export function resolveTargetVersion(current, options) {
 }
 
 /**
+ * Resume-mode version integrity check (v1.4.1, audit F-02).
+ *
+ * A `--resume` run attempts to finish a release whose version bump is supposed
+ * to be committed already. Historically the tool blindly tagged whatever HEAD
+ * was, while `npm publish` read the WORKING-TREE package.json — so a failed
+ * `git commit` followed by `--resume --allow-dirty` could tag a commit whose
+ * package.json still said 1.4.0 while publishing 1.4.2 (audit T-02).
+ *
+ * Pure helper: the caller reads the two version sources (committed HEAD and
+ * the dirty/clean working tree) and gets the human-readable problems back.
+ *
+ * @param {{targetVersion:string, committedVersion:string, worktreeVersion:string}} input
+ * @returns {string[]} problems (empty = safe to resume)
+ */
+export function evaluateResumeVersionIntegrity({ targetVersion, committedVersion, worktreeVersion }) {
+  const problems = []
+  if (!parseVersion(targetVersion)) return [`target version is not semver: ${JSON.stringify(targetVersion)}`]
+  if (committedVersion !== targetVersion) {
+    problems.push(
+      `HEAD package.json says ${JSON.stringify(committedVersion)} but the release targets ${JSON.stringify(targetVersion)} ` +
+        '(the version bump is not committed yet)',
+    )
+  }
+  if (worktreeVersion !== targetVersion) {
+    problems.push(
+      `working-tree package.json says ${JSON.stringify(worktreeVersion)} but the release targets ${JSON.stringify(targetVersion)}`,
+    )
+  }
+  return problems
+}
+
+/**
+ * `git fetch` arguments used by preflight. `--no-write-fetch-head` keeps
+ * `--dry-run` from creating/rewriting `.git/FETCH_HEAD` (audit T-11); the
+ * remote-tracking refs are still refreshed, which is what the behind check needs.
+ * @param {string} [branch]
+ * @returns {string[]}
+ */
+export function fetchArgs(branch = MAIN_BRANCH) {
+  return ['fetch', '--quiet', '--no-write-fetch-head', 'origin', branch]
+}
+
+/**
+ * Version recorded in `package.json` at one git ref (tag, branch or SHA).
+ * @param {string} ref
+ * @param {string} [cwd]
+ * @returns {Promise<{ok:boolean, version:string|null, error:string|null}>}
+ */
+export async function readPackageVersionAtRef(ref, cwd = REPO_ROOT) {
+  const shown = await run('git', ['show', String(ref) + ':package.json'], { cwd })
+  if (shown.code !== 0) return { ok: false, version: null, error: outputTail(shown) }
+  try {
+    const parsed = JSON.parse(shown.stdout)
+    if (!parsed || typeof parsed !== 'object' || typeof parsed.version !== 'string') {
+      return { ok: false, version: null, error: 'package.json has no string version' }
+    }
+    return { ok: true, version: parsed.version, error: null }
+  } catch (error) {
+    return { ok: false, version: null, error: 'package.json at ' + ref + ' is not valid JSON: ' + error.message }
+  }
+}
+
+/**
+ * Assert that an existing/created release tag points at a commit whose
+ * package.json version is the version being released (audit F-02). Without this
+ * a resume could publish artifacts that the tag does not describe.
+ *
+ * @param {string} tag
+ * @param {string} version
+ * @param {{cwd?:string, log?:object}} [options]
+ * @returns {Promise<void>} throws ReleaseError on mismatch
+ */
+export async function assertTagMatchesVersion(tag, version, options = {}) {
+  const cwd = options.cwd || REPO_ROOT
+  const log = options.log
+  const committed = await readPackageVersionAtRef(tag, cwd)
+  if (!committed.ok) {
+    throw new ReleaseError(
+      'tag ' + tag + ' exists but its package.json cannot be read: ' + committed.error,
+      'Inspect the tag (`git show ' + tag + ':package.json`) or delete it and bump the version.',
+    )
+  }
+  if (committed.version !== version) {
+    throw new ReleaseError(
+      'tag ' + tag + ' points at a commit whose package.json says ' + committed.version + ', not ' + version,
+      'Delete the wrong tag (git tag -d ' + tag + '), commit the version bump, then re-run with --resume.',
+    )
+  }
+  if (log) log.ok('tag ' + tag + ' commit package.json version is ' + version)
+}
+
+/**
  * Extract one version section from CHANGELOG.md.
  * The section starts at "## [<version>]" and ends before the next "## " heading.
  * @param {string} changelog
@@ -863,6 +955,28 @@ async function preflight({ options, context, log }) {
   const target = resolveTargetVersion(currentVersion, options)
   log.ok('version: ' + currentVersion + ' -> ' + target.version + (target.mode === 'resume' ? ' (resume)' : ''))
 
+  // F-02: a resume may only finish the release of the version that HEAD already
+  // declares. A failed `git commit` leaves the bump uncommitted; resuming then
+  // would tag an old commit while publishing the dirty working tree.
+  if (target.mode === 'resume') {
+    const committed = await readPackageVersionAtRef('HEAD')
+    if (!committed.ok) {
+      throw new ReleaseError('cannot read package.json at HEAD for the resume check: ' + committed.error, 'Check the git state, then re-run.')
+    }
+    const problems = evaluateResumeVersionIntegrity({
+      targetVersion: target.version,
+      committedVersion: committed.version,
+      worktreeVersion: currentVersion,
+    })
+    if (problems.length > 0) {
+      throw new ReleaseError(
+        'cannot resume the release of ' + target.version + ':\n  - ' + problems.join('\n  - '),
+        'Commit the version bump first (git add package.json engine/package.json && git commit -m "release: ' + PACKAGE_NAME + ' ' + target.version + '"), then re-run with --resume. Alternatively revert both version files and start over.',
+      )
+    }
+    log.ok('resume: HEAD and working-tree versions are both ' + target.version)
+  }
+
   const section = extractChangelogSection(context.changelog, target.version)
   if (!section || section.body.trim().length === 0) {
     throw new ReleaseError(CHANGELOG_FILE + ' has no non-empty "## [' + target.version + ']" section', 'Write the release notes first, e.g. "## [' + target.version + '] - YYYY-MM-DD".')
@@ -873,7 +987,8 @@ async function preflight({ options, context, log }) {
   if (!npm && !options.skipNpm) throw new ReleaseError('npm is not available', 'Put npm on PATH, or set NPM_CLI to npm-cli.js (DSH layouts often use %USERPROFILE%\\.npm-cli\\bin\\npm-cli.js).')
   if (npm) log.ok('npm: ' + (npm.version || 'available') + (npm.kind === 'cli' ? ' (npm-cli.js)' : ''))
 
-  const fetched = await git(['fetch', '--quiet', 'origin', MAIN_BRANCH], { log })
+  // T-11: --no-write-fetch-head keeps a --dry-run from creating .git/FETCH_HEAD.
+  const fetched = await git(fetchArgs(), { log })
   if (fetched.code !== 0) throw new ReleaseError('git fetch origin failed:\n' + outputTail(fetched), 'Check network and git credentials; an SSH remote avoids the Windows schannel TLS problem.')
   const behind = Number((await git(['rev-list', '--count', 'HEAD..origin/' + MAIN_BRANCH], { log })).stdout.trim() || '0')
   if (behind > 0) throw new ReleaseError('local ' + MAIN_BRANCH + ' is behind origin/' + MAIN_BRANCH + ' by ' + behind + ' commit(s)', 'Run git pull --ff-only origin ' + MAIN_BRANCH + ' first.')
@@ -980,6 +1095,8 @@ async function ensureTag(plan, log) {
   const existing = (await git(['tag', '--list', tag], { log })).stdout.trim()
   if (existing === tag) {
     log.info('tag ' + tag + ' already exists')
+    // F-02: an existing tag must describe the version being published.
+    await assertTagMatchesVersion(tag, plan.targetVersion, { log })
     return
   }
   if (plan.mode === 'resume') {
@@ -991,6 +1108,8 @@ async function ensureTag(plan, log) {
   const created = await git(['tag', '-a', tag, '-m', tag], { log })
   if (created.code !== 0) throw new ReleaseError('git tag ' + tag + ' failed:\n' + outputTail(created), 'Check the repository state, then re-run with --resume.')
   log.ok('created tag ' + tag)
+  // F-02: never publish a version the new tag does not actually contain.
+  await assertTagMatchesVersion(tag, plan.targetVersion, { log })
 }
 
 async function pushRef(args, description, log) {
@@ -1013,7 +1132,7 @@ async function executeRelease({ options, context, plan, log }) {
     const added = await git(['add', '--', PACKAGE_FILE, ENGINE_PACKAGE_FILE], { log })
     if (added.code !== 0) throw new ReleaseError('git add failed:\n' + outputTail(added))
     const committed = await git(['commit', '-m', message], { log })
-    if (committed.code !== 0) throw new ReleaseError('git commit failed:\n' + outputTail(committed), 'Commit manually, then re-run with --resume.')
+    if (committed.code !== 0) throw new ReleaseError('git commit failed:\n' + outputTail(committed), 'Fix the commit problem and either (a) commit the two version files manually (git add package.json engine/package.json && git commit) and re-run with --resume, or (b) revert them (git checkout -- package.json engine/package.json) and start the release again. --resume refuses to run while the version bump is uncommitted, and --allow-dirty does not make the tag/version mismatch safe.')
     log.ok('committed: ' + message)
   }
   await ensureTag(plan, log)

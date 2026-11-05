@@ -1,6 +1,6 @@
 {
   "name": "dsh-rofm",
-  "version": "1.4.2",
+  "version": "1.4.3",
   "description": "DSH 长期记忆插件：上下文超过阈值时把最早的一段对话归档进 memory/ 回忆文件夹（v1.4.1 起每次归档至少压到 releaseTargetPercent 以下），之后按关键词（双向匹配）、确定性优先级 α（FAIR-DRI）与可选时间/事件约束自动回忆。 · DSH long-term memory: archives the earliest context into memory/ folders (with a v1.4.1 archive release floor), then recalls it deterministically by keywords, priority α, time windows and event constraints.",
   "type": "module",
   "main": "index.js",

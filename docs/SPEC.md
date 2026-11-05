@@ -68,6 +68,22 @@ The DSH plugin (`index.js` at the repo root) is a thin adapter around it.
 > Both `package.json` files (`dsh-rofm` and the nested `dsh-rofm-engine`) are
 > `1.3.0`; the nested version tracks the plugin release.
 >
+> **Revision note (2026-11-05, v1.4.3).** Patch release: **rendering-only fix**, no data
+> format, no engine API, no configuration key, no migration. `package.json` and
+> `engine/package.json` are **1.4.3**. In QQ-compat sessions an archived tool message is
+> often a raw JSON payload (`qq_get_unread_messages` / `qq_wait_for_messages` from the
+> Derpyu bridge answer with `serializeModelData(...)`), so the pre-1.4.3 scoring summary
+> (first 160 chars of the flattened all-messages text) showed JSON field names instead of
+> the conversation and the model under-scored memories (observed α 0.1–0.4, median 0.3).
+> §4 now renders archived messages through `lib/message-text.js`'s model-readable layer:
+> complete JSON chat payloads become `sender：text` lines (ids/flags dropped), embedded
+> JSON snapshots in a message are extracted only when they contain a real message row,
+> conversation-bearing folders never fall back to JSON field names, and a folder with no
+> readable conversation keeps the legacy byte-identical flatten. `类型=tool` now means
+> "no readable conversation at all" (a JSON tool result carrying the chat is conversation).
+> The same rendering is used by the re-review “原文” and by the `memory_group_recall`
+> snippets; stored `context.json` is never rewritten, old folders show the fix immediately.
+>
 > **Revision note (2026-11-03, v1.4.2).** Minor release: one new adapter-only model
 > tool + one new adapter-only config block; **the engine contract is unchanged**
 > (no new engine API, no new storage fields, no migration). (1) **`memory_group_recall`**
@@ -1044,11 +1060,22 @@ instead and appears under “待复核” in the same section.
 false`; session taken from `context.agent.session`):
 
 - lists up to **100 pending new** folders (`scored === false`, createdAt asc;
-  `id` / `title` / first 160 chars of the folder text, flattened) and up to
+  `id` / `title` / a 160-char readable conversation preview) and up to
   **100 re-review** folders (`rescorePending === true`; `id` / `title` / current
-  `α` / `β` / keywords, the folder's **full original text** and the `judgeReason`
+  `α` / `β` / keywords, the folder's **full readable text** and the `judgeReason`
   recorded by its last judgement — re-archiving removed the recalled copy from
   the injected block, so the title alone would under-inform the re-judgement).
+  v1.4.3: both bodies are rendered by `lib/message-text.js`'s model-readable
+  layer — a complete JSON chat payload archived from a QQ tool result renders as
+  `sender：text` lines (ids/flags dropped) instead of JSON field names, an
+  embedded JSON snapshot in a message is only unwrapped when it contains a real
+  message row, and the render is **in place** (message order is unchanged). When
+  the folder really has readable conversation, pure `[tool-call …]` protocol
+  markers and still-raw-JSON leftovers (truncated/unparseable payloads) are
+  dropped from the summary; plain tool text keeps its position. A folder with no
+  readable conversation keeps the legacy flatten byte-for-byte. `类型` is `tool`
+  only when the folder has no readable conversation at all (`decision` / `user`
+  otherwise per the same text).
   The cap is `TASKS_LIST_LIMIT = 100` (exported by `lib/plugin.js`; v1.2 R1, was
   50). Note: 100 re-review entries with full original text can add tens of
   thousands of characters per request; the list shrinks as the model submits
@@ -3313,16 +3340,16 @@ As of the v1.2.1 revision the suites were **188/188 (engine)** and **115/115
 time-view `--help` / e2e-adapter / fixture e2e-real-data; all 8 exit 0 → PASS;
 since v1.4.1 every `node:test` step also enforces a minimum case count and a
 maximum skip count; the full-suite floor comes from `tools/gate-baseline.json`
-(recorded 1026 / max-skip 4 / e2e 12/8; effective floor = max(recorded, 98% of the
+(recorded 1060 / max-skip 4 / e2e 12/8; effective floor = max(recorded, 98% of the
 statically scanned declarations); missing/corrupt baseline = FAIL; update the
 baseline whenever tests change). Negative proofs: deleting a 53-test file FAILS
 (expected ≥1026, got 937); skipping all e2e FAILS.
-**Current measured numbers (v1.4.2, 2026-11-03)**: full suite **1026 tests /
-1024 pass / 0 fail / 2 skip**; e2e-adapter **12/12**, fixture e2e **8/8**;
-gate `8/8 PASS` with **1026 unique** node:test cases (the two e2e steps are
+**Current measured numbers (v1.4.3, 2026-11-05)**: full suite **1060 tests /
+1056 pass / 0 fail / 4 skip**; e2e-adapter **12/12**, fixture e2e **8/8**;
+gate `8/8 PASS` with **1060 unique** node:test cases (the two e2e steps are
 already part of the full run and are not double-counted; the script also prints
 the summed number of the re-runs). Final numbers are recorded in
-`docs/VERIFICATION.md` §22 and printed by the gate — do not hardcode them here
+`docs/VERIFICATION.md` §24 and printed by the gate — do not hardcode them here
 (they drift every release). Run
 `node tools/verify-1.4.0.mjs`, `node --test test/*.test.mjs`,
 `node --test test-adapter/*.test.mjs`, `node test/simulate.mjs`,

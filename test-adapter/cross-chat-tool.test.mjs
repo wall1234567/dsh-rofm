@@ -353,6 +353,35 @@ test('owner private chat: returns ONLY group memories (private/webui decoys stay
   })
 })
 
+test('group snippet shows the conversation inside a QQ tool-result JSON (v1.4.3)', async () => {
+  await withTempDirAsync(async (dir) => {
+    const memoryDir = path.join(dir, 'memory')
+    // Real shape: qq_get_unread_messages answers with serializeModelData(...).
+    const toolJson = JSON.stringify({
+      ok: true,
+      key: `group:${GROUP_A}`,
+      unreadCount: 1,
+      messages: [{ seq: 5, messageId: '880011', sender: '群友甲', userId: '70001', text: '周末有人一起去看电影吗' }],
+      readThroughSeq: 5,
+    })
+    writeStore(memoryDir, `qqb-g-${GROUP_A}-${'c'.repeat(32)}`, [
+      folder('mem-20261102T150000Z-0001', {
+        createdAt: T_1102,
+        keywords: ['电影'],
+        title: '电影邀约',
+        messages: [{ role: 'tool', content: toolJson }],
+      }),
+    ])
+    const { tool, definition } = makeFakeTool({ memoryDir })
+    const value = await tool.execute({ query: '电影' }, ownerExec())
+    assert.equal(value.found, 1)
+    assert.equal(value.entries[0].snippet, '群友甲：周末有人一起去看电影吗', 'snippet is the conversation, not field names')
+    const renderedText = definition.output.render({}, value)[0].text
+    assert.ok(renderedText.includes('群友甲：周末有人一起去看电影吗'), renderedText)
+    assert.ok(!renderedText.includes('"messageId"'), 'JSON field names must not reach the model')
+  })
+})
+
 test('unscored folders and non-group stores are never returned, even by keyword', async () => {
   await withTempDirAsync(async (dir) => {
     const memoryDir = path.join(dir, 'memory')

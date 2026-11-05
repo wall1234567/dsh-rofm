@@ -1,12 +1,11 @@
 # 发布 dsh-rofm（维护者手册）
 
-> **当前版本：1.4.2（2026-11-03）**——`package.json` 与 `engine/package.json` 必须都为 `1.4.2`
-> （`tools/release.mjs` 的预检会强制两者一致，并校验 `CHANGELOG.md` 已有 `## [1.4.2]` 段）。
-> 1.4.2 是**隐私修复版（patch）**：`config.json` 移除维护者的 QQ 号与本机路径（迁移到 git 忽略的
-> `config.local.json`），并合并此前未单独发布的内容——1.4.1（archive floor / 类别词保证 / 1.4.0 审计修复）与
-> 1.5.0（`memory_group_recall` 私聊→群聊只读 + `compat.crossChat`）。
-> **上一发布：1.3.0（2026-10-31；npm 上正被 1.4.2 取代）**；1.4.0 / 1.4.1 / 1.5.0 从未单独发布到 npm
-> （内容全部并入 1.4.2）。本手册中标注 "v1.4.1 起" 的机制在 1.4.2 继续沿用。
+> **当前版本：1.4.3（2026-11-05）**——`package.json` 与 `engine/package.json` 必须都为 `1.4.3`
+> （`tools/release.mjs` 的预检会强制两者一致，并校验 `CHANGELOG.md` 已有 `## [1.4.3]` 段）。
+> 1.4.3 是**补丁版**：修复 QQ 渠道兼容下“记忆评分任务”摘要显示原始 JSON 而不是对话正文的缺陷
+> （`lib/message-text.js` 新增模型可读渲染层；不改数据格式、无需迁移）。
+> **上一发布：1.4.2（2026-11-03，隐私修复 + memory_group_recall）**；1.4.0 / 1.4.1 / 1.5.0 从未单独发布到 npm
+> （内容全部并入 1.4.2）。本手册中标注 "v1.4.1 起" 的机制在 1.4.2/1.4.3 继续沿用。
 
 本文件记录把 `dsh-rofm` 发布到 **GitHub** 与 **npm** 的完整流程。
 仓库已具备：MIT `LICENSE`、`.gitignore`（忽略 `memory/` 运行时数据与本地噪音）、
@@ -26,7 +25,7 @@
 它把这一段原样作为 GitHub Release 正文，并用标题里的版本号做校验）：
 
 ```md
-## [1.4.2] — 2026-11-03
+## [1.4.3] — 2026-11-05
 
 一句话说明本次发布。
 
@@ -35,7 +34,7 @@
 - …
 ```
 
-> 示例用当前版本 **1.4.2**；下一次发布时把版本号/日期换成目标版本即可（脚本按 `package.json` 的当前版本
+> 示例用当前版本 **1.4.3**；下一次发布时把版本号/日期换成目标版本即可（脚本按 `package.json` 的当前版本
 > 与 `CHANGELOG.md` 里 `## [<版本>]` 段落做校验，版本是数据、不是写死在脚本里的常量）。
 
 ### 1.2 执行
@@ -44,11 +43,11 @@
 # 递增补丁版本并发布（--title 会进 commit message 与 GitHub Release 名称）
 node tools/release.mjs --bump patch --title "一句话标题" --yes
 
-# 递增补丁版本（1.4.2 → 1.4.3 即 patch）
+# 递增次版本（1.4.2 → 1.5.0 即 minor）
 node tools/release.mjs --bump minor --title "一句话标题" --yes
 
-# 或者显式指定版本（必须大于当前版本；当前 1.4.2）
-node tools/release.mjs --version 1.4.2 --title "一句话标题" --yes
+# 或者显式指定版本（必须大于当前版本；当前 1.4.2，目标 1.4.3）
+node tools/release.mjs --version 1.4.3 --title "一句话标题" --yes
 
 # 先看看会发生什么：跑完所有检查并打印计划，但不改任何东西
 node tools/release.mjs --bump patch --title "一句话标题" --dry-run
@@ -169,10 +168,10 @@ node tools/release.mjs --resume --yes
 - [ ] 跨平台检查项已过：`test/portability.test.mjs` 全绿、README §2.4「跨平台支持」与
   `docs/SPEC.md` 的 Platform and path contract 与当前代码一致（见 `docs/VERIFICATION.md` §19）；
 - [ ] `node tools/selfcheck.mjs` 在本机真实数据上 `0 failed`（历史遗留只允许 WARN）；
-- [ ] 若新增/删除测试：已同步 `tools/gate-baseline.json` 的 `minFullSuiteTests`（当前 **1026**；
+- [ ] 若新增/删除测试：已同步 `tools/gate-baseline.json` 的 `minFullSuiteTests`（当前 **1060**；
   e2e-adapter 12 / e2e-real-data 8 不变），且 `node tools/verify-1.4.0.mjs`（历史命名）= **8/8 PASS**；
 - [ ] 版本号已在 `package.json`、`engine/package.json`、`CHANGELOG.md`、git tag 四处一致
-  （当前 **1.4.2**；前三个 + tag 冲突由脚本强制检查）；
+  （目标 **1.4.3**；前三个 + tag 冲突由脚本强制检查）；
 - [ ] `memory/` 只有 `.gitkeep`，`git status` 干净；
 - [ ] `npm pack --dry-run` 预演通过，包内只有 `memory/.gitkeep`（无会话数据 / 无测试目录）。
 

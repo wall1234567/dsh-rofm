@@ -14,7 +14,8 @@
 > 不再代表当前版本（数字统一以 `npm test` 实测为准，不在文档里写死）。
 > **v1.4.0 的验证记录见 §20**（确定性召回/公平性、时间辅助、小窗口、数据时代、兼容与性能）——
 > §20/§21 是 **v1.4.0 的历史记录**（2026-11-01/02 实测，数字已过时，仅作历史留档）。
-> **当前版本 v1.4.1 的最终验证记录见 §22**（2026-11-02 实测，含全量测试/门禁/自检/e2e/数据快照）。
+> **当前版本 v1.4.3 的最终验证记录见 §24**（2026-11-05 实测，含全量测试/门禁/自检/e2e/真实数据前后对比；
+> §22/§23 为 v1.4.1/v1.4.2 历史记录）。
 
 ## 1. 自动化测试
 
@@ -941,7 +942,7 @@ macOS 专项处理：APFS 大小写不敏感由 **`realpath` 归一化**吸收�
 
 ## 20. v1.4.0 验证记录（2026-11-01，历史留档）
 
-> **本节是 v1.4.0 发布时的验证记录（历史留档，数字已过时）**；当前版本 v1.4.1 的最终记录见 §22。
+> **本节是 v1.4.0 发布时的验证记录（历史留档，数字已过时）**；当前版本 v1.4.3 的最终记录见 §24。
 > 环境：Windows 11、Node v24.21.0、DSH 自带运行时、
 > 仓库 `<repo>`；真实库 21 个 store / 3742 folders）。数字为 2026-11-01 收尾实测；
 > 一键门禁 `node tools/verify-1.4.0.mjs` 是最终可复现的发布口径（8 步全部 exit 0 才算 PASS）。
@@ -1295,7 +1296,7 @@ CJK bigram + CJK 单字），`≥ event.similarity.threshold=0.72` 视为“双�
 - CLI `--event` 有 200 字符长度上限（超长报参数错误）；工具侧超长同样按参数错误处理。
 - 与时间约束一致：事件约束只作用于第一代候选，`hops` 后代沿用同一约束集。
 
-## 22. v1.4.1 验证记录（2026-11-02，历史留档；当前版本记录见 §23）
+## 22. v1.4.1 验证记录（2026-11-02，历史留档；当前版本记录见 §24）
 
 > **环境**：Windows 11、Node v24.21.0（DSH 自带运行时）、仓库 `<repo>`。
 > 所有写盘测试用 `os.tmpdir()`；真实 `memory/` 在验证期间只读（清理测试/压测数据由 cleanup-data 单独执行，
@@ -1358,7 +1359,7 @@ node --test test/e2e-real-data-readonly.test.mjs
 node tools/memory-audit.mjs --json
 ```
 
-## 23. v1.4.2 验证记录（2026-11-03，当前版本）
+## 23. v1.4.2 验证记录（2026-11-03，历史留档；当前版本记录见 §24）
 
 > **环境**：Windows 11、Node v24.21.0（DSH 自带运行时）、仓库 `<repo>`。
 > 所有写盘测试使用 `os.tmpdir()`；真实 `memory/` 在验证期间只读。
@@ -1446,3 +1447,78 @@ node tools/privacy-check.mjs
 grep -rn "群聊也可\|群聊也能查\|私聊数据会返回\|群聊会话也能用" README.md docs/SPEC.md CHANGELOG.md
 ```
 
+
+## 24. v1.4.3 验证记录（2026-11-05，当前版本）
+
+> **环境**：Windows 11、Node v24.21.0（DSH 自带运行时）、仓库 `<repo>`。
+> 所有写盘测试使用 `os.tmpdir()`；真实 `memory/` 与真实归档在验证期间只读。
+> 本节对应“QQ 渠道兼容下评分摘要是原始 JSON、模型看不到对话正文”的用户报告。
+> §23 保留为 1.4.2 历史记录；§1–§22 为更早版本历史。
+
+### 24.1 缺陷与复现（修复前）
+
+- **报告**：模型给记忆打分时普遍偏低（α 0.1~0.4，71 条真实对话 α 中位数 0.3）；报告者抽样
+  353 个归档中 212 个（60%）的摘要以 `{"newMessages":[{"seq":5,"messageId":"…","sender":"私聊",
+  "text":"真实聊天对话的内容"...` 这类原始 JSON 开头。
+- **机制**：QQ 渠道兼容（Derpyu520/qq-bridge）会话里，MCP 工具结果就是
+  `serializeModelData(...)` 的 JSON 字符串（`qq_get_unread_messages` 返回
+  `{"ok":true,"key":…,"messages":[{…,"text":…}]}`；`qq_wait_for_messages` 返回带
+  `newMessages` 的同形 JSON）。`memoryFolderTaskInfo`（1.3.0 时叫 `memoryFolderSummary`）
+  把归档消息经 `messageToText` flatten 后 `slice(0, 160)`：前 160 字符全是 `"seq"`/`"messageId"`
+  等字段名，模型只能凭字段名猜重要性 → 低 α。
+- **修复前实测**（本机真实库 3 stores / 1264 folders；用当时工作树代码 + 报告形态的合成归档）：
+  - QQ unread/wait JSON 的摘要分别为
+    `tool: {"ok":true,"key":"private:765280787","unreadCount":2,"messages":[{"seq":5,"messageId":…`，
+    真实对话正文在 160 字符窗口外；
+  - 真实库里**旧摘要以 JSON/工具标记开头** 的文件夹 **188 个**，其 α **中位数 0.05、均值 0.116**；
+    旧摘要以可读正文开头的 1074 个文件夹 α **中位数 0.10、均值 0.134** —— 与“JSON 摘要 → 低 α”
+    的报告方向一致（本机以 WebUI/工具会话为主；报告者是 QQ 重度使用场景，故比例 60% vs 14.9%）。
+
+### 24.2 修复内容（渲染层，无数据迁移）
+
+- 新增 `lib/message-text.js` 模型可读渲染层（`messagePreview` / `conversationPreview` /
+  `messagesToReadableText`）：完整 JSON chat 载荷按 `sender：text` 行提取（丢弃 seq/messageId/
+  userId/ok 等 id 与标记），支持 `messages` / `newMessages` / 内容块数组 / 嵌套数组；用户消息内嵌
+  JSON 快照（QQ 唤醒提示「本次消息快照」）仅当 JSON 至少含一条真实消息行时才提取（代码/配置
+  JSON 不误伤）；坏/截断 JSON 安全退回旧渲染，全程 bounded（单消息 4000 字符 / 500 节点）且不抛错。
+- **原地渲染**：消息顺序不变；有可读对话时剔除纯 `[tool-call …]` 协议标记与仍解析不出正文的原始
+  JSON 残片，普通文本工具输出保留原位置；整个文件夹无可读对话时退回旧 flatten，输出逐字节不变。
+- 消费面：评分摘要 `memoryFolderTaskInfo`、待复核「原文」`memoryFolderReview`、
+  `memory_group_recall` 群聊摘要 `snippetOf`；`类型` 改为“完全无可读对话才是 tool”。
+- 存档 `context.json` 不重写；旧归档下次生成任务区块时立即按新渲染显示。
+
+### 24.3 修复后实测（本机真实库，只读对比）
+
+| 指标 | 修复前 | 修复后 |
+|---|---|---|
+| 摘要以 JSON/工具标记开头的文件夹 | 188 / 1264（14.9%） | **165 / 1264（13.1%）**，全部为“整个文件夹无可读对话”（纯 tool-call/协议标记 141、截断/坏 JSON 24），有对话的文件夹 **0 个**仍以原始 JSON 开头 |
+| 由 JSON 摘要变为可读对话的文件夹 | — | **23** |
+| 摘要内容发生变化的文件夹 | — | **42**（其余 1222 个逐字节相同；0 个空摘要） |
+| JSON 摘要文件夹的 α（n=188） | 中位数 0.05 / 均值 0.116 | 修复针对的是评分输入，不批量回写旧 α |
+| 可读摘要文件夹的 α（n=1074） | 中位数 0.10 / 均值 0.134 | — |
+| 抽查 10 条变化条目 | — | 均为“JSON 字段名 → 对话正文”或“去掉 tool-call 协议标记”，未发现信息丢失/怪异输出 |
+
+### 24.4 测试与门禁（2026-11-05 本机实测）
+
+- `node --test` = **1060 tests / 1056 pass / 0 fail / 4 skip**（4 skip = 平台符号链接/zstd 条件跳过）。
+  新增：`test/message-preview.test.mjs` **17 例** + adapter **4 例**（`scoring-pressure` 3、`cross-chat-tool` 1）。
+  回归点：QQ unread/wait JSON → `sender：text`；内嵌快照提取；坏/截断 JSON 不抛错；非聊天 JSON 退回；
+  协议标记剔除仅在有对话时；tool-only 摘要逐字节不变；待评分摘要/类型/待复核原文/群聊 snippet。
+- `node tools/verify-1.4.0.mjs` = **8/8 PASS**（baseline recorded **1060** / maxSkipped 4 / e2e 12/8 不变；
+  详见门禁原始输出）。
+- `tools/selfcheck.mjs`、`test/simulate.mjs`、e2e-adapter 12/12、e2e-real-data 8/8 与 1.4.2 口径一致。
+- 版本：`package.json` / `engine/package.json` = **1.4.3**；`test/config-consistency.test.mjs` 8/8 PASS
+  （版本从 package.json 读取、CHANGELOG 有非空 `[1.4.3]` 段）。
+
+### 24.5 复跑命令
+
+```bash
+export PATH="<node-bin>:$PATH"
+cd <repo>
+node --test
+node tools/verify-1.4.0.mjs
+node tools/selfcheck.mjs
+node test/simulate.mjs
+node --test test/message-preview.test.mjs
+node --test test-adapter/scoring-pressure.test.mjs test-adapter/cross-chat-tool.test.mjs
+```

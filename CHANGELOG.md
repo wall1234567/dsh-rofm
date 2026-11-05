@@ -7,6 +7,44 @@ The project follows a lightweight [SemVer](https://semver.org/) scheme.
 
 （下一个版本的变更写在这里。）
 
+## [1.4.3] — 2026-11-05
+
+**补丁版：修复 QQ 渠道兼容下“记忆评分任务”的摘要是原始 JSON、模型看不到对话正文而普遍打低 α 的缺陷。**
+
+### Fixed
+
+- **待评分摘要看不到对话正文（用户报告）**：`memoryFolderTaskInfo`（1.3.0 时叫
+  `memoryFolderSummary`）用 `text.slice(0, 160)` 截取由所有消息 flatten 成的文本。QQ 兼容
+  （Derpyu520/qq-bridge 的 MCP 工具）会话归档的 tool 消息 content 是原始 JSON——
+  `qq_get_unread_messages` 返回 `{"ok":true,"key":"private:…","messages":[{"seq":5,"messageId":"…",
+  "sender":"私聊","text":"真实聊天内容"}]}`，`qq_wait_for_messages` 返回带 `newMessages` 的同形
+  JSON——前 160 个字符全是字段名，模型只能凭字段名判断重要性。实测 71 条真实对话 α 中位数
+  仅 0.3（大量 0.1~0.4），353 个归档里 212 个（60%）的摘要这样开头。新增
+  `lib/message-text.js` 的模型可读渲染层（v1.4.3）：
+  - `messagePreview` / `conversationPreview` / `messagesToReadableText` 把完整 JSON 工具结果按
+    chat 行提取（`sender：text`，丢弃 seq/messageId 等 id 与布尔标记），覆盖
+    `messages` / `newMessages` / 内容块数组 / 嵌套（转发）数组；
+  - 用户消息里内嵌的 JSON 快照（如 QQ 唤醒提示的「本次消息快照」）同样按 chat 行提取，但要求
+    解析出的 JSON 至少含一条真实消息行，正文里的代码/配置 JSON 不会被误当快照；
+  - **原地渲染，不改变摘要“先显示哪些消息”的语义**：每条消息保持原位置，只是 JSON 工具结果
+    显示为对话；当文件夹确实有可读对话时，纯 `[tool-call …]` 协议标记与仍解析不出正文的
+    原始 JSON 残片（截断/坏 JSON）会从摘要里剔除，普通文本工具输出保留原位置；整个文件夹
+    完全没有可读对话时退回旧的整段 flatten，这类 tool-only 文件夹的摘要逐字节不变；
+  - 非聊天 JSON（配置/task 元数据）解析不出 chat 行时退回旧渲染；坏/截断 JSON 不抛错；
+  - 同缺陷类的两个消费面一并修复：待复核「原文」`memoryFolderReview` 与 `memory_group_recall`
+    的群聊摘要 `snippetOf` 都改用可读渲染；
+  - `类型` 判定改为“文件夹完全无可读对话才是 tool”：承载 QQ 对话的 JSON 工具结果不再被标成
+    `类型=tool`（过程日志暗示会让模型二次压低 α）。
+- **回归测试**：新增 `test/message-preview.test.mjs`（17 例：QQ unread/wait 形态、内嵌快照、
+  sender、坏 JSON、误伤防护、原地渲染/协议标记剔除、tool-only 逐字节不变、边界/异常安全）+
+  adapter 4 例（`scoring-pressure` 待评分摘要/类型/待复核原文、`cross-chat-tool` 群聊摘要）。
+  本机实测：旧摘要以 JSON 开头的 188 个文件夹 α 中位数 0.05（均值 0.116），可读摘要的
+  1074 个 α 中位数 0.10（均值 0.134）——与用户报告的“JSON 摘要 → 低 α”一致。
+  `node --test` = **1060 tests / 1056 pass / 4 skip / 0 fail**。
+- **版本/门禁**：`package.json` / `engine/package.json` → **1.4.3**；`tools/gate-baseline.json`
+  更新为 1060（maxSkipped 仍为 4）。本版只改渲染方式，**不改数据格式、不迁移旧数据**：
+  旧文件夹不需要重写即生效（摘要每次从 `context.json` 重新生成）。
+
 ## [1.4.2] — 2026-11-03
 
 **隐私修复 + 未发布的 1.4.1/1.5.0 内容合并发布（1.3.0 之后首个公开版本）**。

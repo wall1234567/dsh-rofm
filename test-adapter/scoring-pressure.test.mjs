@@ -500,6 +500,91 @@ test('pending task items show content type and waiting age', withTempDir(async (
   assert.match(text, /id=mem-user-0001 · 类型=user · 已等待 刚刚/, text)
 }))
 
+test('pending task summary shows QQ tool-result conversation, not raw JSON (v1.4.3)', withTempDir(async (dir) => {
+  const memoryDir = path.join(dir, 'memory')
+  mkdirSync(memoryDir, { recursive: true })
+  // The Derpyu bridge answers qq_get_unread_messages with serializeModelData(...):
+  // a JSON string whose first 160 chars used to be nothing but field names.
+  const toolJson = JSON.stringify({
+    ok: true,
+    key: 'private:765280787',
+    unreadCount: 1,
+    messages: [{ seq: 5, messageId: '765280787', sender: '私聊', userId: '765280787', text: '我决定以后所有项目都用 python' }],
+    readThroughSeq: 5,
+  })
+  writePending(memoryDir, 'mem-qq-json-0001', {
+    text: toolJson,
+    createdAt: Date.now() - 3600_000,
+    messages: [
+      { role: 'tool', content: toolJson },
+      { role: 'assistant', content: '好的，记下了。' },
+    ],
+  })
+  const session = new FakeSession({ id: 'session-qq-json', contextWindow: 20000 })
+  appendSystem(session)
+  const { ctx, capture } = makeContext(session)
+  const plugin = new RofmPlugin(ctx, makeOverrides(memoryDir))
+  plugin.start()
+  const text = tasksText(capture, session)
+  const line = text.split('\n').find((entry) => entry.includes('id=mem-qq-json-0001'))
+  assert.ok(line, `pending item is listed: ${text.slice(0, 400)}`)
+  assert.ok(line.includes('摘要=私聊：我决定以后所有项目都用 python'), line)
+  assert.equal(line.includes('"messageId"'), false, 'JSON field names must not reach the model')
+  // The folder now carries the conversation, so it is not process-log-only.
+  assert.ok(line.includes('类型=decision'), line)
+}))
+
+test('pending task content type stays tool when no readable conversation exists', withTempDir(async (dir) => {
+  const memoryDir = path.join(dir, 'memory')
+  mkdirSync(memoryDir, { recursive: true })
+  // A truncated JSON tool payload cannot be parsed into conversation: the folder
+  // must keep the legacy summary and the legacy "tool" label (no regression).
+  const truncated = '{"id":"task-2","revision":1,"subject":"阶段A-1: engine/recall-index.js'
+  writePending(memoryDir, 'mem-tool-truncated-0001', {
+    text: truncated,
+    createdAt: Date.now() - 3600_000,
+    messages: [{ role: 'tool', content: truncated }],
+  })
+  const session = new FakeSession({ id: 'session-tool-truncated', contextWindow: 20000 })
+  appendSystem(session)
+  const { ctx, capture } = makeContext(session)
+  const plugin = new RofmPlugin(ctx, makeOverrides(memoryDir))
+  plugin.start()
+  const text = tasksText(capture, session)
+  const line = text.split('\n').find((entry) => entry.includes('id=mem-tool-truncated-0001'))
+  assert.ok(line, text.slice(0, 400))
+  assert.ok(line.includes('类型=tool'), line)
+  assert.ok(line.includes(`摘要=tool: ${truncated.slice(0, 40)}`), line)
+}))
+
+test('re-review body renders QQ tool-result JSON readably (v1.4.3)', withTempDir(async (dir) => {
+  const memoryDir = path.join(dir, 'memory')
+  mkdirSync(memoryDir, { recursive: true })
+  const waitJson = JSON.stringify({
+    ok: true,
+    key: 'private:765280787',
+    newMessages: [{ seq: 7, messageId: '765280789', sender: '私聊', userId: '765280787', text: '你上次说的那家甜品店叫啥来着' }],
+    readThroughSeq: 7,
+  })
+  writeFolder(memoryDir, 'mem-qq-review-0001', {
+    createdAt: Date.now() - 3600_000,
+    text: waitJson,
+    messages: [{ role: 'tool', content: waitJson }],
+    rescorePending: true,
+    keywords: ['甜品'],
+  })
+  const session = new FakeSession({ id: 'session-qq-review', contextWindow: 20000 })
+  appendSystem(session)
+  const { ctx, capture } = makeContext(session)
+  const plugin = new RofmPlugin(ctx, makeOverrides(memoryDir))
+  plugin.start()
+  const text = tasksText(capture, session)
+  assert.ok(text.includes('### 待复核的已召回记忆'), text.slice(0, 300))
+  assert.ok(text.includes('原文：'))
+  assert.ok(text.includes('私聊：你上次说的那家甜品店叫啥来着'), 'the re-review body is the conversation')
+  assert.equal(text.includes('"readThroughSeq"'), false, 'JSON field names must not reach the model')
+}))
+
 test('re-review entries are truncated to the task-block budget instead of growing unbounded', withTempDir(async (dir) => {
   const memoryDir = path.join(dir, 'memory')
   mkdirSync(memoryDir, { recursive: true })

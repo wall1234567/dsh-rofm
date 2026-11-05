@@ -8,12 +8,33 @@
 > 回忆块注入在**系统提示词区块**里（v1.1 形态；v1.2 曾试验“最早历史消息”，已按用户要求**回退**）。
 > v1.2 另增 `memory_recall`（模型主动按关键词回忆）与 `memory_image`（按关键词/记忆 id/文件名找归档图片文件）。
 > v1.4.2 再增 `memory_group_recall`：**QQ 私聊主人**可只读查询**群聊**历史记忆（私聊→群聊允许、群聊→任何禁止，见 §3.2.10）。
+> v1.4.3 修复了 QQ 渠道下「记忆评分任务」摘要显示原始 JSON 而不是对话正文、导致模型普遍打低 α 的缺陷
+> （新增模型可读渲染层，原地渲染、无需迁移，见下方 v1.4.3 说明）。
 > 归档中的图片存入每会话的 `images/`；回忆时块里显示图片的**文件路径**（不重新上传附件），
 > 模型用 `read_image` 读取。
 > v1.2 把单次归档上限提高到 500 个文件夹、“记忆评分任务”每轮最多列 **100 条待评分 + 100 条待复核**；
 > 文件夹标题优先取用户消息并在同一次归档内自动去重；多次归档的 checkpoint 注记合并为一条
 > （N = 累计归档段数），归档不再把宿主会重新注入的 pinned 上下文写进注记；新增
 > `tools/selfcheck.mjs` 独立自检工具（见 §7）。
+>
+> **v1.4.3（补丁：评分摘要显示原始 JSON → 修复为对话正文，必读）**
+>
+> QQ 渠道兼容（Derpyu520/qq-bridge 的 MCP 工具）会话里，归档的 tool 消息 content 是原始 JSON
+> （`qq_get_unread_messages` 返回 `{"ok":true,"key":…,"messages":[{"seq":5,"messageId":"…",
+> "sender":"私聊","text":"真实聊天内容"}]}`，`qq_wait_for_messages` 返回带 `newMessages` 的同形 JSON）。
+> 旧实现把归档消息 flatten 后 `slice(0,160)` 当摘要，前 160 字符全是 `"seq"`/`"messageId"` 等字段名，
+> 模型看不到对话正文、只能凭字段名猜重要性 → α 普遍偏低（报告者实测 71 条真实对话 α 中位数 0.3；
+> 353 个归档里 212 个（60%）摘要这样开头）。
+>
+> v1.4.3 新增 `lib/message-text.js` 模型可读渲染层（`messagePreview` / `conversationPreview` /
+> `messagesToReadableText`）：JSON 工具结果按 `sender：text` chat 行提取（丢弃 id/布尔标记），
+> 用户消息内嵌 JSON 快照（QQ 唤醒提示「本次消息快照」）也按真实消息行提取；**原地渲染**
+> （消息顺序不变），有可读对话时剔除纯 `[tool-call …]` 标记与解析不出正文的原始 JSON 残片，
+> 无可读对话的 tool-only 文件夹摘要逐字节不变。待复核「原文」与 `memory_group_recall` 群聊摘要
+> 同缺陷一并修复；`类型` 仅在完全无对话时为 `tool`。**不改数据格式、无需迁移**：旧归档下次
+> 生成任务区块即按新渲染显示。验证见 `docs/VERIFICATION.md` §24（本机 1264 个真实文件夹：
+> 188 个 JSON 摘要 → 23 个变可读对话、42 个摘要变化、1222 个逐字节不变；JSON 摘要文件夹
+> α 中位数 0.05 vs 可读摘要 0.10，与报告方向一致）。
 >
 > **v1.4.2（隐私修复 + 新工具：QQ 私聊 → 群聊记忆只读查询，必读）**
 >
@@ -1953,8 +1974,12 @@ selfcheck: 10 passed, 2 warnings, 0 failed
 **v1.4.2 最终实测（2026-11-03）**：`node --test` = **1026 tests / 1024 pass / 0 fail / 2 skip**
 （新增 `test-adapter/cross-chat-tool.test.mjs` **20 例**；2 skip = Node zstd 平台条件跳过），
 e2e-adapter **12/12** + e2e-real-data（夹具）**8/8**；一键门禁 = **8/8 PASS**
-（1026 unique / 1046 summed with e2e re-runs）。最终数字与完整记录见
-[docs/VERIFICATION.md](docs/VERIFICATION.md) §23（§20/§21/§22 为 v1.4.0/v1.4.1 历史记录）；
+（1026 unique / 1046 summed with e2e re-runs）。
+**v1.4.3 最终实测（2026-11-05）**：`node --test` = **1060 tests / 1056 pass / 0 fail / 4 skip**
+（新增 `test/message-preview.test.mjs` **17 例** + adapter **4 例**），e2e-adapter **12/12** +
+e2e-real-data（夹具）**8/8**；一键门禁 = **8/8 PASS**（1060 unique / 1080 summed with e2e re-runs）。
+最终数字与完整记录见 [docs/VERIFICATION.md](docs/VERIFICATION.md) §24（§20/§21/§22/§23 为
+v1.4.0/v1.4.1/v1.4.2 历史记录）；
 CI 在 Linux/Windows/macOS × Node 20/22/24 上校验）：
 `test/` 覆盖引擎用例 + `simulate`（含 v1.3.0 的 compat / compat-autopatch / heuristic-score /
 passive-archive / qq-media / recall `minAlpha` 用例、`test/portability.test.mjs` 跨平台用例，
@@ -2086,6 +2111,22 @@ and `dsh-rofm:memory-tasks`) and 3 event listeners** (plus a 4th
 `enabled:false` in `config.json` nothing is registered at all) — no timers,
 child processes or background jobs.
 
+- **v1.4.3 (patch: readable scoring summaries)**: in QQ-compat sessions an archived tool message is
+  often a raw JSON payload (`qq_get_unread_messages` / `qq_wait_for_messages` answer with
+  `serializeModelData(...)`), so the pre-1.4.3 scoring summary (first 160 chars of the flattened
+  all-messages text) showed JSON field names instead of the conversation and the model under-scored
+  memories (reported: 71 real conversations α median 0.3; 212/353 archives started with raw JSON).
+  `lib/message-text.js` now has a model-readable layer (`messagePreview` / `conversationPreview` /
+  `messagesToReadableText`): complete JSON chat payloads render as `sender：text` lines (ids/flags
+  dropped), embedded JSON snapshots in a message are unwrapped only when they contain a real message
+  row, and the render is in place — pure `[tool-call …]` markers and still-raw-JSON leftovers are
+  dropped only when the folder really has readable conversation; a folder with no conversation keeps
+  the legacy byte-identical flatten. The re-review “原文” and `memory_group_recall` snippets use the
+  same rendering; `类型=tool` now means "no readable conversation at all". Rendering-only: no data
+  format change, no migration (old folders show the fix on the next task block). Verified 2026-11-05
+  on the dev machine: `node --test` **1060 tests / 1056 pass / 4 skip / 0 fail**,
+  `node tools/verify-1.4.0.mjs` **8/8 PASS**; the live-data before/after numbers are in
+  `docs/VERIFICATION.md` §24.
 - **v1.4.2 (minor: new model tool + new config block)**: **`memory_group_recall`** lets a QQ
   **private-chat owner** query QQ **group-chat** history memories (keyword / group id or chatKey /
   time range / `listGroups`, `limit`/`offset` pagination). Directionality is a hard rule — private →

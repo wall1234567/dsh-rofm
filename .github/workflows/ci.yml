@@ -16,7 +16,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        # macOS is pinned to the x64 image (`macos-15-intel`): the arm64
+        # `macos-latest` pool is capacity-constrained and GitHub cancels jobs
+        # that cannot acquire a runner after ~15 minutes, which turned the
+        # 1.4.4 release CI red twice without any code failure. The three-OS
+        # contract is unchanged; only the macOS architecture is pinned.
+        os: [ubuntu-latest, windows-latest, macos-15-intel]
         node: [20, 22, 24]
     steps:
       - uses: actions/checkout@v4

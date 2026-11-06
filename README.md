@@ -936,7 +936,7 @@ git clone https://github.com/<you>/dsh-rofm.git
 | --- | --- | --- | --- | --- | --- |
 | Linux | `ubuntu-latest` | ✅ | ✅ | ✅ | 大小写敏感文件系统；普通用户权限 |
 | Windows | `windows-latest` | ✅ | ✅ | ✅ | NTFS 大小写不敏感；测试步骤用 Git Bash（`shell: bash`） |
-| macOS | `macos-latest` | ✅ | ✅ | ✅ | APFS 默认大小写不敏感；系统自带 bash 3.2 |
+| macOS | `macos-15-intel`（x64） | ✅ | ✅ | ✅ | APFS 默认大小写不敏感；系统自带 bash 3.2；固定 x64 镜像以避开 arm64 runner 容量队列 |
 
 > 本仓库开发机的**真机回归只覆盖 Windows**（结果见 [docs/VERIFICATION.md](docs/VERIFICATION.md) §19）；
 > Linux / macOS 的结论来自 CI 矩阵 + 静态审计，矩阵上任何一格变红都按平台回归处理。

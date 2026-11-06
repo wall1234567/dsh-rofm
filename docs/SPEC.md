@@ -3377,8 +3377,11 @@ test output summary, any deviation from this spec, and a 10-line usage example.
 
 `dsh-rofm` supports **Windows, Linux and macOS** equally. CI (`.github/workflows/ci.yml`)
 runs the whole suite on **3 operating systems × Node 20/22/24** (`ubuntu-latest`,
-`windows-latest`, `macos-latest`; every step uses `shell: bash`, which is Git Bash on
-Windows and the system bash 3.2 on macOS). This section is the contract for
+`windows-latest`, `macos-15-intel`; every step uses `shell: bash`, which is Git Bash on
+Windows and the system bash 3.2 on macOS). macOS is pinned to the x64 image because the
+arm64 `macos-latest` pool is capacity-constrained and GitHub cancels jobs that cannot
+acquire a runner after ~15 minutes; the three-OS contract is unchanged. This section is
+the contract for
 `engine/`, `test/` and `tools/`; the user-facing guidance lives in `README.md`
 §2.4 "跨平台支持（Windows / Linux / macOS）".
 

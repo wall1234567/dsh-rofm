@@ -25,7 +25,8 @@ npm run check                          # 测试 + 模拟 + selfcheck + CLI help 
 
 ## 三平台开发与测试（v1.3.0）
 
-- **CI 矩阵**：`.github/workflows/ci.yml` 在 `ubuntu-latest` / `windows-latest` / `macos-latest`
+- **CI 矩阵**：`.github/workflows/ci.yml` 在 `ubuntu-latest` / `windows-latest` / `macos-15-intel`
+  （macOS 固定 x64 镜像，避开 arm64 `macos-latest` 的容量队列；三平台契约不变）
   × Node 20/22/24 上跑全部步骤（引擎测试、适配层测试、`test/simulate.mjs`、`node engine/cli.mjs --help`、
   `node tools/selfcheck.mjs`），全部步骤用 `shell: bash`（Windows 上是 Git Bash；macOS 自带的
   bash 3.2 也兼容）。PR 必须让 9 个组合全绿。

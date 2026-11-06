@@ -1448,7 +1448,7 @@ grep -rn "群聊也可\|群聊也能查\|私聊数据会返回\|群聊会话也�
 ```
 
 
-## 24. v1.4.3 验证记录（2026-11-05，当前版本）
+## 24. v1.4.3 验证记录（2026-11-05，历史留档；当前版本记录见 §25）
 
 > **环境**：Windows 11、Node v24.21.0（DSH 自带运行时）、仓库 `<repo>`。
 > 所有写盘测试使用 `os.tmpdir()`；真实 `memory/` 与真实归档在验证期间只读。
@@ -1521,4 +1521,53 @@ node tools/selfcheck.mjs
 node test/simulate.mjs
 node --test test/message-preview.test.mjs
 node --test test-adapter/scoring-pressure.test.mjs test-adapter/cross-chat-tool.test.mjs
+```
+
+## 25. v1.4.4 验证记录（2026-11-06，当前版本）
+
+### 25.1 缺陷与复现（修复前）
+
+用户报告：会话每轮请求都失败，报
+`Failed to parse the request body as JSON: system[0].text: unexpected end of hex escape`，
+待评分记忆永远评不上分。
+
+- 根因：`conversationPreview` 的 160 码元摘要等按 UTF-16 码元 `slice`；emoji 跨边界时
+  截出孤立高代理项 → 摘要进入 `dsh-rofm:memory-tasks` 系统提示词 → 宿主 `JSON.stringify`
+  把孤立代理项转义成 `\ud83e` → DeepSeek Messages 接口拒绝这种非法转义。
+- 本机真实接口对照（`POST https://api.deepseek.com/anthropic/v1/messages`，`max_tokens=1`）：
+  正常请求 `200`；system 含孤立代理项（序列化为 `\ud83e`）→
+  `400 Failed to parse the request body as JSON: system[0].text: unexpected end of hex escape`；
+  人为 `\ud83`（少一位）→ `400 ... invalid escape`。
+- 死锁：请求在模型回合前 400 → 无法调用 `memory_judge` → folder 保持 `scored:false` →
+  下一轮再次注入同一坏摘要；重启无效（folder + recall-state 快照持久化；启发式兜底只作用于新归档）。
+
+### 25.2 修复内容（无数据迁移）
+
+- `lib/message-text.js` 新增 `safeSlice()` / `toWellFormed()`，用于 `truncate`、
+  `pushPreviewLine`、`conversationPreview`、`messagesToReadableText`；
+- `lib/plugin.js`：复核原文预算截断改 `safeSlice`；两个 systemPrompt section 注册处统一
+  `toWellFormed`；checkpoint 注记二次拼接后清洗；`recall-state.json` 的 `block` 写入前清洗；
+- `lib/memory-tool.js`（`judgeReason` 300 + 工具结果）、`lib/cross-chat-tool.js`（snippet +
+  工具结果）、`lib/images.js`（图片消息正文 truncate 镜像）、`lib/recall-tool.js` 与
+  `lib/image-tool.js`（工具结果）同步清洗；
+- 存档 `context.json` 不重写：摘要/原文每次从 `context.json` 重新渲染，旧 folder 自动生效。
+
+### 25.3 测试与门禁（2026-11-06 本机实测）
+
+- `node --test` = **1067 tests / 1065 pass / 2 skip / 0 fail**（6 unit + 1 adapter 新例）。
+- `node tools/verify-1.4.0.mjs` = **8/8 PASS**（baseline → 1067 / maxSkipped 4 / e2e 12/8 不变）。
+- `node test/simulate.mjs`、`node tools/selfcheck.mjs`、`node tools/privacy-check.mjs`、
+  `node engine/cli.mjs --help` 全 PASS；`test/config-consistency.test.mjs` 通过
+  （版本从 package.json 读取、CHANGELOG 有非空 `[1.4.4]` 段）。
+- 版本：`package.json` / `engine/package.json` = **1.4.4**；`tools/gate-baseline.json` 同步 1067。
+
+### 25.4 复跑命令
+
+```bash
+export PATH="<node-bin>:$PATH"
+cd <repo>
+node --test
+node tools/verify-1.4.0.mjs
+node --test test/message-preview.test.mjs
+node --test test-adapter/scoring-pressure.test.mjs
 ```

@@ -20,6 +20,9 @@ import {
   messagePreview,
   messageToText,
   messagesToReadableText,
+  safeSlice,
+  toWellFormed,
+  truncate,
 } from '../lib/message-text.js'
 
 const QQ_UNREAD = JSON.stringify({
@@ -228,4 +231,85 @@ test('JSON extraction is bounded and never throws on hostile payloads', () => {
   for (const content of [null, '', '{', '[1,2,3', 42, { nested: { text: 7 } }]) {
     assert.doesNotThrow(() => messagePreview({ role: 'tool', content }))
   }
+})
+
+// ---------------------------------------------------------------------------
+// v1.4.4: never serialize an unpaired UTF-16 surrogate into a model request
+// ---------------------------------------------------------------------------
+//
+// A plain `slice()` can split an emoji on a UTF-16 code-unit boundary. The lone
+// surrogate that remains is escaped by `JSON.stringify` into an invalid-surrogate
+// JSON escape, and the DeepSeek Messages API rejects the whole request with
+// `Failed to parse the request body as JSON … unexpected end of hex escape`.
+// A pending memory keeps that summary in the system prompt, so the session can
+// never complete a turn to score it — it stays stuck on every retry.
+
+const EMOJI = '\u{1F916}' // 🤖 = U+1F916 = high surrogate D83E + low surrogate DD16
+
+/** True when `text` contains an unpaired high or low surrogate. */
+function hasLoneSurrogate(text) {
+  for (let index = 0; index < text.length; index += 1) {
+    const code = text.charCodeAt(index)
+    if (code >= 0xd800 && code <= 0xdbff) {
+      const next = index + 1 < text.length ? text.charCodeAt(index + 1) : 0
+      if (!(next >= 0xdc00 && next <= 0xdfff)) return true
+      index += 1
+    } else if (code >= 0xdc00 && code <= 0xdfff) {
+      return true
+    }
+  }
+  return false
+}
+
+test('toWellFormed: replaces unpaired surrogates with U+FFFD and keeps real emoji', () => {
+  assert.equal(toWellFormed('abc'), 'abc')
+  assert.equal(toWellFormed(`a${EMOJI}b`), `a${EMOJI}b`)
+  assert.equal(toWellFormed('a\uD83Eb'), 'a\uFFFDb')
+  assert.equal(toWellFormed('a\uDE00b'), 'a\uFFFDb')
+  assert.equal(toWellFormed('\uD83E'), '\uFFFD')
+  assert.equal(toWellFormed('\uD83E\uDD16'), '\uD83E\uDD16')
+})
+
+test('safeSlice: a surrogate pair straddling the limit is dropped whole', () => {
+  const text = 'A'.repeat(100) + EMOJI + 'B'.repeat(100)
+  assert.equal(safeSlice(text, 101), 'A'.repeat(100))
+  assert.equal(safeSlice(text, 102), 'A'.repeat(100) + EMOJI)
+  assert.equal(hasLoneSurrogate(safeSlice(text, 101)), false)
+  assert.equal(safeSlice('short', 160), 'short')
+  assert.equal(safeSlice('short', 0), '')
+})
+
+test('conversationPreview: the 160-code-unit cut never splits an emoji', () => {
+  // `user: ` is 6 units, so 153 ASCII put the emoji's high surrogate exactly on
+  // unit 159: before v1.4.4 `flat.slice(0, 160)` kept a lone D83E at the end.
+  const preview = conversationPreview([{ role: 'user', content: 'A'.repeat(153) + EMOJI }], 160)
+  assert.equal(preview.summary, `user: ${'A'.repeat(153)}`)
+  assert.equal(hasLoneSurrogate(preview.summary), false)
+  const BACKSLASH = String.fromCharCode(92)
+  assert.equal(JSON.stringify(preview.summary).includes(`${BACKSLASH}ud83e`), false)
+})
+
+test('truncate: the hard cut never ends on a high surrogate', () => {
+  const output = truncate('A'.repeat(399) + EMOJI, 400)
+  assert.equal(output, `${'A'.repeat(399)}…[+1]`)
+  assert.equal(hasLoneSurrogate(output), false)
+})
+
+test('pushPreviewLine: the 4000-unit JSON cap never ends on a high surrogate', () => {
+  const json = JSON.stringify({ messages: [{ text: 'A'.repeat(3999) + EMOJI }] })
+  const preview = messagePreview({ role: 'tool', content: json })
+  assert.ok(preview.text.length <= 4000)
+  assert.equal(hasLoneSurrogate(preview.text), false)
+})
+
+test('previews replace lone surrogates that already exist in archived data', () => {
+  // `JSON.parse` of a `\ud83e` escape (QQ bridge / stored context.json) produces a
+  // real lone surrogate; it must not survive into the prompt even with no cut.
+  const row = JSON.parse('{"messages":[{"sender":"群友","text":"bad \\ud83e tail"}]}')
+  const preview = conversationPreview([{ role: 'tool', content: JSON.stringify(row) }], 160)
+  assert.equal(hasLoneSurrogate(preview.summary), false, preview.summary)
+  assert.ok(preview.summary.includes('\uFFFD'), preview.summary)
+  const readable = messagesToReadableText([{ role: 'user', content: 'x \uD83E y' }])
+  assert.equal(hasLoneSurrogate(readable), false)
+  assert.ok(readable.includes('\uFFFD'))
 })

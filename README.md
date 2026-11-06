@@ -10,12 +10,31 @@
 > v1.4.2 再增 `memory_group_recall`：**QQ 私聊主人**可只读查询**群聊**历史记忆（私聊→群聊允许、群聊→任何禁止，见 §3.2.10）。
 > v1.4.3 修复了 QQ 渠道下「记忆评分任务」摘要显示原始 JSON 而不是对话正文、导致模型普遍打低 α 的缺陷
 > （新增模型可读渲染层，原地渲染、无需迁移，见下方 v1.4.3 说明）。
+> v1.4.4 修复了评分摘要/复核原文等模型可见文本按 UTF-16 码元截断可能切断 emoji 代理对 → 请求体出现孤立代理项转义 → DeepSeek Messages 接口 400、会话永久卡死的缺陷
+> （所有截断改为代理对安全 + 系统提示词/工具结果边界 U+FFFD 清洗；无需迁移，见下方 v1.4.4 说明）。
 > 归档中的图片存入每会话的 `images/`；回忆时块里显示图片的**文件路径**（不重新上传附件），
 > 模型用 `read_image` 读取。
 > v1.2 把单次归档上限提高到 500 个文件夹、“记忆评分任务”每轮最多列 **100 条待评分 + 100 条待复核**；
 > 文件夹标题优先取用户消息并在同一次归档内自动去重；多次归档的 checkpoint 注记合并为一条
 > （N = 累计归档段数），归档不再把宿主会重新注入的 pinned 上下文写进注记；新增
 > `tools/selfcheck.mjs` 独立自检工具（见 §7）。
+>
+> **v1.4.4（补丁：emoji 代理对被截断 → 会话 400 永久卡死，必读）**
+>
+> `lib/message-text.js` 的 160 字符评分摘要（`conversationPreview`）、4000 码元 JSON 行预览
+> （`pushPreviewLine`）与工具参数 `truncate` 都用 `slice` 按 UTF-16 码元硬切；截点落在 emoji
+> 代理对中间时留下孤立高代理项，`JSON.stringify` 把它转义成 `\ud83e` 这类非法 JSON 转义，
+> DeepSeek Messages 接口（`api.deepseek.com/anthropic/v1/messages`）直接返回
+> `400 Failed to parse the request body as JSON: system[0].text: unexpected end of hex escape`。
+> 坏摘要来自待评分记忆，而评分需要一次成功的模型回合，于是每轮都 400、该记忆永远评不上分，
+> 重启也不恢复。
+>
+> v1.4.4 新增 `safeSlice`（截点落在代理对中间时整体让出该对，摘要仍 ≤160）与 `toWellFormed`
+> （孤立代理项 → U+FFFD，Node 18 兼容），覆盖所有模型可见截断点（摘要、JSON 行、复核原文、
+> `judgeReason`、跨群 snippet、图片消息正文），并在两个 systemPrompt section 注册处统一清洗；
+> `recall-state.json` 的 `block` 与归档 checkpoint 注记同样清洗。**不改数据格式、无需迁移**：
+> 旧 folder 下次生成任务区块即按安全截断显示，升级后卡死会话的下一轮请求即恢复。真实接口
+> 复现/修复验证与测试见 `docs/VERIFICATION.md` §25 与 CHANGELOG 1.4.4。
 >
 > **v1.4.3（补丁：评分摘要显示原始 JSON → 修复为对话正文，必读）**
 >

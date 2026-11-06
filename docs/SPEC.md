@@ -1076,6 +1076,20 @@ false`; session taken from `context.agent.session`):
   readable conversation keeps the legacy flatten byte-for-byte. `类型` is `tool`
   only when the folder has no readable conversation at all (`decision` / `user`
   otherwise per the same text).
+  v1.4.4: every model-visible cut is surrogate-pair safe. The
+  `conversationPreview` 160-code-unit cap, `pushPreviewLine`'s 4000-code-unit
+  cap, `truncate`'s 400-code-unit cap, the re-review original-text budget cut,
+  the `judgeReason` 300-code-unit cut and the `memory_group_recall` snippet cap
+  never end on a lone high surrogate: when the cut would split a surrogate pair
+  the pair is dropped whole, so the bounded text stays `<= cap` (possibly 1 code
+  unit shorter). Both `dsh-rofm:*` system-prompt sections, the
+  `recall-state.json` snapshot `block` and the compaction checkpoint note
+  additionally pass through `toWellFormed` (unpaired surrogate to U+FFFD),
+  because the host's `JSON.stringify` turns an unpaired surrogate into an
+  invalid-surrogate JSON escape and the DeepSeek Messages API rejects the whole
+  request with `400 Failed to parse the request body as JSON ... unexpected end
+  of hex escape` — which would stall the session forever on the pending folder
+  that summary came from.
   The cap is `TASKS_LIST_LIMIT = 100` (exported by `lib/plugin.js`; v1.2 R1, was
   50). Note: 100 re-review entries with full original text can add tens of
   thousands of characters per request; the list shrinks as the model submits

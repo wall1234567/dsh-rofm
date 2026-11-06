@@ -35,6 +35,21 @@ import { estimateTokens } from '../engine/index.js'
 const SURFACE_TYPES = new Set(['user/message', 'assistant/message', 'system/message', 'developer/message', 'tool/result'])
 const clone = (value) => JSON.parse(JSON.stringify(value))
 
+/** True when `text` contains an unpaired high or low UTF-16 surrogate. */
+function hasLoneSurrogate(text) {
+  for (let index = 0; index < text.length; index += 1) {
+    const code = text.charCodeAt(index)
+    if (code >= 0xd800 && code <= 0xdbff) {
+      const next = index + 1 < text.length ? text.charCodeAt(index + 1) : 0
+      if (!(next >= 0xdc00 && next <= 0xdfff)) return true
+      index += 1
+    } else if (code >= 0xdc00 && code <= 0xdfff) {
+      return true
+    }
+  }
+  return false
+}
+
 class FakeSession {
   constructor({ contextWindow = 20000, header = { origin: 'main' }, id = 'session-pressure' } = {}) {
     this.id = id
@@ -532,6 +547,34 @@ test('pending task summary shows QQ tool-result conversation, not raw JSON (v1.4
   assert.equal(line.includes('"messageId"'), false, 'JSON field names must not reach the model')
   // The folder now carries the conversation, so it is not process-log-only.
   assert.ok(line.includes('类型=decision'), line)
+}))
+
+test('pending task summary never splits an emoji at the 160-code-unit window (v1.4.4)', withTempDir(async (dir) => {
+  const memoryDir = path.join(dir, 'memory')
+  mkdirSync(memoryDir, { recursive: true })
+  // `user: ` plus 153 ASCII puts the emoji's high surrogate on unit 159; the
+  // pre-fix `flat.slice(0, 160)` kept a lone D83E there, the host serialized it
+  // as an invalid-surrogate JSON escape, and the Messages API rejected every
+  // request before the model could score the folder (permanent stall).
+  const emoji = '\u{1F916}' // 🤖 = high surrogate D83E + low surrogate DD16
+  writePending(memoryDir, 'mem-surrogate-0001', {
+    createdAt: Date.now() - 3600_000,
+    text: 'SURROGATE-BOUNDARY',
+    messages: [{ role: 'user', content: 'A'.repeat(153) + emoji }],
+  })
+  const session = new FakeSession({ id: 'session-surrogate', contextWindow: 20000 })
+  appendSystem(session)
+  const { ctx, capture } = makeContext(session)
+  const plugin = new RofmPlugin(ctx, makeOverrides(memoryDir))
+  plugin.start()
+  const text = tasksText(capture, session)
+  const line = text.split('\n').find((entry) => entry.includes('id=mem-surrogate-0001'))
+  assert.ok(line, text.slice(0, 400))
+  assert.ok(line.includes('摘要=user: AAAA'), line)
+  assert.equal(hasLoneSurrogate(text), false, 'system-prompt text must be well-formed UTF-16')
+  // The exact defect: JSON.stringify of an unpaired surrogate emits this escape
+  // and the DeepSeek Messages API rejects the request with 400.
+  assert.equal(JSON.stringify(text).includes(`${String.fromCharCode(92)}ud83e`), false)
 }))
 
 test('pending task content type stays tool when no readable conversation exists', withTempDir(async (dir) => {

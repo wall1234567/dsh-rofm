@@ -7,6 +7,52 @@ The project follows a lightweight [SemVer](https://semver.org/) scheme.
 
 （下一个版本的变更写在这里。）
 
+## [1.4.4] — 2026-11-06
+
+**补丁版：修复“记忆评分摘要”等模型可见文本按 UTF-16 码元截断时切断 emoji 代理对，孤立代理项被 `JSON.stringify` 转义成非法转义，DeepSeek Messages 接口直接 400、该记忆永远评不上分、会话永久卡死（用户报告，已用真实接口复现）。**
+
+### Fixed
+
+- **UTF-16 代理对被截断→接口 400→会话卡死（用户报告，可稳定复现）**：`lib/message-text.js`
+  的 `conversationPreview()`（`flat.slice(0, 160)`）、`pushPreviewLine()`（4000 码元上限）与
+  `truncate()`（工具参数 400 码元上限）用 `String.prototype.slice` 按 UTF-16 码元硬切：截点落在
+  emoji/扩展汉字的代理对中间时，结果字符串以孤立高代理项结尾。待评分记忆的摘要被拼进系统提示词
+  区块 `dsh-rofm:memory-tasks`，宿主用 `JSON.stringify` 序列化请求体时把孤立代理项转义成 6 个
+  ASCII 字符（如 `\ud83e`：JSON 语法合法，但语义是非法 Unicode 标量）。DeepSeek Messages 接口
+  （`POST https://api.deepseek.com/anthropic/v1/messages`）返回
+  `400 Failed to parse the request body as JSON: system[0].text: unexpected end of hex escape`。
+  请求在模型回合开始前就失败，`memory_judge` 从未被调用 → folder 保持 `scored:false` →
+  下一轮系统提示词再次带上同一坏摘要 → 每轮 400；重启也一样（folder 与 recall-state 快照均持久化，
+  启发式兜底只作用于新归档）。本机用真实接口做了三组最小对照：正常请求 200；system 含孤立代理项
+  （序列化为 `\ud83e`）→ 400 `unexpected end of hex escape`；人为 `\ud83`（少一位）→ 400
+  `invalid escape`——与报告完全一致。
+- **修复**：
+  - `lib/message-text.js` 新增 `safeSlice()`（截点落在代理对中间时连同高代理项退回 1 个码元，
+    `length <= limit` 契约不变）与 `toWellFormed()`（孤立代理项替换为 U+FFFD；Node 18 兼容，
+    未依赖需 Node 20 的 `String.prototype.toWellFormed`）；`truncate()`、`pushPreviewLine()`、
+    `conversationPreview()`、`messagesToReadableText()` 全部改用它。
+  - `lib/plugin.js`：待复核原文的预算截断（`review.text.slice(0, allowedChars)`）改 `safeSlice`；
+    `memoryTasksText` / `recallSectionText` 两个 systemPrompt section 在注册处统一 `toWellFormed`
+    （兜底覆盖标题、关键词、judgeReason、engine 渲染归档原文，以及上游 JSON 里本来就带孤立代理项
+    的数据）；归档 checkpoint 注记（会变成 user 消息进入请求体）二次拼接后清洗；
+    `recall-state.json` 持久化的 `block` 写入前清洗（旧坏快照重启后也不会再喂给接口）。
+  - `lib/memory-tool.js`：`judgeReason` 的 300 码元截断改 `safeSlice`，工具结果文本 `toWellFormed`。
+  - `lib/cross-chat-tool.js`：`memory_group_recall` 的 snippet 截断改 `safeSlice`，工具结果清洗。
+  - `lib/images.js`：本地镜像的 `truncate()` 同步改代理对安全（图片消息正文会随归档回放）。
+  - `lib/recall-tool.js` / `lib/image-tool.js`：`memory_recall` / `memory_image` 工具结果文本
+    `toWellFormed`（归档数据本身可能含孤立代理项）。
+- **回归测试**：`test/message-preview.test.mjs` 6 例（`safeSlice`/`toWellFormed` 语义、160 码元
+  摘要边界、4000 码元 JSON 行边界、400 码元 `truncate` 边界、归档数据已有孤立代理项）+ `test-adapter/scoring-pressure.test.mjs`
+  1 例（emoji 正好跨 160 边界时，真实的 `dsh-rofm:memory-tasks` section 文本必须 well-formed、
+  不产生孤立代理项转义）。
+- **验证**：`node --test` = **1067 tests / 1065 pass / 2 skip / 0 fail**（2 skip 为平台条件跳过）；
+  `node test/simulate.mjs`、`node tools/selfcheck.mjs`、`node tools/privacy-check.mjs`、
+  `node engine/cli.mjs --help` 全 PASS；`tools/gate-baseline.json` → 1067。
+- **不需要迁移**：摘要与原文每次从 `context.json` 重新渲染，旧 folder 下一次生成任务区块即按安全
+  截断显示；已卡住的会话升级后下一轮请求即恢复（folder 仍是 pending，模型可以正常评分）。
+- **版本/门禁**：`package.json` / `engine/package.json` → **1.4.4**；`tools/gate-baseline.json`
+  的 `version`/`updatedFor`/`minFullSuiteTests` 同步更新。
+
 ## [1.4.3] — 2026-11-05
 
 **补丁版：修复 QQ 渠道兼容下“记忆评分任务”的摘要是原始 JSON、模型看不到对话正文而普遍打低 α 的缺陷。**

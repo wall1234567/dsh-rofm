@@ -4,6 +4,13 @@
  *
  * Threshold/metric are the contract defaults: `metric='dice'`, `threshold=0.72`,
  * `maxCandidates=5`, `maxLabelLength=60`.
+ *
+ * v1.5.0 (design contract §1/§3.2): a folder may belong to several events
+ * (`folder.events[]`, with the legacy `folder.event` as fallback) and a similar
+ * but different scoring label is NO LONGER merged silently — `assignEventLabel`
+ * keeps the submitted label and returns `candidates`; only the explicit
+ * rollback switch `event.mergeRequiresApproval=false` restores the old
+ * silent-merge behaviour.
  */
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
@@ -40,6 +47,11 @@ function folder(id, event, createdAt) {
   return entry
 }
 
+/** v1.5.0: a folder carrying a multi-label `events` array. */
+function eventsFolder(id, events, createdAt) {
+  return { id, events, createdAt: createdAt === undefined ? 1 : createdAt }
+}
+
 const folders = () => [
   folder('m1', '日本旅行', 10),
   folder('m2', '日本旅行', 5),
@@ -59,6 +71,11 @@ test('EVENT_DEFAULTS equals engine/config.js DEFAULT_CONFIG.event (contract defa
   assert.deepEqual(EVENT_DEFAULTS.similarity, { metric: 'dice', threshold: 0.72, maxCandidates: 5 })
   assert.equal(EVENT_DEFAULTS.mode, 'index')
   assert.equal(EVENT_DEFAULTS.maxLabelLength, 60)
+  // v1.5.0 multi-event / approval settings (design contract §2).
+  assert.equal(EVENT_DEFAULTS.maxPerFolder, 4)
+  assert.equal(EVENT_DEFAULTS.mergeRequiresApproval, true)
+  assert.equal(EVENT_DEFAULTS.showExisting, true)
+  assert.equal(EVENT_DEFAULTS.showExistingLimit, 24)
   assert.deepEqual(EVENT_MODES, ['off', 'index', 'constrain'])
   assert.deepEqual(EVENT_METRICS, ['dice', 'avg', 'min'])
 })
@@ -67,24 +84,36 @@ test('eventConfig: defaults, enum fallback and clamping never throw', () => {
   assert.deepEqual(eventConfig(undefined), {
     mode: 'index',
     maxLabelLength: 60,
+    maxPerFolder: 4,
     metric: 'dice',
     threshold: 0.72,
     maxCandidates: 5,
     askUserHint: true,
+    mergeRequiresApproval: true,
+    showExisting: true,
+    showExistingLimit: 24,
   })
   const custom = eventConfig({
-    event: { mode: 'constrain', maxLabelLength: 999, similarity: { metric: 'min', threshold: -1, maxCandidates: 99 }, askUserHint: false },
+    event: { mode: 'constrain', maxLabelLength: 999, maxPerFolder: 99, similarity: { metric: 'min', threshold: -1, maxCandidates: 99 }, askUserHint: false },
   })
   assert.equal(custom.mode, 'constrain')
   assert.equal(custom.maxLabelLength, 200) // clamped to 1..200
+  assert.equal(custom.maxPerFolder, 32) // clamped to 1..32
   assert.equal(custom.metric, 'min')
   assert.equal(custom.threshold, 0) // clamped to 0..1
   assert.equal(custom.maxCandidates, 10) // clamped to 1..10
   assert.equal(custom.askUserHint, false)
+  // v1.5.0 switches: the approval requirement is on unless explicitly disabled.
+  const rollback = eventConfig({ event: { mergeRequiresApproval: false, showExisting: false, showExistingLimit: 0 } })
+  assert.equal(rollback.mergeRequiresApproval, false)
+  assert.equal(rollback.showExisting, false)
+  assert.equal(rollback.showExistingLimit, 1) // 0 is out of range -> clamped to 1
+  assert.equal(eventConfig({ event: { mergeRequiresApproval: null } }).mergeRequiresApproval, true, 'only false disables the approval')
   // invalid values fall back to the defaults
-  const garbage = eventConfig({ event: { mode: 'nope', maxLabelLength: 'x', similarity: { metric: 'cosine', threshold: 'y', maxCandidates: 0 } } })
+  const garbage = eventConfig({ event: { mode: 'nope', maxLabelLength: 'x', maxPerFolder: 'x', similarity: { metric: 'cosine', threshold: 'y', maxCandidates: 0 } } })
   assert.equal(garbage.mode, 'index')
   assert.equal(garbage.maxLabelLength, 60)
+  assert.equal(garbage.maxPerFolder, 4)
   assert.equal(garbage.metric, 'dice')
   assert.equal(garbage.threshold, 0.72)
   assert.equal(garbage.maxCandidates, 1) // 0 is out of range -> clamped to 1
@@ -282,6 +311,64 @@ test('buildEventIndex: signature is deterministic and changes with content/confi
 })
 
 // ---------------------------------------------------------------------------
+// 4b) v1.5.0 multi-label folders (`folder.events[]` + byIdAll)
+// ---------------------------------------------------------------------------
+
+test('buildEventIndex: folder.events multi-label folders are indexed and capped by maxPerFolder', () => {
+  const index = buildEventIndex(
+    [
+      eventsFolder('m1', ['日本旅行', '登录重构项目'], 10),
+      eventsFolder('m2', ['日本旅行'], 20),
+      // 5 submitted labels, one duplicate -> 4 canonical labels survive the cap.
+      eventsFolder('m3', ['日本旅行计划', '「日本旅行」', '签到', '返程', '额外'], 30),
+    ],
+    makeCfg(),
+  )
+  assert.equal(index.folderCount, 3)
+  // count desc, then label asc (code-point order).
+  assert.deepEqual(index.labels.map((item) => item.label), ['日本旅行', '日本旅行计划', '登录重构项目', '签到', '返程'])
+  assert.equal(index.byKey.get('日本旅行').count, 3)
+  assert.deepEqual(index.byKey.get('日本旅行').ids, ['m1', 'm2', 'm3'])
+  assert.equal(index.byKey.get('额外'), undefined, 'maxPerFolder caps the submitted labels')
+  // Multi-label truth: every label a folder carries.
+  assert.deepEqual(index.byIdAll.get('m1'), [
+    { label: '日本旅行', key: '日本旅行' },
+    { label: '登录重构项目', key: '登录重构项目' },
+  ])
+  assert.deepEqual(index.byIdAll.get('m3'), [
+    { label: '日本旅行计划', key: '日本旅行计划' },
+    { label: '日本旅行', key: '日本旅行' },
+    { label: '签到', key: '签到' },
+    { label: '返程', key: '返程' },
+  ])
+  // Compatibility: byId keeps the first (canonical) label, as in v1.4.x.
+  assert.deepEqual(index.byId.get('m1'), { label: '日本旅行', key: '日本旅行' })
+  assert.deepEqual(index.byId.get('m3'), { label: '日本旅行计划', key: '日本旅行计划' })
+  // A smaller configured cap also applies.
+  const capped = buildEventIndex([eventsFolder('m1', ['甲事件', '乙事件', '丙事件'], 1)], makeCfg({ maxPerFolder: 2 }))
+  assert.deepEqual(capped.labels.map((item) => item.label), ['乙事件', '甲事件'])
+})
+
+test('buildEventIndex: empty events array falls back to the legacy folder.event; events wins when non-empty', () => {
+  const index = buildEventIndex(
+    [
+      { id: 'a', events: [], event: '旧事件', createdAt: 1 },
+      { id: 'b', events: ['新事件'], event: '旧事件', createdAt: 2 },
+      { id: 'c', events: ['甲事件', '乙事件'], createdAt: 3 },
+      { id: 'd', events: [null, '', '甲事件'], createdAt: 4 },
+    ],
+    makeCfg(),
+  )
+  assert.equal(index.byId.get('a').label, '旧事件', 'an empty array is "no events", so the legacy field is used')
+  assert.equal(index.byId.get('b').label, '新事件', 'events wins when it has labels')
+  assert.deepEqual(index.byIdAll.get('c'), [
+    { label: '甲事件', key: '甲事件' },
+    { label: '乙事件', key: '乙事件' },
+  ])
+  assert.deepEqual(index.byIdAll.get('d'), [{ label: '甲事件', key: '甲事件' }], 'invalid labels are dropped')
+})
+
+// ---------------------------------------------------------------------------
 // 5) resolveEventQuery (recall time)
 // ---------------------------------------------------------------------------
 
@@ -395,48 +482,87 @@ test('resolveEventQuery: null/missing index degrades safely', () => {
 
 test('assignEventLabel: exact label keeps the canonical spelling, no merge', () => {
   const index = buildEventIndex(folders(), makeCfg())
-  assert.deepEqual(assignEventLabel(index, '  日本旅行 '), { label: '日本旅行', merged: null, warnings: [] })
-  assert.deepEqual(assignEventLabel(index, '空'), { label: '', merged: null, warnings: [] })
+  assert.deepEqual(assignEventLabel(index, '  日本旅行 '), { label: '日本旅行', merged: null, candidates: [], warnings: [] })
+  assert.deepEqual(assignEventLabel(index, '空'), { label: '', merged: null, candidates: [], warnings: [] })
   // a new, sufficiently different label becomes its own canonical label
-  assert.deepEqual(assignEventLabel(index, '美国旅行'), { label: '美国旅行', merged: null, warnings: [] })
+  assert.deepEqual(assignEventLabel(index, '美国旅行'), { label: '美国旅行', merged: null, candidates: [], warnings: [] })
 })
 
-test('assignEventLabel: similar label is silently merged into the existing canonical', () => {
+test('assignEventLabel: a similar label is kept and its candidates returned (no silent merge)', () => {
   const index = buildEventIndex(folders(), makeCfg())
+  const before = index.labels.length
   const result = assignEventLabel(index, '日本旅行计划')
-  assert.equal(result.label, '日本旅行')
+  assert.equal(result.label, '日本旅行计划', 'the submitted label stays canonical')
+  assert.equal(result.merged, null, 'nothing is merged without approval')
+  assert.equal(result.warnings.length, 1)
+  // `event-candidate:` is the stable prefix the adapter/tool layer parses.
+  assert.ok(result.warnings[0].startsWith('event-candidate: '), result.warnings[0])
+  assert.ok(result.warnings[0].includes('日本旅行计划'))
+  assert.ok(result.warnings[0].includes('日本旅行'))
+  assert.ok(result.warnings[0].includes('0.78'))
+  assert.ok(result.warnings[0].includes('尚未归并'))
+  assert.ok(result.warnings[0].includes('重新提交'))
+  assert.equal(result.candidates.length, 1, 'the similar canonical event is offered as a candidate')
+  assert.equal(result.candidates[0].label, '日本旅行')
+  assert.equal(result.candidates[0].count, 3)
+  assert.ok(Math.abs(result.candidates[0].score - 0.7777777777777778) < 1e-12)
+  assert.equal(index.labels.length, before, 'computing candidates never mutates the index')
+})
+
+test('assignEventLabel: mergeRequiresApproval=false restores the old silent merge', () => {
+  const index = buildEventIndex(folders(), makeCfg())
+  const rollback = makeCfg({ mergeRequiresApproval: false })
+  const result = assignEventLabel(index, '日本旅行计划', rollback)
+  assert.equal(result.label, '日本旅行', 'the rollback mode merges into the existing canonical')
   assert.ok(result.merged)
   assert.equal(result.merged.from, '日本旅行计划')
   assert.equal(result.merged.to, '日本旅行')
   assert.ok(Math.abs(result.merged.score - 0.7777777777777778) < 1e-12)
+  assert.deepEqual(result.candidates, [])
   assert.equal(result.warnings.length, 1)
-  // `event-merged:` is the stable prefix the adapter/tool layer (E) parses
+  // `event-merged:` is the stable prefix the adapter/tool layer parses
   assert.ok(result.warnings[0].startsWith('event-merged: '), result.warnings[0])
   assert.ok(result.warnings[0].includes('日本旅行计划'))
   assert.ok(result.warnings[0].includes('日本旅行'))
   assert.ok(result.warnings[0].includes('0.78'))
 })
 
-test('assignEventLabel: threshold/metric config decides the merge; no index => no merge', () => {
+test('assignEventLabel: similarity config decides candidate/assign and only the rollback switch merges', () => {
   const index = buildEventIndex(folders(), makeCfg())
-  // raising the threshold above 0.778 disables the merge
+  // raising the threshold above 0.778 avoids candidates entirely
   const strict = assignEventLabel(index, '日本旅行计划', makeCfg({ similarity: { threshold: 0.9 } }))
   assert.equal(strict.merged, null)
   assert.equal(strict.label, '日本旅行计划')
-  // a lower threshold merges a case dice would not merge
+  assert.deepEqual(strict.candidates, [])
+  assert.deepEqual(strict.warnings, [])
+  // a lower threshold surfaces a candidate that the default dice config would not
   const loose = assignEventLabel(index, '日本美食', makeCfg({ similarity: { threshold: 0.4 } }))
-  assert.equal(loose.label, '日本旅行')
-  assert.ok(loose.merged)
+  assert.equal(loose.label, '日本美食', 'still no merge with approval required')
+  assert.equal(loose.merged, null)
+  assert.equal(loose.candidates[0].label, '日本旅行')
+  // ... unless the operator rolled back to the old silent merge
+  const looseRollback = assignEventLabel(index, '日本美食', makeCfg({ similarity: { threshold: 0.4 }, mergeRequiresApproval: false }))
+  assert.equal(looseRollback.label, '日本旅行')
+  assert.ok(looseRollback.merged)
   // null index: normalization only
-  assert.deepEqual(assignEventLabel(null, 'Japan Trip'), { label: 'japan trip', merged: null, warnings: [] })
+  assert.deepEqual(assignEventLabel(null, 'Japan Trip'), { label: 'japan trip', merged: null, candidates: [], warnings: [] })
 })
 
-test('assignEventLabel: repeated labelling converges to the same canonical label', () => {
+test('assignEventLabel: variants stay separate until approved; rollback mode converges', () => {
   const base = buildEventIndex(folders(), makeCfg())
   const variants = ['日本旅行计划', '日本旅行计划2026', '日本旅行安排']
   for (const variant of variants) {
     const assigned = assignEventLabel(base, variant)
-    assert.equal(assigned.label, '日本旅行', `variant ${variant}`)
+    assert.equal(assigned.label, eventKeyOf(variant), `variant ${variant} is kept as its own label`)
+    assert.equal(assigned.merged, null)
+    assert.ok(assigned.candidates.length > 0, `variant ${variant} gets candidates`)
+  }
+  // The legacy rollback mode still converges to one canonical label.
+  const rollbackCfg = makeCfg({ mergeRequiresApproval: false })
+  for (const variant of variants) {
+    const assigned = assignEventLabel(base, variant, rollbackCfg)
+    assert.equal(assigned.label, '日本旅行', `variant ${variant} converges in rollback mode`)
+    assert.ok(assigned.merged)
   }
 })
 

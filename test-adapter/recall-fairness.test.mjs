@@ -531,7 +531,19 @@ test('fair recall persists recall-state v3 with lanes/round/ledger/counters', wi
   assert.equal(typeof snapshot.counters.reInjections, 'number')
   assert.equal(typeof snapshot.counters.registerDrops, 'number')
   assert.equal(typeof snapshot.counters.timeMisses, 'number')
-  assert.equal(snapshot.block, recallBlock(capture, session), 'block text equals the injected section')
+  // v1.6.0: the recall section is the rendered block plus its deterministic
+  // extras (e.g. the full-quota retry nudge when this fair round fills
+  // `recall.firstGenMax`), so the persisted block is the section *prefix* and the
+  // section must be exactly block + extras — the old "equals the block" assertion
+  // no longer describes the product behaviour.
+  const injectedSection = recallBlock(capture, session)
+  assert.equal(injectedSection.slice(0, snapshot.block.length), snapshot.block, 'block text is the recall-section prefix')
+  const recallExtras = plugin.sessionState(session).recallExtras
+  assert.equal(
+    injectedSection,
+    typeof recallExtras === 'string' && recallExtras.length > 0 ? `${snapshot.block}\n\n${recallExtras}` : snapshot.block,
+    'the injected section is the persisted block plus its deterministic extras',
+  )
   assert.equal(typeof snapshot.degraded, 'boolean')
 }))
 

@@ -63,6 +63,7 @@ import {
   writeIndex,
 } from './store.js'
 import { estimateTokens, extractKeywords, normalizeMessages, renderMessage } from './tokenize.js'
+import { extractTimeTags } from './relative-time.js'
 
 const roundNumber = (value, digits = 2) => {
   const factor = 10 ** digits
@@ -122,6 +123,283 @@ function rangeFromTimes(times) {
   }
   if (start === null) return null
   return { start, end: end + 1, source: 'messages' }
+}
+
+/**
+ * v1.5.0 / v1.5.5: deterministic assistant-utterance keywords for one archived
+ * chunk.
+ *
+ * The "you said it" channel must index what the **assistant actually said**, so
+ * it must not reuse the generic `extractKeywords` path: that path is tuned for
+ * long mixed text and, on one short Chinese sentence, drops every one-off
+ * 3-gram and then back-fills position fragments ("我建/建议/议你"). This
+ * extractor works sentence/clause by clause instead.
+ *
+ * v1.5.5 filtering (the old version extracted tool-call/JSON junk as "the
+ * assistant's words", so "你说过…" questions missed the real commitments):
+ *   - only real assistant conversation is read: `role === 'assistant'`,
+ *     array content blocks contribute their `type === 'text'` parts only
+ *     (tool-call blocks are dropped), and messages whose text is JSON-like
+ *     (`{…}` / `[…]`) or a protocol marker (`[tool-call …]`, `[tool-added …]`,
+ *     `[tool-removed …]`, `[tool-result …]`) are skipped;
+ *   - per-turn priority: the LAST natural-language reply of each turn is read
+ *     first, and selection round-robins across turns, so every turn gets at
+ *     least one slot before a turn takes a second and one long JSON blob cannot
+ *     crowd out the turn's actual reply;
+ *   - post-filter drops JSON keys/tokens: `tool-call`, `id`, `alpha`, `beta`,
+ *     `keywords`, `mem-…` ids, pure numbers and pure-lowercase JSON identifiers.
+ *
+ * Extraction rules (unchanged): ASCII/number words of length >= 2 are candidates;
+ * CJK bigrams with a function/pronoun/connective character are grammar glue and
+ * are dropped; per clause the tail bigram ranks first (head-final compounds);
+ * overlapping position fragments are dropped; the deterministic selection is
+ * capped at ASSISTANT_KEYWORDS_MAX (12, inside the 8..16 design range).
+ *
+ * Dictionary-free, deterministic, never throws. Returns `[]` when the chunk has
+ * no readable assistant text.
+ *
+ * @param {any[]} messages
+ * @param {object} [cfg] plugin config (kept for API compatibility; the assistant
+ *   channel has no tunable config key of its own)
+ * @returns {string[]}
+ */
+export function extractAssistantKeywords(messages, cfg) {
+  const turns = assistantConversationTurns(messages)
+  if (turns.length === 0) return []
+  return assistantKeywordsFromTurns(turns)
+}
+
+/** Protocol marker prefixes that are not natural language. */
+const ASSISTANT_PROTOCOL_PREFIXES = ['[tool-call', '[tool-added', '[tool-removed', '[tool-result']
+/** JSON keys / protocol tokens that must never become assistant keywords. */
+const ASSISTANT_JSON_KEY_TOKENS = new Set([
+  'tool-call', 'tool-added', 'tool-removed', 'tool-result', 'role', 'content', 'type',
+  'id', 'ids', 'alpha', 'beta', 'keyword', 'keywords', 'reason', 'keep', 'update',
+  'updates', 'ok', 'true', 'false', 'null', 'seq', 'time', 'createdat', 'message',
+  'messages', 'sender', 'userid', 'messageid', 'readthroughseq', 'index', 'data',
+  'meta', 'value', 'name', 'text', 'key', 'count', 'status', 'error', 'code', 'tool',
+])
+
+/**
+ * Natural-language text of one assistant message (v1.5.5): array content blocks
+ * contribute only their text parts; JSON-like payloads and protocol markers are
+ * not speech and yield ''.
+ *
+ * @param {any} message
+ * @returns {string}
+ */
+function assistantNaturalText(message) {
+  if (!message || typeof message !== 'object' || message.role !== 'assistant') return ''
+  const content = message.content
+  let raw = ''
+  if (typeof content === 'string') {
+    raw = content
+  } else if (Array.isArray(content)) {
+    const parts = []
+    for (const block of content) {
+      if (!block || typeof block !== 'object') continue
+      if (block.type !== 'text') continue // drop tool-call / tool-result blocks
+      const text = typeof block.text === 'string' ? block.text : typeof block.content === 'string' ? block.content : ''
+      if (text) parts.push(text)
+    }
+    raw = parts.join('\n')
+  } else {
+    return ''
+  }
+  raw = raw.trim()
+  if (raw.length === 0) return ''
+  // A serialized tool result / JSON payload is not the assistant speaking.
+  if (raw.startsWith('{') || raw.startsWith('[')) return ''
+  const lines = raw.split('\n').filter((line) => {
+    const trimmed = line.trim()
+    if (trimmed.length === 0) return true
+    return !ASSISTANT_PROTOCOL_PREFIXES.some((prefix) => trimmed.startsWith(prefix))
+  })
+  const text = lines.join('\n').trim()
+  if (text.length === 0) return ''
+  if (text.startsWith('{') || text.startsWith('[')) return ''
+  return text
+}
+
+/**
+ * Group the assistant's natural-language messages by conversational turn
+ * (v1.5.5): a new turn starts at every `user` message; tool results and other
+ * roles stay inside the current turn. Turns with no natural-language assistant
+ * message are dropped.
+ *
+ * @param {any[]} messages
+ * @returns {string[][]} one array of assistant texts per turn, in message order
+ */
+function assistantConversationTurns(messages) {
+  const turns = []
+  let current = null
+  for (const message of Array.isArray(messages) ? messages : []) {
+    if (!message || typeof message !== 'object') continue
+    if (message.role === 'user') {
+      current = null
+      continue
+    }
+    if (message.role !== 'assistant') continue
+    if (current === null) {
+      current = []
+      turns.push(current)
+    }
+    const text = assistantNaturalText(message)
+    if (text.length > 0) current.push(text)
+  }
+  return turns.filter((texts) => texts.length > 0)
+}
+
+/**
+ * Whether one candidate token survives the v1.5.5 JSON/token post-filter.
+ *
+ * Drops known JSON keys, `mem-…` ids, pure numbers and pure-lowercase JSON
+ * identifiers (`readthroughseq`, `assistant_keywords`, …). Ordinary lowercase
+ * technical words ("docker", "ttl") stay keywords — the JSON-like payloads were
+ * already skipped before this filter runs.
+ *
+ * @param {string} token
+ * @returns {boolean}
+ */
+function isUsefulAssistantKeyword(token) {
+  if (typeof token !== 'string') return false
+  const text = token.trim()
+  if (text.length === 0 || text.length > 48) return false
+  const lower = text.toLowerCase()
+  if (ASSISTANT_JSON_KEY_TOKENS.has(lower)) return false
+  if (/^mem-[a-z0-9._-]+$/i.test(text)) return false
+  if (/^\d+(?:\.\d+)?$/.test(text)) return false
+  if (/^[a-z][a-z0-9_.-]*$/.test(text)) {
+    // Pure-lowercase ASCII identifier: underscores/dots or a long JSON-key shape
+    // are never ordinary words, so they are JSON/token junk.
+    if (text.includes('_') || text.includes('.') || text.length > 11) return false
+  }
+  return true
+}
+
+/**
+ * Pick assistant keywords from per-turn texts (v1.5.5).
+ *
+ * Each turn reads its LAST natural-language reply first (that is the turn's
+ * conclusion / promise), then the earlier replies in message order; within a
+ * message the existing clause order applies. Selection round-robins across
+ * turns, so every turn gets at least one slot before a turn takes a second.
+ *
+ * @param {string[][]} turns
+ * @returns {string[]}
+ */
+function assistantKeywordsFromTurns(turns) {
+  const perTurn = turns.map((texts) => {
+    const ordered = texts.length > 1 ? [texts[texts.length - 1], ...texts.slice(0, -1)] : texts.slice()
+    const flat = []
+    for (const text of ordered) {
+      for (const part of String(text).split(ASSISTANT_CLAUSE_SPLIT_RE)) {
+        const clause = part.trim()
+        if (clause.length === 0) continue
+        for (const token of assistantClauseCandidates(clause)) {
+          if (isUsefulAssistantKeyword(token)) flat.push(token)
+        }
+      }
+    }
+    return flat
+  })
+  const selected = []
+  const seen = new Set()
+  for (let round = 0; selected.length < ASSISTANT_KEYWORDS_MAX; round += 1) {
+    let progressed = false
+    for (const turn of perTurn) {
+      if (selected.length >= ASSISTANT_KEYWORDS_MAX) break
+      const token = turn[round]
+      if (token === undefined) continue
+      progressed = true
+      const normalized = token.toLowerCase()
+      if (seen.has(normalized)) continue
+      seen.add(normalized)
+      selected.push(token)
+    }
+    if (!progressed) break
+  }
+  return selected
+}
+
+/** Max assistant-utterance keywords per archived folder (design range 8..16). */
+const ASSISTANT_KEYWORDS_MAX = 12
+/** Sentence/clause separators: punctuation and line breaks split clauses. */
+const ASSISTANT_CLAUSE_SPLIT_RE = /[。！？!?；;，,、：:…—\n\r\t]+/
+/** CJK ideograph runs (the same ranges engine/tokenize.js uses). */
+const ASSISTANT_CJK_RUN_RE = /[\u3400-\u4DBF\u4E00-\u9FFF\uF900-\uFAFF\u{20000}-\u{2FA1F}]+/gu
+/** Latin/technical words and numbers; the length check happens after trimming. */
+const ASSISTANT_LATIN_WORD_RE = /[a-z][a-z0-9_+#.-]*|\d+(?:\.\d+)*/gi
+/**
+ * High-frequency function / pronoun / connective / numeral characters. A CJK
+ * bigram containing one of them is grammar glue, not a content word: this is
+ * exactly what produced the old "我建/议你/你少" fragments.
+ */
+const ASSISTANT_STOP_CHARS = new Set([
+  '的', '地', '得', '了', '着', '过', '是', '在', '我', '你', '您', '他', '她', '它', '咱', '俺', '们',
+  '这', '那', '哪', '此', '其', '之', '就', '都', '也', '又', '还', '很', '太', '更', '最', '好',
+  '会', '能', '要', '可', '以', '应', '该', '请', '别', '把', '被', '给', '让', '从', '到', '对',
+  '于', '与', '和', '及', '等', '个', '些', '有', '没', '不', '无', '所', '而', '但', '却', '因',
+  '为', '如', '并', '且', '则', '若', '吗', '呢', '吧', '啊', '呀', '哦', '嗯', '嘛', '么', '什',
+  '怎', '谁', '啥', '多', '少', '零', '一', '二', '三', '四', '五', '六', '七', '八', '九', '十',
+  '百', '千', '万',
+])
+/**
+ * Whole bigrams that survive the character filter but are still pure grammar.
+ * Only exact tokens are dropped, so real words built from the same characters
+ * ("建议", "就业") are never lost.
+ */
+const ASSISTANT_STOP_TOKENS = new Set([
+  '还是', '还有', '没有', '不是', '不能', '不会', '不用', '不要', '需要', '应该', '一定', '一样',
+  '一些', '一下', '一个', '有点', '一点', '什么', '怎么', '这样', '那样', '这个', '那个', '这些',
+  '那些', '因为', '所以', '但是', '如果', '然后', '已经', '非常', '特别', '比较', '无论', '虽然',
+  '不过', '而且', '或者', '以及', '之后', '之前', '以后', '以前', '的话', '时候',
+])
+
+/** Trim leading/trailing ASCII separators that the greedy word regex swallowed. */
+function trimAssistantWord(word) {
+  let out = word
+  while (out.length > 0 && '._-+#'.includes(out[out.length - 1])) out = out.slice(0, -1)
+  while (out.length > 0 && '._-+#'.includes(out[0])) out = out.slice(1)
+  return out
+}
+
+/** Whether two CJK bigrams share a character (i.e. they overlap in the text). */
+function assistantBigramsOverlap(left, right) {
+  return left[0] === right[0] || left[0] === right[1] || left[1] === right[0] || left[1] === right[1]
+}
+
+/** Ranked candidates of one clause (tail/word first), as plain strings. */
+function assistantClauseCandidates(clause) {
+  const words = []
+  ASSISTANT_LATIN_WORD_RE.lastIndex = 0
+  let match
+  while ((match = ASSISTANT_LATIN_WORD_RE.exec(clause)) !== null) {
+    const token = trimAssistantWord(match[0])
+    if (token.length >= 2 && !words.includes(token)) words.push(token)
+  }
+  const bigrams = []
+  const seen = new Set()
+  ASSISTANT_CJK_RUN_RE.lastIndex = 0
+  while ((match = ASSISTANT_CJK_RUN_RE.exec(clause)) !== null) {
+    const chars = [...match[0]]
+    for (let index = 0; index + 1 < chars.length; index += 1) {
+      const token = chars[index] + chars[index + 1]
+      if (ASSISTANT_STOP_CHARS.has(chars[index]) || ASSISTANT_STOP_CHARS.has(chars[index + 1])) continue
+      if (ASSISTANT_STOP_TOKENS.has(token) || seen.has(token)) continue
+      seen.add(token)
+      bigrams.push({ token, tail: index + 2 === chars.length })
+    }
+  }
+  // Tail bigrams first (head-final compounds), then the remaining bigrams in
+  // text order; ASCII/number words outrank both (they are unambiguous).
+  const ranked = [...bigrams.filter((entry) => entry.tail), ...bigrams.filter((entry) => !entry.tail)]
+  const ordered = [...words]
+  for (const entry of ranked) {
+    if (ordered.some((chosen) => assistantBigramsOverlap(chosen, entry.token))) continue
+    ordered.push(entry.token)
+  }
+  return ordered
 }
 
 /**
@@ -749,6 +1027,10 @@ export function planCompression(options = {}) {
   }
 
   const baseNow = Number.isFinite(Number(options.now)) ? Number(options.now) : Date.now()
+  // v1.5.0 (audit F-03-02): `timeTag.mode='off'` is documented as "no
+  // collection/index/filter" (engine/config.js), so the archive path must not
+  // compute or write time tags at all in that mode.
+  const timeTagEnabled = !(cfg.timeTag && typeof cfg.timeTag === 'object' && cfg.timeTag.mode === 'off')
   const folderCount = chunks.length
   const folderPlans = []
   const eventTimeSourceCounts = {}
@@ -801,6 +1083,32 @@ export function planCompression(options = {}) {
       meta.eventEnd = eventRange.end
       meta.eventTimeSource = eventRange.source
       eventTimeSourceCounts[eventRange.source] = (eventTimeSourceCounts[eventRange.source] || 0) + 1
+    }
+    // v1.5.0: the assistant's own utterances are indexed separately so a
+    // "你说过/你之前说…" question can recall what the assistant said even when the
+    // judge's keywords did not cover it (deterministic, no model call).
+    try {
+      const assistantKeywords = extractAssistantKeywords(chunkMessages, cfg)
+      if (assistantKeywords.length > 0) meta.assistantKeywords = assistantKeywords
+    } catch {
+      /* best effort */
+    }
+    // v1.5.0 (audit F-03-02/F-03-03): deterministic time tags — fuzzy expressions
+    // ("昨天", "下周二") in the archived messages are converted to absolute
+    // half-open intervals at archive time (never by a model). `timeTag.mode='off'`
+    // means "no collection", so nothing is computed or written then. The anchor of
+    // a message is its own finite `time`, else the folder `createdAt` (DESIGN §1);
+    // another message's event-range start must never be used instead.
+    if (timeTagEnabled) {
+      try {
+        const timeTagResult = extractTimeTags(chunkMessages, createdAt, cfg)
+        if (Array.isArray(timeTagResult.tags) && timeTagResult.tags.length > 0) {
+          meta.timeTags = timeTagResult.tags
+          meta.timeTagSource = 'messages'
+        }
+      } catch {
+        /* time tags are best effort; never break an archive */
+      }
     }
     folderPlans.push({ id: meta.id, meta, messages: chunkMessages })
   }

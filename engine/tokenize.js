@@ -7,7 +7,7 @@
  * turned into 2-grams and 3-grams. Candidates are scored by
  * `frequency × length`, filtered through built-in zh+en stopwords + particle
  * characters + CJK trigram evidence, de-duplicated by substring containment and
- * finally capped to `keywords.min..keywords.max`.
+ * finally capped to `keywords.min..keywords.max` (v1.5.4: 3~16).
  *
  * Token estimate (used only as fallback when the host does not provide real
  * token numbers):
@@ -27,6 +27,23 @@ export const CJK_CHAR_RE = /[\u3400-\u4DBF\u4E00-\u9FFF\uF900-\uFAFF\u{20000}-\u
 const CJK_RUN_RE = /[\u3400-\u4DBF\u4E00-\u9FFF\uF900-\uFAFF\u{20000}-\u{2FA1F}]+/gu
 const LATIN_RUN_RE = /[a-z][a-z0-9_+#.-]*/g
 const NUMBER_RE = /\d+(?:\.\d+)*/g
+
+/**
+ * Query-side recall keyword cap — the pre-1.6 value (16).
+ *
+ * Recall extracts keywords from the *query* text in three main places: the
+ * automatic recall path (engine/recall.js), the deterministic selector
+ * (engine/recall-index.js `querySeeds`) and `analyzeQuery`
+ * (engine/query-analysis.js). This constant is the long-standing cap for those
+ * paths; the separate "you said" assistant-utterance channel keeps its own,
+ * narrower cap of 8 (engine/query-analysis.js), exactly as before v1.6.0.
+ *
+ * v1.5.4 rule is **query 16 / archive 16**: this query cap stays
+ * 16, while `cfg.keywords.min/max` (archival folder keywords, 3~16) is the one
+ * that was raised. The two are deliberately independent — a query extracts at
+ * most 16 terms, one archived folder may store up to 16 keywords (v1.5.4).
+ */
+export const RECALL_KEYWORDS_MAX = 16
 
 /** Characters that make a CJK n-gram look like a filler fragment. */
 const PARTICLE_CHARS = new Set(['的', '了', '着', '过', '呢', '吗', '吧', '啊', '呀', '哦', '嗯', '嘛', '呗', '啦', '哈'])

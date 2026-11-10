@@ -163,7 +163,7 @@ function formatterFor(timeZone) {
  * @param {string} timeZone
  * @returns {{year:number,month:number,day:number,hour:number,minute:number,second:number}}
  */
-function civilAt(ms, timeZone) {
+export function civilAt(ms, timeZone) {
   const whole = isSafeTimestamp(ms) ? Math.floor(ms / 1000) * 1000 : 0
   const key = `${timeZone || ''}\u0000${whole}`
   const cached = civilCache.get(key)
@@ -190,7 +190,7 @@ function offsetAt(ms, timeZone) {
 }
 
 /** Civil wall time in `timeZone` -> epoch ms (two-pass offset resolution). */
-function instantForCivil(civil, timeZone) {
+export function instantForCivil(civil, timeZone) {
   const wall = utcFromCivil(civil)
   if (!Number.isFinite(wall)) return NaN
   const firstOffset = offsetAt(wall, timeZone)
@@ -200,7 +200,7 @@ function instantForCivil(civil, timeZone) {
 }
 
 /** Calendar day index: days since 1970-01-01 in the *local* calendar. */
-function civilDayIndex(civil) {
+export function civilDayIndex(civil) {
   return Math.floor(utcFromCivil({ year: civil.year, month: civil.month, day: civil.day }) / DAY_MS)
 }
 
@@ -502,7 +502,7 @@ export function addZonedDays(ms, days, timeZone) {
 }
 
 /** Add calendar months (same wall-clock preserving semantics). Internal helper. */
-function addZonedMonths(ms, months, timeZone) {
+export function addZonedMonths(ms, months, timeZone) {
   const value = toTimestamp(ms)
   const amount = Number(months)
   if (!Number.isFinite(value) || !Number.isFinite(amount)) return NaN

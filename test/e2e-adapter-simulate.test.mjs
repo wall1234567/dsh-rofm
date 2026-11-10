@@ -1032,11 +1032,13 @@ function getEventFixture() {
 }
 
 /**
- * Store with the four event-fixture memories, tagged through two REAL
- * `memory_judge` calls:
+ * Store with the four event-fixture memories, tagged through three REAL
+ * `memory_judge` calls (v1.5.0 merge-approval flow):
  *   1) canonical labels 日本旅行 / 登录重构项目 + one memory left without event;
- *   2) the approximate label 「日本旅行计划」 which `assignEventLabel` must merge
- *      into 「日本旅行」 (Dice 0.778) and report with the `event-merged:` marker.
+ *   2) the approximate label 「日本旅行计划」 is NOT merged silently: the label is
+ *      kept as its own canonical label and `eventMergeCandidates` reports it;
+ *   3) re-submitting the existing 「日本旅行」 label approves the merge, so the
+ *      second trip memory ends up on the canonical label again.
  */
 async function createEventFixture() {
   const dir = makeTempDir('event')
@@ -1067,8 +1069,8 @@ async function createEventFixture() {
   const firstCall = await judge.execute(
     {
       updates: [
-        { id: 'mem-event-a1', alpha: 0.9, beta: 3, keywords: EVENT_KEYWORDS, event: EVENT_TRIP, reason: '旅行第一天的行程记录' },
-        { id: 'mem-event-b1', alpha: 0.8, beta: 3, keywords: EVENT_KEYWORDS, event: EVENT_PROJECT, reason: '工作项目的评审记录' },
+        { id: 'mem-event-a1', alpha: 0.9, beta: 3, keywords: EVENT_KEYWORDS, events: [EVENT_TRIP], reason: '旅行第一天的行程记录' },
+        { id: 'mem-event-b1', alpha: 0.8, beta: 3, keywords: EVENT_KEYWORDS, events: [EVENT_PROJECT], reason: '工作项目的评审记录' },
         { id: 'mem-event-none', alpha: 0.5, beta: 0, keywords: EVENT_KEYWORDS, reason: '一次闲聊' },
       ],
     },
@@ -1077,9 +1079,14 @@ async function createEventFixture() {
   const secondCall = await judge.execute(
     {
       updates: [
-        { id: 'mem-event-a2', alpha: 0.9, beta: 3, keywords: EVENT_KEYWORDS, event: `${EVENT_TRIP}计划`, reason: '旅行计划变更记录' },
+        { id: 'mem-event-a2', alpha: 0.9, beta: 3, keywords: EVENT_KEYWORDS, events: [`${EVENT_TRIP}计划`], reason: '旅行计划变更记录' },
       ],
     },
+    { agent: { session } },
+  )
+  // The model approves the candidate by re-submitting the existing canonical label.
+  const thirdCall = await judge.execute(
+    { updates: [{ id: 'mem-event-a2', events: [EVENT_TRIP] }] },
     { agent: { session } },
   )
   const engine = plugin.engineFor(session, plugin.currentConfig())
@@ -1095,6 +1102,7 @@ async function createEventFixture() {
     recall,
     firstCall,
     secondCall,
+    thirdCall,
     engine,
     index,
     memoryOf: (id) => JSON.parse(readFileSync(path.join(memoryDir, id, 'meta.json'), 'utf8')),
@@ -1112,7 +1120,7 @@ async function runRecallTool(run, args, session) {
   return { session: target, args, value, rendered, ids: Array.isArray(value?.added) ? value.added : [] }
 }
 
-test('event constraint (a): memory_judge tags canonical event labels and merges similar ones', async () => {
+test('event constraint (a): memory_judge tags canonical labels, keeps near-duplicates as candidates, approves a merge', async () => {
   const run = await getEventFixture()
 
   // (1) canonical labels land in meta.json and are mirrored into index.json.
@@ -1120,8 +1128,12 @@ test('event constraint (a): memory_judge tags canonical event labels and merges 
   const a2 = run.memoryOf('mem-event-a2')
   const b1 = run.memoryOf('mem-event-b1')
   const none = run.memoryOf('mem-event-none')
-  assert.equal(a1.event, EVENT_TRIP, 'the first trip memory is tagged with the canonical event')
-  assert.equal(a2.event, EVENT_TRIP, 'the approximate label 日本旅行计划 is merged into 日本旅行')
+  assert.deepEqual(a1.events, [EVENT_TRIP], 'the first trip memory carries the canonical event set')
+  assert.deepEqual(a2.events, [EVENT_TRIP], 'after approval the second trip memory is back on the canonical event')
+  assert.deepEqual(b1.events, [EVENT_PROJECT], 'the work project memory keeps its own event')
+  assert.equal(none.events, undefined, 'a memory without an event writes no events field (old-data compatible)')
+  assert.equal(a1.event, EVENT_TRIP, 'the legacy event mirror is still written')
+  assert.equal(a2.event, EVENT_TRIP, 'the merged memory mirrors the canonical event')
   assert.equal(b1.event, EVENT_PROJECT, 'the work project memory keeps its own event')
   assert.equal(none.event, undefined, 'a memory without an event writes no event field (old-data compatible)')
   for (const meta of [a1, a2, b1]) {
@@ -1131,22 +1143,46 @@ test('event constraint (a): memory_judge tags canonical event labels and merges 
   assert.equal(none.eventSource, undefined, 'no event provenance for an event-less memory')
   const indexEvents = Object.fromEntries(run.index.folders.map((folder) => [folder.id, folder.event]))
   assert.equal(indexEvents['mem-event-a1'], EVENT_TRIP, 'index.json mirrors the canonical event')
-  assert.equal(indexEvents['mem-event-a2'], EVENT_TRIP, 'index.json mirrors the merged event')
+  assert.equal(indexEvents['mem-event-a2'], EVENT_TRIP, 'index.json mirrors the approved event')
   assert.equal(indexEvents['mem-event-b1'], EVENT_PROJECT, 'index.json mirrors the project event')
   assert.equal(indexEvents['mem-event-none'], undefined, 'index.json has no event for the event-less memory')
+  const indexEventSets = Object.fromEntries(run.index.folders.map((folder) => [folder.id, folder.events]))
+  assert.deepEqual(indexEventSets['mem-event-a1'], [EVENT_TRIP], 'index.json mirrors the v1.5.0 event set')
+  assert.deepEqual(indexEventSets['mem-event-a2'], [EVENT_TRIP])
+  assert.deepEqual(indexEventSets['mem-event-b1'], [EVENT_PROJECT])
+  assert.equal(indexEventSets['mem-event-none'], undefined)
 
   // (2) batch accounting + the model-visible warnings.
-  assert.deepEqual(run.firstCall.eventStats, { assigned: 2, merged: 0, cleared: 0 }, 'the first batch assigns two events')
+  assert.deepEqual(run.firstCall.eventStats, { assigned: 2, merged: 0, cleared: 0, candidates: 0 }, 'the first batch assigns two events')
   assert.ok(
-    run.firstCall.warnings.some((warning) => warning.includes('没有 event 标签')),
+    run.firstCall.warnings.some((warning) => warning.includes('没有事件标签')),
     'a new memory judged without an event gets a non-blocking reminder',
   )
-  assert.deepEqual(run.secondCall.eventStats, { assigned: 0, merged: 1, cleared: 0 }, 'the second batch reports one merge')
-  const mergeWarning = run.secondCall.warnings.find((warning) => warning.startsWith('event-merged:'))
-  assert.ok(mergeWarning, 'the merge carries the stable `event-merged:` marker')
-  assert.ok(mergeWarning.includes(EVENT_TRIP) && mergeWarning.includes('0.78'), `the merge warning names both labels and the score (${mergeWarning})`)
+  // v1.5.0: the near-duplicate label is NOT merged silently. It is written as
+  // its own canonical label and returned as a candidate for the model to approve.
+  assert.deepEqual(
+    run.secondCall.eventStats,
+    { assigned: 1, merged: 0, cleared: 0, candidates: 1 },
+    'the second batch reports one unapproved candidate instead of a merge',
+  )
+  assert.equal(run.secondCall.eventMergeCandidates.length, 1, 'the candidate is surfaced to the model')
+  const candidate = run.secondCall.eventMergeCandidates[0]
+  assert.equal(candidate.submitted, `${EVENT_TRIP}计划`)
+  assert.equal(candidate.existing, EVENT_TRIP)
+  assert.ok(Math.abs(candidate.score - 0.7777777777777778) < 1e-12, `the candidate carries the Dice score (${candidate.score})`)
+  const candidateWarning = run.secondCall.warnings.find((warning) => warning.startsWith('event-candidate:'))
+  assert.ok(candidateWarning, 'the candidate carries the stable `event-candidate:` marker')
+  assert.ok(candidateWarning.includes(EVENT_TRIP) && candidateWarning.includes('0.78'), `the warning names both labels and the score (${candidateWarning})`)
   const judgeText = run.judge.output.render(null, run.secondCall)[0].text
-  assert.match(judgeText, /事件标签：归并 1 条/, 'the judge summary counts event merges without printing label text')
+  assert.match(judgeText, /事件标签：打标 1 条、待确认归并 1 条/, 'the judge summary counts the unapproved candidate')
+  assert.match(judgeText, /标签写入：事件 1 个/, 'the judge summary counts the written tag')
+  // Re-submitting the existing canonical label is the model-approved merge.
+  assert.deepEqual(
+    run.thirdCall.eventStats,
+    { assigned: 0, merged: 1, cleared: 0, candidates: 0 },
+    're-submitting the existing label is counted as an approved merge',
+  )
+  assert.equal(run.thirdCall.eventMergeCandidates, undefined, 'the approved merge leaves no candidate behind')
 
   // (3) the in-memory derived event index agrees (count desc, canonical labels only).
   const eventIndex = run.engine.eventIndex()
@@ -1160,7 +1196,12 @@ test('event constraint (a): memory_judge tags canonical event labels and merges 
   )
   assert.equal(eventIndex.byKey.size, 2, 'two canonical events share one key each')
   assert.equal(eventIndex.byId.size, 3, 'three memories carry an event; the fourth has none')
-  assert.equal(eventIndex.byId.get('mem-event-a2').label, EVENT_TRIP, 'the merged memory points at the canonical label')
+  assert.deepEqual(eventIndex.byId.get('mem-event-a2'), { label: EVENT_TRIP, key: EVENT_TRIP }, 'the merged memory points at the canonical label')
+  assert.deepEqual(
+    eventIndex.byIdAll.get('mem-event-a2'),
+    [{ label: EVENT_TRIP, key: EVENT_TRIP }],
+    'v1.5.0 byIdAll lists every label of the merged memory',
+  )
 })
 
 test('event constraint (b): memory_recall scopes to the event; 空/omitted are unconstrained; time AND event', async () => {
@@ -1212,7 +1253,7 @@ test('event constraint (c): ambiguous labels wait for the model, unknown events 
 
   // (1) R5 ambiguity: a new-but-similar label returns candidates and NO results.
   const session = run.nextSession()
-  const ambiguous = await runRecallTool(run, { keywords: '项目记录', event: `${EVENT_TRIP}计划`, limit: 8 }, session)
+  const ambiguous = await runRecallTool(run, { keywords: '项目记录', event: `${EVENT_TRIP}计划2027`, limit: 8 }, session)
   assert.equal(ambiguous.value.found, 0, 'an ambiguous label never guesses a result')
   assert.deepEqual(ambiguous.ids, [], 'no additions for an ambiguous event')
   assert.equal(ambiguous.value.missType, 'event-ambiguous', 'the miss type tells the model to arbitrate')
@@ -1223,7 +1264,7 @@ test('event constraint (c): ambiguous labels wait for the model, unknown events 
     [{ label: EVENT_TRIP, count: 2 }],
     'the similar canonical event is returned as a candidate',
   )
-  assert.ok(Math.abs(Number(ambiguous.value.eventInfo.candidates[0].score) - 0.7778) < 0.01, 'the candidate carries the Dice score')
+  assert.ok(Math.abs(Number(ambiguous.value.eventInfo.candidates[0].score) - 14 / 19) < 0.01, 'the candidate carries the Dice score')
   assert.ok(ambiguous.rendered.includes('与已有事件高度相似'), 'the model is told the submitted event is similar to an existing one')
   assert.ok(ambiguous.rendered.includes('请判断是否为同一事件'), 'the model is asked to decide whether they are the same event')
   assert.ok(ambiguous.rendered.includes('event:"空"'), 'the model is told how to drop the constraint')
@@ -1238,7 +1279,6 @@ test('event constraint (c): ambiguous labels wait for the model, unknown events 
   const resolved = await runRecallTool(run, { keywords: '项目记录', event: EVENT_TRIP, limit: 8 }, session)
   assert.equal(resolved.value.found, 2, 're-submitting the candidate label hits the exact event')
   assert.equal(resolved.value.eventInfo.status, 'exact')
-
   // (4) unknown event: strict constraint to an event with no memories.
   const unknown = await runRecallTool(run, { keywords: '项目记录', event: '火星基地', limit: 8 })
   assert.equal(unknown.value.found, 0, 'an unknown event returns no memories')
@@ -1289,15 +1329,18 @@ test('event constraint (d): memory_judge clears an event tag with 空 (design §
     { updates: [{ id: 'mem-event-clear', alpha: 0.7, beta: 2, keywords: EVENT_KEYWORDS, event: '旅行笔记', reason: '旅行笔记' }] },
     { agent: { session } },
   )
-  assert.deepEqual(tagged.eventStats, { assigned: 1, merged: 0, cleared: 0 })
+  assert.deepEqual(tagged.eventStats, { assigned: 1, merged: 0, cleared: 0, candidates: 0 })
   assert.equal(metaOf().event, '旅行笔记')
+  assert.deepEqual(metaOf().events, ['旅行笔记'], 'the v1.5.0 event set is written for the legacy shorthand too')
   const cleared = await judge.execute({ updates: [{ id: 'mem-event-clear', event: '空' }] }, { agent: { session } })
-  assert.deepEqual(cleared.eventStats, { assigned: 0, merged: 0, cleared: 1 }, 'clearing an event is counted separately')
+  assert.deepEqual(cleared.eventStats, { assigned: 0, merged: 0, cleared: 1, candidates: 0 }, 'clearing an event is counted separately')
   assert.equal(metaOf().event, undefined, '空 deletes meta.event instead of writing an empty string')
+  assert.equal(metaOf().events, undefined, '空 deletes the v1.5.0 event set too')
   assert.equal(metaOf().eventSource, undefined, 'clearing removes the event provenance too')
   assert.match(judge.output.render(null, cleared)[0].text, /事件标签：清空 1 条/)
   const indexEntry = readIndexFile(memoryDir).folders.find((folder) => folder.id === 'mem-event-clear')
   assert.equal(indexEntry.event, undefined, 'index.json no longer carries the cleared event')
+  assert.equal(indexEntry.events, undefined, 'index.json no longer carries the cleared event set')
   // The cleared label no longer matches anything: the event is unknown now.
   const afterClear = await recall.execute({ keywords: '项目记录', event: '旅行笔记', limit: 8 }, { agent: { session } })
   assert.equal(afterClear.found, 0, 'a cleared event tag is not recallable')

@@ -27,6 +27,7 @@ export {
 
 // tokenization / message model
 export {
+  RECALL_KEYWORDS_MAX,
   estimateTokens,
   estimateMessagesTokens,
   normalizeMessages,
@@ -50,10 +51,27 @@ export { computeImportance, alphaForFolder, DECISION_MARKERS } from './importanc
 export { erf, recallProbability, createRng } from './recall.js'
 
 // compression
-export { planCompression, commitCompression, buildArchiveNote, parseArchiveNote, eventTimeRangeOf } from './compress.js'
+export { planCompression, commitCompression, buildArchiveNote, parseArchiveNote, eventTimeRangeOf, extractAssistantKeywords } from './compress.js'
 
 // recall
-export { recall, loadRecallAdditions, buildRecallBlock, formatBeta, RECALL_BLOCK_PREAMBLE } from './recall.js'
+export {
+  recall,
+  loadRecallAdditions,
+  buildRecallBlock,
+  renderTagLine,
+  formatBeta,
+  RECALL_BLOCK_PREAMBLE,
+  // v1.6.0 computable recall block (absolute dates / weekday / relative-time notes)
+  formatWeekday,
+  formatDateWithWeekday,
+  formatDateTimeWithWeekday,
+  formatTimeTagDate,
+  annotateRelativeTimeText,
+  // v1.5.4 time-caliber rule (renderer appends it when computeDates is on) and
+  // the shared event-time text used by both the engine and the adapter fallback.
+  RECALL_BLOCK_TIME_RULE,
+  formatEventTimeText,
+} from './recall.js'
 
 // v1.4.0 deterministic recall selector (FAIR-DRI, docs/SPEC.md §6.2)
 export {
@@ -108,6 +126,41 @@ export {
   assignEventLabel,
   eventIdsFor,
 } from './event-index.js'
+
+// v1.5.0 location/person/event tags + time tags (in-memory tag index, §6.10)
+export {
+  TAG_KINDS,
+  TAG_MODES,
+  TAG_DEFAULTS,
+  TIME_GRANULARITIES,
+  tagConfig,
+  normalizeTagLabel,
+  buildTagIndex,
+  normalizeTagQuery,
+  resolveTagQuery,
+  detectTagMentions,
+  buildTimeTagIndex,
+  resolveTimeTagIds,
+} from './tag-index.js'
+
+// v1.5.0 deterministic relative-time parser (fuzzy time -> absolute intervals)
+export {
+  readTimeTagConfig,
+  parseRelativeTimes,
+  extractTimeTags,
+  detectQueryTimes,
+  intervalsOverlap,
+} from './relative-time.js'
+
+// v1.5.0 query analysis (clauses / tag mentions / fuzzy time / "you said")
+export {
+  splitClauses,
+  detectAssistantSaid,
+  analyzeQuery,
+  isComplexQuery,
+  effectiveRecallQuota,
+  ASSISTANT_SAID_PHRASES,
+} from './query-analysis.js'
 
 // engine facade
 export { MemoryEngine } from './engine.js'

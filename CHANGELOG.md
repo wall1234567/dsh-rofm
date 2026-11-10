@@ -7,6 +7,353 @@ The project follows a lightweight [SemVer](https://semver.org/) scheme.
 
 （下一个版本的变更写在这里。）
 
+## [1.5.6] — 2026-11-09
+
+**修正版：评分期多话题关键词覆盖规则 + 记忆相关问题主动召回规则。**
+
+- **评分期关键词规则（多话题文件夹）**：`memory_judge` 设置 keywords 时，如果一条记忆包含多个话题
+  （多个用户轮次、多个不相关的事件/项目/决定，或明显不同的时间/场景），keywords 必须覆盖**每个话题**的
+  关键事实（人物、地点、事件、决定、参数、结论），每个话题至少 1 个能独立检索到它的关键词；不得只覆盖
+  第一个/最主要的话题，也不得用泛词凑数。落地：`lib/memory-tool.js` 的 `TOOL_DESCRIPTION` 与
+  `keywords` 参数说明（完整规则）、`lib/plugin.js` 评分 rubric 的 keywords 条目（紧凑句，避免挤占固定
+  任务区块预算）；`test-adapter/scoring-rubric.test.mjs` / `test-adapter/plugin-mock.test.mjs` 钉死文案。
+- **记忆相关问题主动召回规则**：`MEMORY_RULES_TEXT` 新增第 6 条（共 9 条）「记忆相关问题（v1.5.6）」——只要当前
+  问题需要依赖记忆（回忆过去的经历/约定/偏好/参数/人物/时间等），而自动召回没有直接解决它（没回忆到、
+  只召回无关内容、或缺少回答问题所需的关键事实），就必须至少进行一次主动召回（`memory_recall`），用
+  具体关键词/人物/事件检索后再作答。
+  `test-adapter/plugin-rules-1.6.0.test.mjs` 钉死规则文本、顺序与规则 section 长度上限。
+- 版本 1.5.5 → **1.5.6**；文档（README / `docs/SPEC.md` / `docs/VERIFICATION.md` /
+  `config.json` `_readme` / `tools/gate-baseline.json`）同步。
+
+## [1.5.5] — 2026-11-09
+
+**功能版：关键词/标签质量控制 + 高相关命中保底配额 + 助手原话抽取修复。**
+
+- **关键词规则（memory_judge）**：设置 keywords 时，关键词象征的信息应覆盖这条记忆里发生的所有事；
+  信息密度低的给少量关键词（接近下限 3），信息密度高的给更多（最多 16）；本条记忆里出现的所有
+  人物、地点都必须包含；persons/locations/events 设置完后必须复查是否都已写进 keywords（缺了就补）。
+  `memory_judge` TOOL_DESCRIPTION、`keywords` 参数说明与评分 rubric 同步。
+- **助手原话通道修复**：`extractAssistantKeywords()` 改用与
+  `conversationalMessagesText()`/`isRealConversation()` 相同的过滤口径（`lib/message-text.js`）——
+  只抽真实对话：跳过 `[tool-call`/`[tool-added`/`[tool-removed`/`[tool-result` 开头的协议文本、
+  `role === 'tool'`、JSON-like 文本；assistant 消息只取 content blocks 里的 text 部分（丢弃 tool-call 块）。
+  每轮最后一条自然语言回复优先占槽位（每轮至少 1 个，不会被一长串 JSON 挤掉）；后置丢弃
+  `tool-call`/`id`/`alpha`/`beta`/`keywords`/`mem-…`、纯数字、纯小写英文标识等 JSON 键/token。
+- **高相关命中保底配额**：新增 `recall.highRelevance`（默认 `enabled=true, minMatches=2,
+  reserveSlots=2`）。一条记忆命中至少 2 个不同查询关键词即「高相关」，每轮最多保证 2 条这样的记忆
+  进入配额：先补空位，额度已满时替换尾部一条未被其它车道保护的低优先级命中（助手原话/多子句保底
+  不会被替换）；`deterministic` 研究模式和分页路径不启用。遥测新增
+  `highRelevanceEnabled/minMatches/reserveSlots/Candidates/Picks/Replaced`。
+- **memory_judge prompt 增加规则**：助手自己说过的话（称呼约定、承诺、规则、决定）也必须出现在
+  `keywords` 或 assistant 原话通道。
+- 版本 1.5.4 → **1.5.5**；文档（README/SPEC/VERIFICATION/`config.json` `_readme`/`gate-baseline`）同步。
+
+## [1.5.4] — 2026-11-09
+
+**修正版：回忆块时间口径。归档时把每条消息自己的事件时间写入 `context.json` 的 `message.time`
+（回忆时 `messageAnchorMs` 不再退回文件夹 `createdAt`）；回忆块标题改为 `归档于 X（事件时间 Y）`
+（X = 归档时间，Y = 事件时间），移除 v1.6.0 的独立 `事件时间：…` 行；preamble 与
+`dsh-rofm:memory-rules` 明确「引用日期以事件时间为准，标题是归档时间」，降级渲染器与
+`memory_recall` 工具结果标题同步该口径。引擎默认 `recall.computeDates=false` 时仍与 v1.5.0
+逐字节一致；数据只新增可选字段，旧数据不回填、无需迁移。**
+
+### 1.5.4 增量（2026-11-09）
+
+> 说明：工作树中原有的 1.6.0 / 1.7.0 版本段是未发布的内部记录，本版统一以 **1.5.4** 发布；
+> 下列 1.5.4 增量叠加在回忆块时间口径修正之上。
+
+- **版号 1.5.4**：`package.json` / `engine/package.json` 从 1.7.0 改为 **1.5.4**；文档与代码注释里的
+  `v1.7.0` 一并改为 `v1.5.4`。
+- **归档评分可见全文（去除非真实对话部分）**：`记忆评分任务` 的待评分条目不再只给 160 字符摘要，
+  改为 `head + 原文： + 真实对话全文`（`lib/plugin.js` `memoryFolderTaskInfo` →
+  `lib/message-text.js` 新增 `conversationalMessagesText`：只保留 user/assistant 对话与 QQ JSON
+  tool result 中携带的对话，丢弃纯工具输出 / `[tool-call …]` 协议消息 / 结构性消息）；复核条目
+  （`memoryFolderReview`）使用同一过滤器。无真实对话的文件夹显式标注「（无真实对话内容…）」；
+  条目过长仍受任务区块硬预算限制并标注「…（受任务区块预算限制，原文已截断）」。
+- **`memory_judge` 关键词上限 30 → 16**：`engine/config.js` / 随包 `config.json` 的
+  `keywords.max` = 16（`min` 仍为 3）；`memory_judge` 描述、`keywords` 参数说明、评分 rubric
+  的「3~16 个」同步；启发式归档关键词生成同口径（查询侧历史值 16、「你说过」通道 8 不变）。
+- **满页提示前置**：`lib/recall-tool.js renderRecallResult` 的 `renderFullPageHint` 输出从 entries
+  之后移到 header/count 与约束行之后、第一个 `### 回忆` 之前（preamble 区），模型先读到「本页已满」
+  再读条目；分页 / 图片 / warning / trust note 位置不变。
+
+### Added
+
+- **归档写消息时间（v1.5.4）**：adapter 归档路径（`lib/plugin.js`）把每个表面条目自己的
+  `event.time` 放进交给引擎的消息对象，`planCompression` / `commitCompression` 原样写入
+  `context.json` 的 `messages[].time`（`engine/compress.js` 的 `chunkSegments` 在长消息按句切分时
+  原本就给每个片段保留源消息的 `time`）。QQ 被动归档路径（`lib/passive-archive.js`）原本就写
+  `time`，两条归档路径从此一致。回忆侧 `messageAnchorMs` 的锚点优先级不变
+  （`message.time` → `meta.createdAt` → `addition.createdAt`），但新归档不再需要退回 `createdAt`。
+- **回忆块标题 `归档于 X（事件时间 Y）`（v1.5.4，`recall.computeDates=true`）**：
+  `### 回忆 1 · 归档于 2026-04-19 周日 21:10（事件时间 2026-04-15 周三） · α=… · β=… · 第1代 · 关键词：…`。
+  Y 优先取 `meta.eventStart/eventEnd`（半开区间：末日按 `eventEnd-1` 渲染，同日只写一天、单边只写一端），
+  没有再取该条记忆消息里有限的 `message.time` 的最早/最晚；两者都没有时标题只写 `归档于 X`，
+  不输出空括号、不编造事件时间。
+- **回忆块时间口径规则（v1.5.4）**：`engine/recall.js` 新增导出 `RECALL_BLOCK_TIME_RULE`
+  （`engine/index.js` 同步导出），在 `computeDates=true` 时追加到 `RECALL_BLOCK_PREAMBLE` 之后：
+  标题里的「归档于 X」是归档时间、不是事件发生时间；引用日期与时间换算一律以「事件时间」为准；
+  没有事件时间时按正文相对时间注记或记忆内容判断，禁止把归档时间当作事件时间引用。
+  `lib/plugin.js` 的 `MEMORY_RULES_TEXT` 追加第 8 条「时间引用」规则。
+- **降级渲染器同步（v1.5.4）**：`lib/plugin.js renderRecallBlockFallback(ordered, cfg?)` 在
+  `computeDates=true` 时同样渲染 `归档于 X（事件时间 Y）` 标题、时间口径 preamble 与逐消息相对时间
+  注记（镜像 `formatEventTimeText` / `annotateRelativeTimeText`），避免引擎渲染抛错时降级路径把裸
+  归档日期带回；`computeDates=false` 或无 cfg 时保持 legacy 输出逐字节一致。
+- **`memory_recall` 工具结果标题同步（v1.5.4）**：`lib/recall-tool.js` 的
+  `additionToEntry(addition, cfg)` / `formatEntryHeading` 在 `computeDates=true` 时把条目时间改为
+  `· 归档于 <YYYY-MM-DD 周X HH:mm>（事件时间 <YYYY-MM-DD 周X[ ~ …]）`（事件时间优先
+  `meta.eventStart/eventEnd`，否则取召回消息自己的 `time`；都没有时只写归档于），browse 模式仍按
+  `· 事件：…` 显示；legacy 保持裸归档日期。`engine/index.js` 导出共享的 `formatEventTimeText`。
+
+### Changed
+
+- `### 回忆 N` 标题时间格式（`computeDates=true`）由裸日期改为 `归档于 X（事件时间 Y）`；
+  v1.6.0 的独立 `事件时间：…` 行移除（信息移入标题，不重复占 token；`recall.showTags` 只影响标签行，
+  与标题的事件时间无关）。
+- `recall.computeDates=false`（回滚档）与 v1.5.0 仍逐字节一致：标题、preamble 都不变，
+  时间口径规则也不注入。
+- `package.json` / `engine/package.json` 版本 1.6.0 → 1.5.4。
+- 文档同步：README（v1.5.4 banner + §1.15）、`docs/SPEC.md`（§6.7 渲染契约、§25 覆盖清单、§26 数字）、
+  `docs/VERIFICATION.md`（§28）、`config.json` `_readme`；`tools/gate-baseline.json` 更新为 1.5.4
+  与新的全量测试数。
+
+### Fixed
+
+- **归档 `context.json` 的消息缺 `time`**：adapter 归档路径只把事件时间传给 `meta.eventStart/End`，
+  消息本身没有时间，回忆时相对时间注解只能按归档日计算（v1.6.0 的 `message.time` 锚点形同虚设）。
+  现在两条归档路径的消息都带自己的事件时间。
+- **回答模型把回忆块标题里的归档日期当作事件日期引用**：标题现在同时给出并标注归档时间与事件时间，
+  规则文本明确以事件时间为引用口径；`memory_recall` 工具结果标题与降级渲染器同步该口径。
+- **`eventStart/eventEnd` 为 0 时回忆标题渲染 1970 日期**：`0` 是文档化的「无事件时间」哨兵
+  （`README` §3 / 跨聊天查询的 `eventStart: 0` 语义），标题事件时间解析现在忽略非正数时间戳，
+  只渲染真实事件时间；消息 `time` 为 0 同样忽略。
+
+### 兼容与回滚（升级须知）
+
+- **数据格式**：`context.json` 的 `messages[].time` 是可选新增字段。旧文件夹没有该字段时不回填：
+  相对时间注解仍回退 `createdAt`（与 1.6.0 相同），标题按 `meta.eventStart/End` 渲染事件时间、
+  没有事件时间时只写 `归档于 X`；无需迁移。
+- **渲染回滚**：`recall.computeDates=false` 回到 v1.5.0 逐字节渲染（引擎块、适配器 fallback、
+  `memory_recall` 工具结果标题均回到 legacy 形态）；`rules.enabled=false` 可单独关闭记忆使用规则
+  section。时间口径规则随 `computeDates` 只在可计算模式注入。
+- **不发布、不 commit**（发布由 release 工具执行）。
+
+## [1.6.0] — 2026-11-08
+
+**功能版：可计算回忆块（标题星期 / 事件时间行 / 相对时间绝对日期注记）、归档关键词上限 8→30（查询侧维持 16）、
+`memory_recall` 满页加配额重试与人物多称呼别名、`memory_judge` 人称代词指代消解、主动召回 / 满额重试 / 人物称呼
+prompt 规则，以及 benchmark harness 按真实宿主 `output.render` 渲染工具结果。引擎保持零依赖；新增配置
+`recall.computeDates`（引擎默认 `false`、随包 `config.json=true`）；数据格式不变，旧数据不回填、无需迁移。**
+
+### Added
+
+- **可计算回忆块（v1.6.0，新配置 `recall.computeDates`）**：`cfg.recall.computeDates === true` 时
+  `engine/recall.js buildRecallBlock` 输出可计算形式（`false` 时与 1.5.0 逐字节一致，可回归/回滚）：
+  - 每条回忆标题日期带星期：`### 回忆 1 · 2026-04-19 周日 21:10 · α=…`（`formatDateTimeWithWeekday`）；
+  - 记忆带 `meta.eventStart` / `meta.eventEnd` 时，标签行之后增加 `事件时间：2026-04-19 周日 ~ 2026-04-20 周一`
+    （同日只写单日期；只有单边时单边渲染；都没有则不输出该行）；
+  - 正文里的相对时间短语按**该记忆自己的锚点时间**注记绝对日期：`前天(2026-05-25)`、`上周(2026-05-18~2026-05-24)`、
+    `下个月(2026-06)`、`明年(2027)`（`annotateRelativeTimeText`：每条消息每个短语只注记第一次，已带 `(YYYY…)`
+    的文本不重复注记；锚点优先级 `message.time` → `meta.createdAt` → `addition.createdAt`；无法解析或不安全锚点时原样输出）；
+  - 引擎默认 `recall.computeDates=false`，随包 `config.json` 覆盖为 `true`；`engine/index.js` 导出
+    `formatWeekday` / `formatDateWithWeekday` / `formatDateTimeWithWeekday` / `formatTimeTagDate` / `annotateRelativeTimeText`。
+- **关键词上限：查询 16 / 归档 30（最终口径）**：**归档侧** `cfg.keywords.min/max` 3~8 → **3~30**
+  （`engine/config.js` + 随包 `config.json`；一条归档记忆最多 30 个关键词，提高召回覆盖；`memory_judge` 校验与
+  启发式归档关键词生成同步放宽）。**查询侧不变**：`engine/tokenize.js` 的 `RECALL_KEYWORDS_MAX = 16` 覆盖
+  `engine/recall.js` / `engine/recall-index.js` / `engine/query-analysis.js` 的主查询提取，「你说过」通道保持 8；
+  归档上限不放宽查询提取。
+- **`memory_recall` keywords 最多 16 个**：按空白 / 逗号 / 顿号 / 分号拆分、去重保序；>16 个只取前 16 个并在结果
+  `warnings` 里给非阻断提示；≤16 个保持 1.5.0 的引擎侧字符串（仅折叠空白，字节兼容）。
+- **`memory_recall` 满页加配额重试提示**：本页已满（`found === limit` 或 `hasMore`）且未到上限时渲染
+  「必须把 limit 调大（最多 20）再检索一次」；`limit` 已是 20 时改为「用 offset 翻页或换关键词」；browse 与空页不出现
+  （`renderFullPageHint`）。
+- **`memory_recall` persons 多称呼别名语义**：`persons` 可一次传同一人的多个称呼 / 别名（如
+  `["周岑","小周","岑哥"]`）；同类多值为「或」、互不筛选，是否同一人由模型判断；人物 unknown 时提示可换称呼 / 别名再试。
+- **`memory_judge` 人称代词指代消解**：`TOOL_DESCRIPTION` 与 `persons` 参数说明新增指代规则——原文出现
+  「他/她/TA/它/那个人/对方/某人/这位」时，先结合本条原文、同批提交的其他记忆与相邻上下文判断代词指谁；
+  能确定就写明确人名 / 称呼（如「周岑」），不能确定不猜、留空或省略；同一人的多个称呼都写上；`keywords` 也要写
+  代词消解出的人名。
+- **prompt 规则（`MEMORY_RULES_TEXT` 三条新增）**：主动召回（自动回忆块无证据时必须先自行调用至少一次
+  `memory_recall`，禁止直接说「没找到 / 不记得」或凭空猜测）；满额重试（回忆结果已满且无目标记忆时必须加大
+  `limit`（最多 20）再检索一次）；人物称呼（同一人的多个称呼一并传 `persons`，同类多值 OR）。`EMPTY_RECALL_HINT`
+  同步强化为「必须先自行调用至少一次 memory_recall」；`buildRecallExtras` 在本轮自动回忆达到生效配额时输出
+  确定性提示 `【本轮自动回忆已满配额（N 条）】…`（配额取 `queryInfo.quota`，回退 `recall.firstGenMax`；`<=0` 不提示）。
+- **评分任务区块 rubric**：pendingNew 分支新增「persons 指代消解」一条：原文出现代词时先判断指代，能确定写明确
+  人名 / 称呼、不能确定不写（禁止猜测），同一人的多个称呼都写。
+- **benchmark harness 工具结果渲染**：`rofm-bench/formal/harness/tool-render.mjs` 新增
+  `renderToolResultForModel({definition, args, value, maxChars})`——优先按真实宿主 `tool definition.output.render` 渲染；
+  超过预算的 `memory_recall` 结果按 `value.added` 顺序逐条限额渲染（每条公平份额 240–800 字符、总 ≤8000、保证
+  每个 added id 可见，保留 id / keywords / 时间 / 标签 / 关键句摘要），其他工具值超预算时对渲染文本安全裁剪；
+  `exam.mjs:232` 与 `replay.mjs` 同步改用（日志 schema 字段名不变）。
+- **新增测试**：`test/recall-computable-block.test.mjs`、`test-adapter/recall-tool-1.6.0.test.mjs`、
+  `test-adapter/memory-tool-1.6.0.test.mjs`、`test-adapter/plugin-rules-1.6.0.test.mjs`。
+
+### Changed
+
+- `package.json` / `engine/package.json` 版本 1.5.0 → 1.6.0（两者保持一致）。
+- `engine/config.js` `DEFAULT_CONFIG.recall.computeDates=false`；随包 `config.json` `recall.computeDates=true` 并补
+  `_readme` 说明；`test/config-consistency.test.mjs` 的 `PRODUCT_OVERRIDES` 白名单加入 `recall.computeDates`。
+- `memory_recall` 的 `limit` 上限仍为 20（1.5.0 行为），本轮只增加「满页不等于没找到」的显式提示与行为要求。
+- 文档同步：README / `docs/SPEC.md` / `docs/VERIFICATION.md` 更新到 1.6.0（新配置、工具语义、prompt 规则、验证记录）；
+  `tools/gate-baseline.json` 更新为 `version=1.6.0`、`minFullSuiteTests=1.6.0 全量测试数`。
+
+### Fixed
+
+- benchmark harness 不再把 `memory_recall` 的结构化返回值整体 `JSON.stringify(...).slice(0, 8000)` 后喂给模型
+  （选中 20 条时模型只看到前几条的 JSON 碎片）；改为按宿主 render 渲染并逐条限额，保证「选中条数 = 可见条数」。
+- 回忆块里的相对时间（「前天」「下周二」）不再要求回答模型自己做日期运算：`recall.computeDates=true` 时由引擎
+  按记忆自己的锚点注记绝对日期。
+
+### 兼容与回滚（升级须知）
+
+- **`recall.computeDates`**：引擎默认 `false`（1.5.0 渲染逐字节一致）；随包 `config.json` 为 `true`。设回 `false`
+  即回滚到 1.5.0 的回忆块渲染。数据格式不变、无迁移。
+- **关键词上限**：归档侧 `keywords.min/max` 3~8 → **3~30**（`memory_judge` 校验与启发式归档关键词生成同步）；查询侧保持原值不变（`RECALL_KEYWORDS_MAX=16`、`memory_recall` keywords 最多 16、「你说过」通道 8）。
+- **文档/门禁**：`node --test` 全量测试数字与 e2e 最小值同步写入 `tools/gate-baseline.json`；
+  不发布、不 commit（发布由 release 工具执行）。
+
+## [1.5.0] — 2026-11-08
+
+**功能版：四类标签（地点 / 人物 / 多事件 / 时间标签）硬过滤、事件归并需模型批准（不再静默归并）、
+自适应召回配额 20、多子句拆分与逐子问题作答、「你说过」助手原话召回、记忆使用规则 prompt
+（同一件事 / 冲突并列多说法）。引擎保持零依赖，新增 `engine/tag-index.js`、`engine/relative-time.js`、
+`engine/query-analysis.js`；数据格式只新增可选字段，旧数据不回填、无需迁移。**
+
+背景：用户提出六组需求——①过滤扩展（地点/人物/多事件/时间标签）②自适应配额 20 ③多子句拆分与逐子问题作答
+④「你说过」类召回助手原话 ⑤没有相同事件标签不得当成一件事 ⑥冲突必须并列多说法、禁止裁决。本版把六组全部落地：
+标签在**评分时由模型提交**（归档路径保持不调用模型），关键词触发的标签过滤是**硬过滤**（同类多值 OR、跨类 AND），
+时间标签在**归档时由确定性程序**从消息里的模糊时间（「昨天」「下周二」「三天后」）换算成绝对半开区间。
+
+### Added
+
+- **四类标签过滤（地点 / 人物 / 多事件 / 时间标签）**：
+  - `meta.locations`（0..8，`location.maxPerFolder=8`）与 `meta.persons`（0..8，`person.maxPerFolder=8`）：
+    评分模型在 `memory_judge` 里提交原文中**明确出现**的地点/人物（不推断）；地点支持「家」特例
+    （我家/我家里/家里/在家/回家 → 「家」；`小明的家` → `小明家`）。
+  - `meta.events`（0..4，`event.maxPerFolder=4`）与兼容镜像 `meta.event = events[0]`：一条记忆可属于多个事件；
+    旧的单值 `event` 仍可读可写（`events` 与 `event` 同时提交时 `events` 优先并给出 warning）。
+  - `meta.timeTags`（`{from,to,label,granularity}` 半开区间 epoch ms）与 `meta.timeTagSource='messages'`：
+    归档时由 `engine/relative-time.js` 确定性计算（时区感知，支持今天/昨天/周X/月/年/N 天前后/明确日期等），
+    **不要求评分模型提交时间字段**。
+  - 回忆期标签过滤（`locations` / `persons` / `events` / `timeText`）：**同类多值 OR、跨类 AND**，并与关键词、
+    旧时间范围同时生效（AND）；`location/person/timeTag` 各有 `off` / `index` / `constrain` 三种模式。
+  - 标签/时间标签索引**纯内存**从 `index.folders` 派生（`engine/tag-index.js`），不落盘第二份真相、不建标签文件夹；
+    旧数据没有标签属正常，不批量回填。
+- **事件归并需模型批准（不再静默归并）**：评分时提交与已有事件相似但不同的标签，系统**保留新标签**并返回
+  `eventMergeCandidates: [{submitted, existing, score}]`（`eventStats.candidates` 计数），warnings 提示
+  「如需归并请用已有标签重新提交」；模型再提交已有标签（精确命中）即视为批准归并。评分任务区块新增
+  「已有事件标签（同一事件请复用）」列表（`event.showExisting` / `event.showExistingLimit=24`，受任务区块预算约束）。
+- **自适应召回配额 20**：`memory_recall` 的 `limit` 上限 **8 → 20**（默认仍为 3）；自动召回在复杂/大型消息
+  （多子句 / 长文本 / 多关键词，`recall.adaptiveQuota`）时把本轮生效配额从 `firstGenMax` 自适应升到
+  `complexQuota=20`，仍受字符/窗口/block 裁剪预算约束。
+- **多子句拆分与逐子问题作答**：用户消息按 `。！？；` 与换行拆子句（`recall.clauseSplit.maxClauses=8`，
+  `minClauseChars=2`），每个子句保底 1 个召回名额（有候选才可能命中），剩余名额在子句间轮转；无候选的子句在注入块
+  标注「未找到相关记忆」；`engine/query-analysis.js` 的 `splitClauses` / `isComplexQuery` / `effectiveRecallQuota`。
+- **「你说过」助手原话召回**（三层）：引用句式检测（你说过/你之前说/你建议/你答应/你让我/你不是说…，
+  `engine/query-analysis.js` `detectAssistantSaid`）+ assistant 原话关键词索引/匹配通道（`assistantKeywords`，
+  以合成前缀 `\u0003asst:` 加入 postings，仅 `recall.assistantSaid.enabled !== false` 时建立）+
+  prompt 规则（见下）。`memory_recall` 新增 `assistantSaid` 参数，省略时由插件按本轮用户消息的引用句式自动判定。
+- **记忆使用规则 prompt section**：新增 `dsh-rofm:memory-rules`（order 102，`rules.enabled` 开关）四条：
+  ① 多子问题逐条作答、无记忆依据写「不知道」；② 没有相同事件标签（含双方都无标签）不得当成同一件事，
+  可猜测并询问，用户确认前不得当事实陈述；③ 回忆冲突必须并列多种说法并说明无法确定，**禁止裁决、禁止说「没有冲突」**；
+  ④ 「你说过」先核对再答、禁止无证据否认或肯定。
+- **回忆块标签渲染**：`buildRecallBlock` 每条记忆在有标签时新增一行
+  `事件：… · 地点：… · 人物：… · 时间标签：…`（仅当字段存在；`recall.showTags=false` 关闭）；
+  旧数据无标签时输出与 1.4.4 逐字节一致。
+- **评分 rubric / 任务区块**：新增 events（可多个）、locations、persons、时间标签由系统计算、事件归并需批准、
+  keywords 必须覆盖人物/地点/事件名等条目；评分任务区块列出已有事件标签供复用。
+- **引擎新模块与导出**（零依赖）：`engine/tag-index.js`（标签规范化/内存索引/回忆期解析/mention 检测/时间标签索引）、
+  `engine/relative-time.js`（时区感知模糊时间解析）、`engine/query-analysis.js`（子句/标签/模糊时间/引用句式/复杂度）；
+  `engine/index.js` 相应导出，`MemoryEngine` 新增 `tagIndex()` / `timeTagIndex()` / `recallQuota()`。
+- **配置新增**（engine 默认见 `DEFAULT_CONFIG`；随包 `config.json` 覆盖为产品值）：
+  `location` / `person` / `timeTag` / `rules` 组；`recall.adaptiveQuota` / `recall.clauseSplit` /
+  `recall.tagMentions` / `recall.assistantSaid` / `recall.showTags`；
+  `event.maxPerFolder` / `event.mergeRequiresApproval` / `event.showExisting` / `event.showExistingLimit`。
+- **新增测试**：`test/relative-time.test.mjs`、`test/tag-index.test.mjs`、`test/query-analysis.test.mjs`、
+  `test/recall-tags.test.mjs`（标签过滤/时间标签优先/多事件/多子句/配额/助手原话）、
+  `test-adapter/memory-tool-1.5.0.test.mjs`、`test-adapter/recall-tool-1.5.0.test.mjs`、
+  `test-adapter/plugin-rules-1.5.0.test.mjs`。
+
+### Changed
+
+- **事件标签由单值改为多值**：`memory_judge` 新增 `events: string[]`（`event` 保留为旧字段，二者同时提交时
+  `events` 优先）；输出新增 `tagStats: {locations, persons, events}`、`eventStats.candidates`、
+  `eventMergeCandidates`；评分摘要附带标签写入/事件归并计数（不打印标签正文）。
+- **事件归并语义**：`assignEventLabel` 不再静默改写相似标签，改为「保留新标签 + 返回候选」；
+  同一 `memory_judge` 批内仍可复用本批先写入的 canonical 标签。
+- **时间过滤「timeTag 优先」**：带 `timeTags` 的记忆只按时间标签是否落在查询窗口内过滤（忽略
+  eventStart/eventEnd）；没有时间标签的记忆仍按旧事件区间过滤。
+- **`memory_recall` 参数与结果扩展**：新增 `locations` / `persons` / `events` / `timeText` / `assistantSaid`；
+  `limit` 上限 8 → 20；结果新增 `tagInfo` / `timeTagInfo` / `clauseInfo` / `assistantInfo` / `assistantSaid`，
+  `missType` 扩展 `'tag' | 'time-tag'`；MISS/DISABLED 提示与 description 同步新过滤器；标签过滤不消耗配额。
+- **自动召回**：先做一次确定性 `analyzeQuery`（子句拆分 / 标签 mention / 模糊时间窗 / 引用句式 / 复杂度），
+  把 `clauses` / `locations` / `persons` / `timeTagWindows` / `assistantSaid` / `quota` 传给引擎；
+  recall section 末尾追加「本轮子问题召回情况」（每子句：命中 N 条 / 未找到相关记忆）与引用句式提示。
+- **归档路径**：adapter `planCompression` 与 passive 归档都在写 meta 时确定性计算 `timeTags` / `timeTagSource`
+  （passive 路径同时补齐 `eventStart` / `eventEnd` / `eventTimeSource`）；评分/归档覆盖不得删除这些新字段；
+  `engine/store.js copyOptionalIndexFields` 白名单同步，旧 index 字节兼容。
+
+### 修复（1.5.0 审计缺陷修复）
+
+1.5.0 开发完成后做了一轮独立审计（24 条缺陷），本节的修复都属于 1.5.0 未发布内容：
+
+- **F-05-01** 任务区块「已有事件标签」小节的标题+正文计入 `fixedTokens`，渲染后再对 `min(scoring.taskMaxTokens, window×taskBudgetPercent%)` 硬校验（8k/12k 窗口不再 +45%~+75%，worst-case 含 24 条长标签）。
+- **F-LEAD-03** 评分 rubric 删除遗留的单事件 `event（可选但建议）` 行，只保留「events（可多个）」+「events/locations/persons」两行标签规则。
+- **F-04-06** 预算裁剪不再静默：子句命中数按 trim 后实际注入重算（引擎 `clauseInfo[i].ids` → 关键词 → 块大小降级），并追加含「预算/裁剪」字样的提示。
+- **F-04-07** 无候选子句文案统一为「未找到相关记忆」，删除引擎永不产生的 `no-slot`（受本轮配额限制未检索）死分支。
+- **F-04-04** `recall.firstGenMax=0` kill switch：自适应 complex 配额不得抬高（engine `recallQuota()` 与 adapter 双守）。
+- **F-04-03** `recall.assistantSaid.enabled=false` 是硬开关：显式 `memory_recall assistantSaid:true` 也不得检索，`buildRecallIndex` 不建 asst postings。
+- **F-04-05** legacy 模式不检索助手原话时不再谎报：`assistantInfo.effective=false`，模型可见文本不得声称「同时检索了你过去说过的话」。
+- **F-04-01** 子句保底名额不再被主选择残留的 fair lane（`pendingHigh`）污染（保底 pick 必须属于该子句的候选/关键词），`hits` 只用真实计数。
+- **F-04-02** `assistantSaid.reserveSlots` 的 `clampInt(..., 0, 8, 0)` 实参修复，拥挤场景预留通道真实生效（reserveSlots=0 与 =2 有可观察差异）。
+- **F-LEAD-01 / F-02-01** 时间标签优先在软窗口 fallback ladder 的**每一档**都套用（此前只有请求窗口生效，各档漏过滤）。
+- **F-LEAD-02** assistant 原话关键词改为句子/分句级实词抽取（不再复用通用 3-gram 路径，两条归档路径共用）。
+- **F-02-02** unknown 事件恢复「最接近的已有事件」候选（`eventInfo.candidates` 不再写死空数组）。
+- **F-02-03** 单字符 CJK 标签（「家」）的 mention 匹配加词边界/前缀约束，「大家好/国家/专家/大家/人家」不再误触发。
+- **F-02-04** missType 归因按「该过滤器真的过滤掉候选」判定（`eventFiltered=0` 不再误报 `event`，tag 造成 0 条报 `tag`）。
+- **F-02-05** 新增真实 `stats.timeTagFiltered`（时间标签过滤不再并进 `tagFiltered`），`_browseRecall` stats 同步带 `tagFiltered`/`timeTagFiltered`。
+- **F-02-06** `engine.timeWindowFor()` 与 `engine.recall` 对同一窗口套用同一时间标签优先，返回相同 hit set（`hits` = 套用后 `ids.size`）。
+- **F-02-07** `buildTagIndex` / `buildTimeTagIndex` 跳过 `folder.scored === false`，pending folder 不再污染 tagIndex/bucket count。
+- **F-01-01** `events`/`event` 收到非 string/非 string[] 类型视为未提供（保留旧标签+warning，不静默清空、不写 `eventAt`）。
+- **F-01-02** 普通改写/同集合重排不再被计成「归并 1 条」（`merged` 只在复用 canonical/批准归并时计数）。
+- **F-01-03** 从未有事件标签的 folder 提交 `events: []` 不再计 `cleared`、不再新建 `eventAt`（meta/index 不变）。
+- **F-03-01** `timeTag.maxSpanDays` 落实到解析器（超跨度表达式丢弃；默认 366，`maxSpanDays=1` 时「一年后/本周/下个月/今年」全部丢弃）。
+- **F-03-02** `timeTag.mode='off'` 时 adapter/passive 两条归档路径都不采集/写 `timeTags`/`timeTagSource`（也不进索引）。
+- **F-03-03** 消息缺 `message.time` 时锚点回退 folder `createdAt`（不再用 chunk/event 区间起点），两条归档路径一致。
+- **F-05-02** `docs/SPEC.md` 的 v1.4.1 (D-02) 旧「同批静默归并 `merged ≥ 1`」描述更新为 1.5.0「不静默归并（保留新标签 + 返回 candidates，`merged` 只在复用 canonical/批准归并时计数）」。
+- 新增回归测试 `test/audit-fix-plugin.test.mjs`（任务区块预算最坏情形/裁剪提示/rubric 文本/文档语义），与各 slice 的 `test/audit-fix-*.test.mjs` 共 5 个文件。
+
+### 兼容与回滚（升级须知）
+
+- **旧数据不回填**：没有 `events` / `locations` / `persons` / `timeTags` 的旧记忆一切照旧（仍可按关键词/时间/事件回忆）；
+  不批量重写旧 `meta.json` / `index.json`，也不改旧 pending。
+- **`event.mergeRequiresApproval=false`**：回滚 1.4.x 的「静默归并相似事件标签」行为（默认 `true` 为需模型批准）。
+- **标签模式**：`location.mode` / `person.mode` / `timeTag.mode` = `off`（关闭）/ `index`（只建索引不约束；
+  **engine 默认**）/ `constrain`（真正过滤；**随包 config.json 产品默认**）；`event.mode` 继续沿用。
+- **`recall.mode='legacy'`**：回滚 v1.3.0 概率召回；标签/时间标签约束仍作为第一代前置过滤生效，
+  但多子句拆分、助手原话通道、自适应配额**不生效**（legacy 路径不读这些参数，保持概率语义与旧行为）。
+- **分项开关**：`recall.assistantSaid.enabled=false`（关闭助手原话通道）、`recall.tagMentions.enabled=false`
+  （关闭自动召回里的标签 mention 触发）、`recall.clauseSplit.enabled=false`、`recall.adaptiveQuota.enabled=false`、
+  `rules.enabled=false`（不注入记忆使用规则 section）、`recall.showTags=false`（回忆块不渲染标签行）。
+- **时间标签是归档时确定性计算**，不是评分模型提交的字段；`timeTag.maxPerFolder=8`、`timeTag.weekStart=1`、
+  `timeTag.maxSpanDays=366`；旧配置缺新键 → 全部走 engine 默认，无需迁移。
+- **数据版本仍为 1**：新字段全部可选、`indexEntryFromMeta` 有值才写；旧 reader 读新数据不受影响。
+
+### 验证 / 发布门禁
+
+- **`node --test` = 1258 tests / 1256 pass / 0 fail / 2 skip**（2 skip 为 Node zstd 平台条件跳过）；
+  e2e-adapter **12/12**、e2e-real-data（夹具）**8/8**；`node tools/privacy-check.mjs` PASS；
+  `tools/gate-baseline.json` 更新为 `version=1.5.0`、`minFullSuiteTests=1258`（发布前由 Lead 复核最终值）。
+- 新增测试文件：`test/relative-time.test.mjs`、`test/tag-index.test.mjs`、`test/query-analysis.test.mjs`、
+  `test/recall-tags.test.mjs`、`test-adapter/memory-tool-1.5.0.test.mjs`、`test-adapter/recall-tool-1.5.0.test.mjs`、
+  `test-adapter/plugin-rules-1.5.0.test.mjs`，以及审计缺陷修复回归
+  `test/audit-fix-engine.test.mjs`、`test/audit-fix-judge.test.mjs`、`test/audit-fix-tags-time.test.mjs`、
+  `test/audit-fix-archive.test.mjs`、`test/audit-fix-plugin.test.mjs`（5 个）；
+  既有 event/recall/config 测试同步到新语义
+  （事件归并需批准、limit 20、missType 扩展、六个 product override）。
+- README / docs/SPEC.md / `config.json` `_readme` 同步 1.5.0；两个 `package.json` 均为 1.5.0；
+  `docs/VERIFICATION.md` 新增 §26 v1.5.0 验证记录（含本轮审计修复的复跑命令与审计脚本口径备注）。
+
 ## [1.4.4] — 2026-11-06
 
 **补丁版：修复“记忆评分摘要”等模型可见文本按 UTF-16 码元截断时切断 emoji 代理对，孤立代理项被 `JSON.stringify` 转义成非法转义，DeepSeek Messages 接口直接 400、该记忆永远评不上分、会话永久卡死（用户报告，已用真实接口复现）。**

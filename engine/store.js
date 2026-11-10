@@ -124,6 +124,81 @@ export const SCORE_MODES = Object.freeze(['model', 'heuristic'])
 export const ARCHIVE_SOURCES = Object.freeze(['adapter', 'passive'])
 /** Allowed values of `eventTimeSource`. */
 export const EVENT_TIME_SOURCES = Object.freeze(['messages', 'judge', 'archive'])
+/** Allowed values of `timeTagSource` (v1.5.0). */
+export const TIME_TAG_SOURCES = Object.freeze(['messages'])
+/** Allowed granularities of one v1.5.0 time tag. */
+export const TIME_TAG_GRANULARITIES = Object.freeze(['day', 'week', 'month', 'year'])
+/** v1.5.0 caps for the optional tag arrays copied into the index. */
+const MAX_INDEX_TAGS = 64
+const MAX_TAG_LABEL_LENGTH = 200
+
+/** Normalize a tag label array: strings only, trimmed, non-empty, bounded. */
+function normalizeIndexTags(value) {
+  if (!Array.isArray(value)) return null
+  const out = []
+  const seen = new Set()
+  for (const item of value) {
+    if (typeof item !== 'string') continue
+    const label = item.trim()
+    if (!label || label.length > MAX_TAG_LABEL_LENGTH || seen.has(label)) continue
+    seen.add(label)
+    out.push(label)
+    if (out.length >= MAX_INDEX_TAGS) break
+  }
+  return out
+}
+
+/** Normalize the optional v1.5.0 time tags (half-open [from, to) intervals). */
+function normalizeIndexTimeTags(value) {
+  if (!Array.isArray(value)) return null
+  const out = []
+  for (const item of value) {
+    if (!item || typeof item !== 'object') continue
+    const from = Number(item.from)
+    const to = Number(item.to)
+    if (!Number.isFinite(from) || !Number.isFinite(to) || to <= from) continue
+    const label = typeof item.label === 'string' ? item.label.trim().slice(0, MAX_TAG_LABEL_LENGTH) : ''
+    if (!label) continue
+    const granularity = TIME_TAG_GRANULARITIES.includes(item.granularity) ? item.granularity : 'day'
+    out.push({ from, to, label, granularity })
+    if (out.length >= MAX_INDEX_TAGS) break
+  }
+  return out
+}
+
+/** Normalize assistant-utterance keywords (v1.5.0, deterministic archive index). */
+function normalizeAssistantKeywords(value) {
+  if (!Array.isArray(value)) return null
+  const out = []
+  const seen = new Set()
+  for (const item of value) {
+    if (typeof item !== 'string') continue
+    const keyword = item.trim()
+    if (!keyword || keyword.length > 48 || seen.has(keyword)) continue
+    seen.add(keyword)
+    out.push(keyword)
+    if (out.length >= 16) break
+  }
+  return out
+}
+
+/** Copy the optional v1.5.0 tag fields when valid; never invent a value. */
+function copyOptionalTagFields(target, source) {
+  const locations = normalizeIndexTags(source.locations)
+  if (locations && locations.length > 0) target.locations = locations
+  const persons = normalizeIndexTags(source.persons)
+  if (persons && persons.length > 0) target.persons = persons
+  const events = normalizeIndexTags(source.events)
+  if (events && events.length > 0) target.events = events
+  const timeTags = normalizeIndexTimeTags(source.timeTags)
+  if (timeTags && timeTags.length > 0) target.timeTags = timeTags
+  if (TIME_TAG_SOURCES.includes(source.timeTagSource)) target.timeTagSource = source.timeTagSource
+  // Assistant-utterance keyword channel ("你说过…" recall); old folders have none.
+  const assistantKeywords = normalizeAssistantKeywords(source.assistantKeywords)
+  if (assistantKeywords && assistantKeywords.length > 0) target.assistantKeywords = assistantKeywords
+  return target
+}
+
 
 /** Copy the optional v1.4.0 fields when valid; never invent a value. */
 function copyOptionalIndexFields(target, source) {
@@ -150,6 +225,9 @@ function copyOptionalIndexFields(target, source) {
   if (Number.isFinite(source.eventStart)) target.eventStart = source.eventStart
   if (Number.isFinite(source.eventEnd)) target.eventEnd = source.eventEnd
   if (Number.isFinite(source.pendingSince)) target.pendingSince = source.pendingSince
+  // v1.5.0: multi-event / location / person / time-tag fields. Kept in a helper
+  // so writeIndex's re-normalisation can never silently drop them.
+  copyOptionalTagFields(target, source)
   return target
 }
 

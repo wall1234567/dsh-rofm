@@ -17,6 +17,8 @@ import assert from 'node:assert/strict'
 
 import {
   conversationPreview,
+  conversationalMessagesText,
+  isRealConversation,
   messagePreview,
   messageToText,
   messagesToReadableText,
@@ -312,4 +314,39 @@ test('previews replace lone surrogates that already exist in archived data', () 
   const readable = messagesToReadableText([{ role: 'user', content: 'x \uD83E y' }])
   assert.equal(hasLoneSurrogate(readable), false)
   assert.ok(readable.includes('\uFFFD'))
+})
+
+// ---------------------------------------------------------------------------
+// v1.5.4: only a JSON payload that really carries chat rows is conversation
+// ---------------------------------------------------------------------------
+
+test('v1.5.4: conversationalMessagesText keeps QQ chat JSON and drops generic tool JSON', () => {
+  const messages = [
+    { role: 'tool', content: QQ_UNREAD },
+    { role: 'tool', content: JSON.stringify({ error: 'timeout', code: 500 }) },
+    { role: 'user', content: '好的，我记下了。' },
+  ]
+  const text = conversationalMessagesText(messages)
+  assert.ok(text.includes('私聊：今天好累啊，加班到十点才回来'), text)
+  assert.ok(text.includes('user: 好的，我记下了。'), text)
+  assert.equal(text.includes('timeout'), false, 'generic tool JSON is process data, not dialogue')
+})
+
+test('v1.5.4: messagePreview marks JSON payloads with/without chat rows', () => {
+  const chat = messagePreview({ role: 'tool', content: QQ_UNREAD })
+  assert.equal(chat.conversational, true, 'legacy conversational flag is unchanged')
+  assert.equal(chat.jsonPayload, true)
+  assert.equal(chat.jsonChat, true)
+  assert.equal(isRealConversation(chat), true)
+
+  const note = messagePreview({ role: 'tool', content: JSON.stringify({ error: 'timeout', code: 500 }) })
+  assert.equal(note.jsonPayload, true)
+  assert.equal(note.jsonChat, false)
+  assert.equal(isRealConversation(note), false, 'note-only JSON is not real conversation')
+
+  const plain = messagePreview({ role: 'user', content: '普通对话' })
+  assert.equal(plain.jsonPayload, false)
+  assert.equal(isRealConversation(plain), true)
+  const tool = messagePreview({ role: 'tool', content: 'docker ps 输出：端口 8080' })
+  assert.equal(isRealConversation(tool), false)
 })

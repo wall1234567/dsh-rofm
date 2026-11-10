@@ -193,7 +193,7 @@ test('a submitted category word is not duplicated', async () => {
   assert.equal(result.warnings.some((warning) => warning.includes('category-keyword')), false)
 })
 
-test('at the 8-keyword cap the last keyword is replaced (with a warning) instead of exceeding the cap', async () => {
+test('at the 16-keyword cap the last keyword is replaced (with a warning) instead of exceeding the cap', async () => {
   const root = tempDir()
   const memoryDir = path.join(root, 'memory')
   const plugin = makePlugin(memoryDir)
@@ -201,10 +201,12 @@ test('at the 8-keyword cap the last keyword is replaced (with a warning) instead
   const folder = makePendingFolder(memoryDir, 'mem-20261103T000000Z-0006', '我喜欢美式咖啡，不加糖。')
   plugin.engineFor(session, plugin.currentConfig()).reload()
 
-  const eight = ['美式咖啡', '不加糖', '早餐', '早晨', '提神', '饮品', '口味', '替换我']
-  const result = await judge(plugin, session, [{ id: folder.id, alpha: 0.8, beta: 1, keywords: eight }])
+  // v1.5.4 keyword cap is 3~16 (query 16 / archive 16).
+  const sixteen = ['美式咖啡', '不加糖', '早餐', '早晨', '提神', '饮品', '口味', ...Array.from({ length: 8 }, (_, index) => `k${index + 1}`), '替换我']
+  assert.equal(sixteen.length, 16)
+  const result = await judge(plugin, session, [{ id: folder.id, alpha: 0.8, beta: 1, keywords: sixteen }])
   const meta = readMeta(plugin, session, folder.id)
-  assert.equal(meta.keywords.length, 8, 'keyword cap is respected')
+  assert.equal(meta.keywords.length, 16, 'keyword cap is respected')
   assert.ok(meta.keywords.includes('喜好'))
   assert.equal(meta.keywords.includes('替换我'), false, 'the least-important-looking last keyword made room')
   assert.ok(result.warnings.some((warning) => warning.includes('category-keyword-replaced')))

@@ -55,6 +55,14 @@ const PRODUCT_OVERRIDES = Object.freeze({
   'time.mode': 'constrain',
   'time.timezone': 'Asia/Shanghai',
   'event.mode': 'constrain',
+  // v1.5.0 tag constraints: engine defaults are 'index' (index only), the
+  // packaged product enables the hard filter — same pattern as time/event.
+  'location.mode': 'constrain',
+  'person.mode': 'constrain',
+  'timeTag.mode': 'constrain',
+  // v1.6.0 computable recall block: engine default keeps the v1.4/v1.5 block
+  // (byte-identical fixtures), the packaged product renders absolute dates.
+  'recall.computeDates': true,
 })
 
 /**
@@ -176,6 +184,31 @@ test('config: every new v1.4.0 key is present in the packaged config.json', () =
   assert.equal(shipped.event.maxLabelLength, 60)
   assert.deepEqual(shipped.event.similarity, { metric: 'dice', threshold: 0.72, maxCandidates: 5 })
   assert.equal(shipped.event.askUserHint, true)
+  // v1.5.0: multi-event tags + model-approved event merges.
+  assert.equal(shipped.event.maxPerFolder, 4)
+  assert.equal(shipped.event.mergeRequiresApproval, true)
+  assert.equal(shipped.event.showExisting, true)
+  assert.equal(shipped.event.showExistingLimit, 24)
+  // v1.5.0: location / person / time-tag constraints.
+  assert.deepEqual(shipped.location, { mode: 'constrain', maxLabelLength: 60, maxPerFolder: 8, autoMention: true })
+  assert.deepEqual(shipped.person, { mode: 'constrain', maxLabelLength: 60, maxPerFolder: 8, autoMention: true })
+  assert.deepEqual(shipped.timeTag, { mode: 'constrain', maxPerFolder: 8, weekStart: 1, maxSpanDays: 366 })
+  // v1.5.0: adaptive quota / clause split / tag mentions / assistant recall.
+  assert.deepEqual(shipped.recall.adaptiveQuota, {
+    enabled: true,
+    complexQuota: 20,
+    complexMinClauses: 2,
+    complexMinChars: 160,
+    complexMinKeywords: 8,
+  })
+  assert.deepEqual(shipped.recall.clauseSplit, { enabled: true, maxClauses: 8, minClauseChars: 2 })
+  assert.deepEqual(shipped.recall.tagMentions, { enabled: true, maxTagsPerKind: 4 })
+  assert.deepEqual(shipped.recall.assistantSaid, { enabled: true, reserveSlots: 2 })
+  assert.equal(shipped.recall.showTags, true)
+  // v1.5.5: high-relevance guaranteed quota.
+  assert.deepEqual(shipped.recall.highRelevance, { enabled: true, minMatches: 2, reserveSlots: 2 })
+  // v1.5.0: memory-usage rules prompt section.
+  assert.deepEqual(shipped.rules, { enabled: true })
   // scoring pipeline.
   assert.equal(shipped.scoring.includeLegacy, false)
   assert.equal(shipped.scoring.maxPending, 200)

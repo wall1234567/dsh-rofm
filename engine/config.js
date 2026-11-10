@@ -137,9 +137,14 @@ export const DEFAULT_CONFIG = {
       recency: 0.15,
     },
   },
+  // v1.5.4 keyword cap: 查询 16 / 归档 16. One archived folder may carry 3~16
+  // keywords; this governs *archival* keyword generation (engine/compress.js
+  // heuristic path) and the memory_judge validation. Query-side extraction keeps
+  // its own caps (RECALL_KEYWORDS_MAX=16 for the main paths, 8 for the "you said"
+  // channel), so a folder's keyword budget never widens a query.
   keywords: {
     min: 3,
-    max: 8,
+    max: 16,
     stopwords: [...BUILTIN_STOPWORDS],
     extraStopwords: [],
     matchMode: 'contains', // 'contains' | 'exact'
@@ -219,6 +224,68 @@ export const DEFAULT_CONFIG = {
         taboo: { label: '禁忌', words: ['禁忌', '忌讳'] },
       },
     },
+    // --- v1.5.0 adaptive recall quota ---------------------------------------
+    // A complex/large user message (several sub-questions, long text, many
+    // keywords) raises the per-round quota to `complexQuota` (20). The rest of
+    // the selector (round char budget, window cap, block trim) still applies, so
+    // a bigger quota never bypasses the context safety rails.
+    adaptiveQuota: {
+      enabled: true,
+      complexQuota: 20,
+      complexMinClauses: 2,
+      complexMinChars: 160,
+      complexMinKeywords: 8,
+    },
+    // --- v1.5.5 high-relevance guaranteed quota ------------------------------
+    // A folder that matches at least `minMatches` distinct query keywords is
+    // "highly relevant"; up to `reserveSlots` such folders are guaranteed to
+    // survive a small round quota. The guarantee is best effort: it appends free
+    // slots first, then replaces the lowest-priority unprotected tail pick
+    // (never a pick reserved by the assistant-utterance or clause lanes).
+    highRelevance: {
+      enabled: true,
+      minMatches: 2,
+      reserveSlots: 2,
+    },
+    // --- v1.5.0 multi-clause recall -----------------------------------------
+    // A user message with several clauses is split on 。！？；/\n; every clause
+    // gets its own keyword group and at least one recall slot (when candidates
+    // exist). The clauses are reported back so the model can answer each
+    // sub-question separately ("不知道" when a clause found nothing).
+    clauseSplit: {
+      enabled: true,
+      maxClauses: 8,
+      minClauseChars: 2,
+    },
+    // --- v1.5.0 tag mentions as automatic filters ---------------------------
+    // Known location/person/event tag names occurring in the user message are
+    // applied as hard filters (same-kind OR, cross-kind AND); bounded per kind.
+    tagMentions: {
+      enabled: true,
+      maxTagsPerKind: 4,
+    },
+    // --- v1.5.0 "you said …" assistant-utterance recall ---------------------
+    // The assistant's own archived utterances are indexed separately; when the
+    // user message quotes them ("你说过/你之前说/你建议/你答应/你让我/你不是说"…)
+    // this channel is searched too and a few slots are reserved for it.
+    assistantSaid: {
+      enabled: true,
+      // Slots of the per-round quota reserved for the assistant-utterance channel
+      // when a "你说过…" question is detected (0 = channel shares the normal quota).
+      reserveSlots: 2,
+    },
+    // Render the folder's tags (event/location/person/time tags) inside the
+    // injected recall block; old folders without tags render exactly as before.
+    showTags: true,
+    // v1.6.0: render every recalled memory in a "computable" form — absolute
+    // dates with weekday and relative time phrases in the archived text get an
+    // inline absolute date computed from that memory's own anchor
+    // (`前天(2026-05-25)`), so the answering model does not have to do date
+    // arithmetic itself. v1.5.4: the heading reads 归档于 X（事件时间 Y） and the
+    // preamble appends the time-caliber rule (cite the event time, never the
+    // archive time). Engine default is off (v1.4/v1.5 rendering, byte-identical
+    // fixtures); the packaged config.json enables it.
+    computeDates: false,
   },
   // v1.4.0 time assistance (docs/SPEC.md §6.8). The index is strictly in-memory
   // (derived from index.folders, never written back); `createdAt` stays the
@@ -249,12 +316,65 @@ export const DEFAULT_CONFIG = {
     // never filter (engine default); 'constrain' = filter (packaged default).
     mode: 'index',
     maxLabelLength: 60,
+    // v1.5.0: one memory may belong to several events (a trip that also was a
+    // work offsite, a project that had two review threads, …).
+    maxPerFolder: 4,
     // "bidirectionally highly similar" = Dice coefficient
     //   2·|A∩B| / (|A|+|B|) >= threshold
     // (symmetric: neither label may be a small subset of the other; `metric` is
     // configurable for experiments: 'dice' | 'avg' | 'min').
     similarity: { metric: 'dice', threshold: 0.72, maxCandidates: 5 },
     askUserHint: true, // ambiguous/unknown results tell the model it may ask the user
+    // v1.5.0: a similar-but-different label is no longer silently merged into an
+    // existing canonical event; the model must approve (submit the existing
+    // canonical label) before two labels become one event.
+    mergeRequiresApproval: true,
+    // The scoring-task block lists existing event labels so the model can reuse
+    // the canonical one directly (bounded list, part of the task token budget).
+    showExisting: true,
+    showExistingLimit: 24,
+  },
+  // v1.5.0 location constraint (docs/SPEC.md §6.10). A location is an explicit
+  // place named in the archived conversation; implicit-but-independent places are
+  // allowed too ("家", "小明的家" — normalized by engine/tag-index.js). Tags are
+  // produced by the scoring model (memory_judge) like event tags; the archive
+  // path itself never calls a model.
+  location: {
+    // 'off' = ignore location args; 'index' = build the in-memory tag index but
+    // never filter (engine default); 'constrain' = filter (packaged default).
+    mode: 'index',
+    maxLabelLength: 60,
+    maxPerFolder: 8,
+    // Automatic recall extracts known location tag names from the user message
+    // and applies them as a hard filter (users chose "keyword trigger = filter").
+    autoMention: true,
+  },
+  // v1.5.0 person constraint (docs/SPEC.md §6.10).
+  person: {
+    mode: 'index',
+    maxLabelLength: 60,
+    maxPerFolder: 8,
+    autoMention: true,
+  },
+  // v1.5.0 time tags (docs/SPEC.md §6.10): fuzzy expressions found in the
+  // archived messages ("昨天", "下周二", "三天后", …) are converted to absolute
+  // half-open [from, to) intervals by engine/relative-time.js at archive time and
+  // stored on the folder. Time-filtered recall prefers these tags over the
+  // eventStart/eventEnd interval ("回忆侧优先用标签").
+  timeTag: {
+    // 'off' = no collection/index/filter; 'index' = index only (engine default);
+    // 'constrain' = use tags for filtering (packaged default).
+    mode: 'index',
+    maxPerFolder: 8,
+    // First day of the week for 周/星期/礼拜 expressions (1 = Monday, 7 = Sunday).
+    weekStart: 1,
+    maxSpanDays: 366,
+  },
+  // v1.5.0 memory-usage rules injected as a system-prompt section. The rules
+  // tell the model how to answer multi-part questions, how to treat untagged
+  // memories as unrelated, how to report conflicts and how to handle "you said".
+  rules: {
+    enabled: true,
   },
   // v1.4.0 scoring pipeline (docs/SPEC.md §4).
   scoring: {
@@ -525,7 +645,7 @@ export function mergeConfig(base, patch) {
 export function validateConfig(input) {
   const warnings = []
   const cfg = deepMerge(cloneConfig(DEFAULT_CONFIG), isPlainObject(input) ? input : {})
-  for (const group of ['compress', 'importance', 'keywords', 'recall', 'time', 'event', 'scoring', 'match', 'storage', 'external', 'debug']) {
+  for (const group of ['compress', 'importance', 'keywords', 'recall', 'time', 'event', 'location', 'person', 'timeTag', 'rules', 'scoring', 'match', 'storage', 'external', 'debug']) {
     if (!isPlainObject(cfg[group])) {
       warnings.push(`${group}: expected an object; using defaults`)
       cfg[group] = cloneConfig(DEFAULT_CONFIG[group])
@@ -682,6 +802,60 @@ export function validateConfig(input) {
     cy.classes = categoryClassesField(warnings, 'recall.categoryMatch.classes', cy.classes, cyDefaults.classes)
   }
 
+  // --- recall v1.5.0: adaptive quota / clause split / tag mentions / assistant
+  const aq = rec.adaptiveQuota
+  const aqDefaults = DEFAULT_CONFIG.recall.adaptiveQuota
+  if (!isPlainObject(aq)) {
+    if (aq !== undefined) warnings.push('recall.adaptiveQuota: expected an object; using defaults')
+    rec.adaptiveQuota = cloneConfig(aqDefaults)
+  } else {
+    aq.enabled = booleanField(warnings, 'recall.adaptiveQuota.enabled', aq.enabled, aqDefaults.enabled)
+    aq.complexQuota = numberField(warnings, 'recall.adaptiveQuota.complexQuota', aq.complexQuota, aqDefaults.complexQuota, { min: 1, max: 64, integer: true })
+    aq.complexMinClauses = numberField(warnings, 'recall.adaptiveQuota.complexMinClauses', aq.complexMinClauses, aqDefaults.complexMinClauses, { min: 1, max: 32, integer: true })
+    aq.complexMinChars = numberField(warnings, 'recall.adaptiveQuota.complexMinChars', aq.complexMinChars, aqDefaults.complexMinChars, { min: 1, integer: true })
+    aq.complexMinKeywords = numberField(warnings, 'recall.adaptiveQuota.complexMinKeywords', aq.complexMinKeywords, aqDefaults.complexMinKeywords, { min: 1, integer: true })
+  }
+  const cs = rec.clauseSplit
+  const csDefaults = DEFAULT_CONFIG.recall.clauseSplit
+  if (!isPlainObject(cs)) {
+    if (cs !== undefined) warnings.push('recall.clauseSplit: expected an object; using defaults')
+    rec.clauseSplit = cloneConfig(csDefaults)
+  } else {
+    cs.enabled = booleanField(warnings, 'recall.clauseSplit.enabled', cs.enabled, csDefaults.enabled)
+    cs.maxClauses = numberField(warnings, 'recall.clauseSplit.maxClauses', cs.maxClauses, csDefaults.maxClauses, { min: 1, max: 32, integer: true })
+    cs.minClauseChars = numberField(warnings, 'recall.clauseSplit.minClauseChars', cs.minClauseChars, csDefaults.minClauseChars, { min: 1, max: 64, integer: true })
+  }
+  const tm2 = rec.tagMentions
+  const tm2Defaults = DEFAULT_CONFIG.recall.tagMentions
+  if (!isPlainObject(tm2)) {
+    if (tm2 !== undefined) warnings.push('recall.tagMentions: expected an object; using defaults')
+    rec.tagMentions = cloneConfig(tm2Defaults)
+  } else {
+    tm2.enabled = booleanField(warnings, 'recall.tagMentions.enabled', tm2.enabled, tm2Defaults.enabled)
+    tm2.maxTagsPerKind = numberField(warnings, 'recall.tagMentions.maxTagsPerKind', tm2.maxTagsPerKind, tm2Defaults.maxTagsPerKind, { min: 1, max: 32, integer: true })
+  }
+  const as = rec.assistantSaid
+  const asDefaults = DEFAULT_CONFIG.recall.assistantSaid
+  if (!isPlainObject(as)) {
+    if (as !== undefined) warnings.push('recall.assistantSaid: expected an object; using defaults')
+    rec.assistantSaid = cloneConfig(asDefaults)
+  } else {
+    as.enabled = booleanField(warnings, 'recall.assistantSaid.enabled', as.enabled, asDefaults.enabled)
+    as.reserveSlots = numberField(warnings, 'recall.assistantSaid.reserveSlots', as.reserveSlots, asDefaults.reserveSlots, { min: 0, max: 8, integer: true })
+  }
+  const hr = rec.highRelevance
+  const hrDefaults = DEFAULT_CONFIG.recall.highRelevance
+  if (!isPlainObject(hr)) {
+    if (hr !== undefined) warnings.push('recall.highRelevance: expected an object; using defaults')
+    rec.highRelevance = cloneConfig(hrDefaults)
+  } else {
+    hr.enabled = booleanField(warnings, 'recall.highRelevance.enabled', hr.enabled, hrDefaults.enabled)
+    hr.minMatches = numberField(warnings, 'recall.highRelevance.minMatches', hr.minMatches, hrDefaults.minMatches, { min: 1, max: 16, integer: true })
+    hr.reserveSlots = numberField(warnings, 'recall.highRelevance.reserveSlots', hr.reserveSlots, hrDefaults.reserveSlots, { min: 0, max: 8, integer: true })
+  }
+  rec.showTags = booleanField(warnings, 'recall.showTags', rec.showTags, DEFAULT_CONFIG.recall.showTags)
+  rec.computeDates = booleanField(warnings, 'recall.computeDates', rec.computeDates, DEFAULT_CONFIG.recall.computeDates)
+
   // --- time (v1.4.0) ------------------------------------------------------
   const tm = cfg.time
   const tmDefaults = DEFAULT_CONFIG.time
@@ -713,6 +887,37 @@ export function validateConfig(input) {
   if (!isPlainObject(ev.similarity)) ev.similarity = cloneConfig(evDefaults.similarity)
   ev.similarity.metric = enumField(warnings, 'event.similarity.metric', ev.similarity.metric, ['dice', 'avg', 'min'], evDefaults.similarity.metric)
   ev.askUserHint = booleanField(warnings, 'event.askUserHint', ev.askUserHint, evDefaults.askUserHint)
+  // v1.5.0 multi-event + explicit merge approval.
+  ev.maxPerFolder = numberField(warnings, 'event.maxPerFolder', ev.maxPerFolder, evDefaults.maxPerFolder, { min: 1, max: 32, integer: true })
+  ev.mergeRequiresApproval = booleanField(warnings, 'event.mergeRequiresApproval', ev.mergeRequiresApproval, evDefaults.mergeRequiresApproval)
+  ev.showExisting = booleanField(warnings, 'event.showExisting', ev.showExisting, evDefaults.showExisting)
+  ev.showExistingLimit = numberField(warnings, 'event.showExistingLimit', ev.showExistingLimit, evDefaults.showExistingLimit, { min: 1, max: 200, integer: true })
+
+  // --- v1.5.0 tag constraints (location / person / timeTag) ---------------
+  // The three groups share the same shape: a mode switch, a label length cap and
+  // a per-folder cap. `location`/`person` add `autoMention` (automatic recall
+  // treats a known tag name in the user message as a hard filter).
+  for (const kind of ['location', 'person']) {
+    const group = cfg[kind]
+    const defaults = DEFAULT_CONFIG[kind]
+    group.mode = enumField(warnings, `${kind}.mode`, group.mode, ['off', 'index', 'constrain'], defaults.mode)
+    group.maxLabelLength = numberField(warnings, `${kind}.maxLabelLength`, group.maxLabelLength, defaults.maxLabelLength, { min: 1, max: 200, integer: true })
+    group.maxPerFolder = numberField(warnings, `${kind}.maxPerFolder`, group.maxPerFolder, defaults.maxPerFolder, { min: 1, max: 64, integer: true })
+    group.autoMention = booleanField(warnings, `${kind}.autoMention`, group.autoMention, defaults.autoMention)
+  }
+  const tt = cfg.timeTag
+  const ttDefaults = DEFAULT_CONFIG.timeTag
+  tt.mode = enumField(warnings, 'timeTag.mode', tt.mode, ['off', 'index', 'constrain'], ttDefaults.mode)
+  tt.maxPerFolder = numberField(warnings, 'timeTag.maxPerFolder', tt.maxPerFolder, ttDefaults.maxPerFolder, { min: 1, max: 64, integer: true })
+  tt.weekStart = numberField(warnings, 'timeTag.weekStart', tt.weekStart, ttDefaults.weekStart, { min: 1, max: 7, integer: true })
+  tt.maxSpanDays = numberField(warnings, 'timeTag.maxSpanDays', tt.maxSpanDays, ttDefaults.maxSpanDays, { min: 1, integer: true })
+
+  // --- v1.5.0 memory-usage rules prompt section ---------------------------
+  if (!isPlainObject(cfg.rules)) {
+    warnings.push('rules: expected an object; using defaults')
+    cfg.rules = cloneConfig(DEFAULT_CONFIG.rules)
+  }
+  cfg.rules.enabled = booleanField(warnings, 'rules.enabled', cfg.rules.enabled, DEFAULT_CONFIG.rules.enabled)
 
   // --- scoring (v1.4.0) ---------------------------------------------------
   const sc = cfg.scoring

@@ -14,8 +14,8 @@
 > 不再代表当前版本（数字统一以 `npm test` 实测为准，不在文档里写死）。
 > **v1.4.0 的验证记录见 §20**（确定性召回/公平性、时间辅助、小窗口、数据时代、兼容与性能）——
 > §20/§21 是 **v1.4.0 的历史记录**（2026-11-01/02 实测，数字已过时，仅作历史留档）。
-> **当前版本 v1.4.3 的最终验证记录见 §24**（2026-11-05 实测，含全量测试/门禁/自检/e2e/真实数据前后对比；
-> §22/§23 为 v1.4.1/v1.4.2 历史记录）。
+> **当前版本 v1.5.6 的最终验证记录见 §31**（2026-11-09 实测，含全量测试/门禁/自检/e2e/真实数据前后对比）；
+> §22–§30 为 v1.4.1–v1.5.5 的历史记录（其中 v1.4.3 见 §24、v1.6.0 见 §27、v1.5.5 见 §30）。
 
 ## 1. 自动化测试
 
@@ -1523,7 +1523,7 @@ node --test test/message-preview.test.mjs
 node --test test-adapter/scoring-pressure.test.mjs test-adapter/cross-chat-tool.test.mjs
 ```
 
-## 25. v1.4.4 验证记录（2026-11-06，当前版本）
+## 25. v1.4.4 验证记录（2026-11-06，历史留档；当前版本记录见 §26）
 
 ### 25.1 缺陷与复现（修复前）
 
@@ -1571,3 +1571,315 @@ node tools/verify-1.4.0.mjs
 node --test test/message-preview.test.mjs
 node --test test-adapter/scoring-pressure.test.mjs
 ```
+
+## 26. v1.5.0 验证记录（2026-11-08，当前版本）
+
+> **环境**：Windows 11、Node v24.21.0（DSH 自带运行时）、仓库 `<repo>`。
+> 所有写盘测试使用 `os.tmpdir()`；真实 `memory/`（3 stores / 1264 folders）与真实归档在验证期间只读。
+> 本节对应 1.5.0 六组需求（地点/人物/多事件/时间标签过滤、自适应配额 20、多子句逐题作答、
+> 「你说过」助手原话、事件不静默归并、冲突并列多说法）开发完成后的**独立黑盒缺陷审计
+>（24 条：S2×13 / S3×11）**及其修复。§20–§25 为更早版本历史。
+
+### 26.1 独立审计与修复（修复前基线）
+
+- 审计方式：独立 Agent 黑盒审计；仓库与真实 `memory/` 只读，全部 fixture 落在 `rofm-audit-1.5/tmp/`。
+- **修复前门禁全绿但仍有缺陷**：`node --test` = **1202 tests / 1200 pass / 0 fail / 2 skip**、
+  `node tools/verify-1.4.0.mjs` = 8/8 PASS，审计仍确认 **24 条真实缺陷**（“有测试、有字段、有函数，
+  但端到端未实现/实现错误”）。
+- 修复结果：24/24 全部修复（S1=0；S2=13、S3=11），逐条证据见
+  `D:/Deepseek/rofm-fix/verify/SCOREBOARD.md`、总报告 `D:/Deepseek/rofm-fix/FINAL-FIX-REPORT.md`。
+
+| 领域 | 缺陷 | 修复后行为 |
+|---|---|---|
+| 时间标签 | F-LEAD-01 / F-02-01、F-03-01、F-03-02、F-03-03 | 软窗口 fallback 每档套「标签优先」；`timeTag.maxSpanDays` 真实生效；`mode=off` 归档不采集/不写 timeTags；锚点回退 folder `createdAt` |
+| 标签索引/遥测 | F-02-03、F-02-04、F-02-05、F-02-06、F-02-07 | 单字符 CJK 标签 mention 加词边界；missType 按「谁真正过滤掉候选」归因；`timeTagFiltered` 真实遥测；`timeWindowFor` 与 recall 命中集一致；pending folder 不进 tagIndex |
+| 写入（memory_judge） | F-01-01、F-01-02、F-01-03 | 事件字段错类型视为未提供（保留旧标签+warning，不静默清空）；普通改写/同集合重排不再计「归并」；从未有标签的空清空为 no-op |
+| 配额/子句/助手通道 | F-04-01、F-04-02、F-04-03、F-04-04、F-04-05、F-04-06、F-04-07 | 子句保底不再被 fair lane 残留污染且 `hits` 真实；`reserveSlots` 生效（0/2 有差异）；`assistantSaid.enabled=false` 硬开关且索引不建 asst postings；`firstGenMax=0` kill switch 守住；legacy 不再谎报；预算裁剪有「裁剪/预算」提示且条数真实；无候选文案与死分支修正 |
+| 接线/文档 | F-LEAD-02、F-LEAD-03、F-05-01、F-05-02 | assistant 原话改分句级实词抽取（真实归档→评分→召回 end-to-end 可命中）；rubric 去重；任务区块预算硬不变量成立；SPEC D-02 旧「同批静默归并」描述更新 |
+
+### 26.2 修复内容（无数据迁移）
+
+- 引擎：`engine/engine.js`（时间标签 ladder、missType/遥测、`timeWindowFor`、assistant 开关与预留槽、
+  firstGenMax kill switch、子句保底 + 真实 `hits`/可选 `clauseInfo[i].ids`）、`engine/recall-index.js`
+  （assistant postings 按开关门控）、`engine/tag-index.js`（单字符 mention、跳过 `scored===false`）、
+  `engine/relative-time.js`（`maxSpanDays`）、`engine/compress.js`（assistant 抽取、mode=off、锚点）。
+- 插件/工具：`lib/memory-tool.js`（事件标签写入语义）、`lib/passive-archive.js`（同归档口径）、
+  `lib/plugin.js`（任务区块预算、rubric、裁剪提示、kill switch 守卫）、`lib/recall-tool.js`
+  （顶层 `assistantSaid` 如实回显）。
+- **行为语义变化**：`memory_recall` 结果顶层 `assistantSaid` 由「请求过」改为「引擎实际检索了」；
+  `assistantInfo` 保持 `{requested, effective, phrases}`。
+- 不新增/修改配置键；`config.json` / `DEFAULT_CONFIG` 不变；旧数据不回填、读路径字节不变；
+  `docs/SPEC.md` 的 v1.4.1 (D-02) 旧描述更新为 1.5.0 语义。
+
+### 26.3 测试与门禁（2026-11-08 本机实测）
+
+- `node --test` = **1258 tests / 1256 pass / 0 fail / 2 skip**（2 skip 为 Node zstd 平台条件跳过）。
+  新增审计回归 5 个文件共 56 例：`test/audit-fix-engine.test.mjs`（15）、`test/audit-fix-judge.test.mjs`（8）、
+  `test/audit-fix-tags-time.test.mjs`（17）、`test/audit-fix-archive.test.mjs`（7）、
+  `test/audit-fix-plugin.test.mjs`（8）。
+- `node tools/verify-1.4.0.mjs` = **8/8 PASS**（`tools/gate-baseline.json` → **1258** / maxSkipped 4 / e2e 12/8；
+  1258 unique / 1278 summed with e2e re-runs）。
+- `node tools/selfcheck.mjs` = 10 passed / 2 warnings / 0 failed；`tools/privacy-check.mjs` PASS；
+  `node test/simulate.mjs`、`node engine/cli.mjs --help` PASS。
+- 真实库只读回归：3 stores / **1264 folders**，`list` + 12 固定查询与 1.4.4 一致，`index/meta/context`
+  字节不变，`compat-old-data` = **PASS=12 / FAIL=0**。
+- 测试有效性：5 类新增回归测试拷入修复前备份仓库全部变红；11 类跨版本行为消融均
+  「修复前复现 → 修复后消失」。
+- 版本：`package.json` / `engine/package.json` = **1.5.0**；`tools/gate-baseline.json` = 1258。
+
+### 26.4 复跑命令
+
+```bash
+export PATH="<node-bin>:$PATH"
+cd <repo>
+node --test
+node tools/verify-1.4.0.mjs
+node tools/selfcheck.mjs
+node tools/privacy-check.mjs
+node --test test/audit-fix-engine.test.mjs test/audit-fix-judge.test.mjs \
+  test/audit-fix-tags-time.test.mjs test/audit-fix-archive.test.mjs test/audit-fix-plugin.test.mjs
+```
+
+> 审计脚本复跑备注（`D:/Deepseek/rofm-audit-1.5/` 为只读证据，不改脚本）：
+> ① `04-quota-clause-assistant/02-clauses.mjs` 的两条 REPRO 断言是缺陷确认期断言（修复正确后必然失败/自相矛盾），
+> 正式口径见 `D:/Deepseek/rofm-fix/POLICY.md` §1ter；
+> ② `01-judge-tags/repro-01-judge-tags.mjs` 是无条件打印 REPRODUCED 的报告生成器，不是验收门禁，
+> F-01 系列以 `lead/verify-slice01.mjs` + 动态断言为准；
+> ③ `lead/repro-assistant-channel.mjs` 的 e2e 段归档出的是 pending folder（本就不可召回），
+> 缺陷证据以 scored 路径（`scoring.fallback='always'`）为准；
+> ④ `05-wiring-docs-compat/compat-old-data.mjs` 使用共享临时目录，**不可并发运行**。
+
+
+---
+
+## 27. v1.6.0 最终验证（2026-11-08，历史留档；当前版本见 §28）
+
+**范围**：可计算回忆块（新配置 `recall.computeDates`）、归档关键词上限 8→30（查询侧维持 16）、`memory_recall` 满页加配额重试与
+persons 多称呼别名语义、`memory_judge` 人称代词指代消解、记忆使用规则新增三条、benchmark harness 工具结果渲染修复
+（`exam.mjs:232` 的整段 JSON `slice(0,8000)` 移除）。
+
+### 27.1 测试与门禁（本机实测）
+
+- `node --test` = **1304 tests / 1302 pass / 0 fail / 2 skip**（2 skip 为 Node zstd 平台条件跳过，非缺陷）。
+  相对 1.5.0（1258）新增 46 例：`test/recall-computable-block.test.mjs`（21）、
+  `test-adapter/recall-tool-1.6.0.test.mjs`（15）、`test-adapter/memory-tool-1.6.0.test.mjs`（4）、
+  `test-adapter/plugin-rules-1.6.0.test.mjs`（6）。
+- `node tools/verify-1.4.0.mjs` = **8/8 PASS**（`tools/gate-baseline.json` → **1304** / maxSkipped 4 / e2e 12/8；
+  **1304 unique / 1324 summed with e2e re-runs**）；privacy / simulate / selfcheck / cli-help / memory-audit /
+  time-view / e2e-adapter（12/12）/ e2e-real-data（8/8）全部 PASS。
+- `test/config-consistency.test.mjs` 通过：版本 1.6.0、CHANGELOG 有 `## [1.6.0]`、README §3 / SPEC §2 文档值一致、
+  七个 PRODUCT_OVERRIDES（六个 v1.5.0 开关 + `recall.computeDates`）与 `DEFAULT_CONFIG`/随包 `config.json` 对账一致。
+- benchmark harness 独立审计（`rofm-bench/formal/harness/`，benchmark 研究目录、不属于本插件包）：
+  `node _test-tool-render.mjs` 25/25；独立审计脚本 `_audit-tool-render.mjs` **33 checks 全 PASS**；
+  冻结插件真实 `output.render` 探针：20 条×2000 字符记忆 → 输出 8000 字符、**20/20 id 全可见**、每条保留
+  id/关键词/时间/标签/关键句摘要、无 raw JSON；旧 `JSON.stringify(value).slice(0,8000)` 对照仅 4/20 条完整；
+  选中 7 条 → 7/7 可见；2 条小结果输出与真实 `output.render` 逐字节相同。
+
+### 27.2 复跑命令
+
+```bash
+export PATH="<node-bin>:$PATH"
+cd <repo>
+node --test
+node --test test/recall-computable-block.test.mjs test-adapter/recall-tool-1.6.0.test.mjs \
+  test-adapter/memory-tool-1.6.0.test.mjs test-adapter/plugin-rules-1.6.0.test.mjs
+node tools/verify-1.4.0.mjs
+node tools/selfcheck.mjs && node tools/privacy-check.mjs
+# benchmark harness（研究目录，只读/自测，不调用模型）
+cd D:/Deepseek/rofm-bench/formal/harness && node _test-tool-render.mjs && node _audit-tool-render.mjs
+```
+
+### 27.3 版本
+
+`package.json` / `engine/package.json` = **1.6.0**；`tools/gate-baseline.json` = **1304**；
+`docs/SPEC.md` §2/§6.7/§6.13 与 README §1.14/§3 已同步 1.6.0 行为与新配置；数据格式不变、旧数据无需迁移。
+
+---
+
+## 28. v1.5.4 第一阶段验证：回忆块时间口径（2026-11-09）
+
+**范围**：回忆块时间口径修正——① 归档时把每条消息自己的事件时间写入 `context.json` 的 `message.time`，
+回忆时 `messageAnchorMs` 不再退回文件夹 `createdAt`；② 回忆块标题改为 `归档于 X（事件时间 Y）`
+（X = 归档时间，Y = 事件时间），移除 v1.6.0 的独立 `事件时间：` 行；③ 回忆块 preamble
+（`RECALL_BLOCK_TIME_RULE`）与 `dsh-rofm:memory-rules` 明确「引用日期以事件时间为准，标题是归档时间」；
+④ 同一时间口径同步到降级渲染器（`renderRecallBlockFallback`）与 `memory_recall` 工具结果标题；
+⑤ `eventStart/eventEnd = 0` 按「无事件时间」处理，不再渲染 1970。
+
+### 28.1 测试与门禁（本机实测）
+
+- `node --test` = **1312 tests / 1310 pass / 0 fail / 2 skip**（2 skip 为 Node zstd 平台条件跳过，非缺陷）。
+  相对 1.6.0（1304）新增 8 例：`test/recall-computable-block.test.mjs` 净 +2（标题同时标注归档/事件时间、
+  由消息时间派生事件时间、时间口径规则只在可计算 preamble、epoch 0 哨兵；旧事件时间行断言改为标题断言）、
+  `test-adapter/plugin-mock.test.mjs` +1（归档 `context.json` 每条消息带 `time`、`meta.eventStart/End`
+  与之相等、召回标题与相对时间注解使用事件时间而非归档日）、
+  `test-adapter/plugin-rules-1.6.0.test.mjs` +1（v1.5.4「时间引用」规则 + 顺序/长度守卫）、
+  `test-adapter/recall-render.test.mjs` +1（降级渲染器在 `computeDates=true` 时与引擎逐字节一致，
+  含消息时间派生事件区间与注解）、`test-adapter/recall-tool.test.mjs` +3（`memory_recall` 条目
+  `归档于/（事件时间）` 标题、消息时间派生、browse 仍按事件时间）。
+- `node tools/verify-1.4.0.mjs` = **8/8 PASS**（`tools/gate-baseline.json` → **1316** / maxSkipped 4 / e2e 12/8；
+  **1316 unique / 1336 summed with e2e re-runs**）；privacy / simulate / selfcheck / cli-help / memory-audit /
+  time-view / e2e-adapter（12/12）/ e2e-real-data（8/8）全部 PASS。
+- `test/config-consistency.test.mjs` 通过：版本 1.5.4、CHANGELOG 有 `## [1.5.4]`、README §3 / SPEC §2 文档值一致、
+  七个 PRODUCT_OVERRIDES（六个 v1.5.0 开关 + `recall.computeDates`）与 `DEFAULT_CONFIG`/随包 `config.json`
+  对账一致。
+- 独立审计（Lead 自写探针，未入库）：用真实归档产物复算——归档后每条 `context.json` 消息的 `time` 有限且等于源
+  事件时间，`meta.eventStart/End` 等于消息 `time` 的 min/max+1；`buildRecallBlock`（`computeDates=true`）
+  标题为 `### 回忆 N · 归档于 <createdAt 带星期时分>（事件时间 <事件区间>） · α=…`，无独立 `事件时间：` 行；
+  `computeDates=false` 与冻结 1.6.0 树的 `buildRecallBlock` 逐字节一致（多种 falsy 配置变体 × 多组
+  fixtures 对比，标题与 preamble 均不变）；相对时间注解锚点等于消息自身 `time`（固定 2026-04-15 事件日、
+  归档日为 2026-11 → 注解 `昨天(2026-04-14)`，不是按归档日算出的日期）；降级渲染器与 `memory_recall`
+  标题在两种形态下分别与引擎/legacy 输出一致。
+- 独立复核（teammate `verifier`，只读）：复核结论 **PASS**（无 blocker/major）；其自写探针 6 种 falsy 配置变体
+  × 6 组 fixtures × live vs 冻结 1.6.0 = 36/36 逐字节一致；指出并已修复 3 项：降级渲染器旧标题、
+  `memory_recall` 标题裸归档日期、`eventStart=0` 渲染 1970；修复后其列出的 focused tests 与本轮全量均通过。
+
+### 28.2 复跑命令
+
+```bash
+export PATH="<node-bin>:$PATH"
+cd <repo>
+node --test
+node --test test/recall-computable-block.test.mjs test-adapter/plugin-mock.test.mjs \
+  test-adapter/plugin-rules-1.6.0.test.mjs
+node tools/verify-1.4.0.mjs
+node tools/selfcheck.mjs && node tools/privacy-check.mjs
+```
+
+### 28.3 版本
+
+`package.json` / `engine/package.json` = **1.5.4**；`tools/gate-baseline.json` = **1316**；
+`docs/SPEC.md` §2/§6.7/§25/§26 与 README §1.15/§1.16/§3/§7 已同步 1.5.4 行为；`context.json` 只新增可选
+`messages[].time`，旧数据不回填、无需迁移。
+
+---
+
+## 29. v1.5.4 增量验证（2026-11-09）
+
+**范围**：① 版号统一为 1.5.4（1.7.0 → 1.5.4，含文档/注释）；② 归档评分时模型可见
+「去掉非真实对话部分」的真实对话全文（待评分 + 复核条目）；③ `memory_judge` 评分关键词上限
+30 → 16；④ `memory_recall` 满页提示移到条目之前（preamble 区）。
+
+### 29.1 测试与门禁（本机实测）
+
+- `node --test` = **1316 tests / 1314 pass / 0 fail / 2 skip**（2 skip 为 Node zstd 平台条件跳过）。
+  相对上一轮（1312）净增 4 例：`test-adapter/scoring-pressure.test.mjs` 新增「待评分条目渲染真实对话
+  全文（超过旧 160 字符窗口的尾部标记可见）」与「非真实对话消息（纯 tool 输出）不进入评分文本」；
+  同时改写了 v1.4.3/v1.4.4 的评分摘要测试（摘要 → 全文/过滤/无真实对话标注）、
+  `test-adapter/plugin-mock.test.mjs` 任务区块断言（`摘要=` 移除、原文全文、规则 3~16）、
+  `test-adapter/scoring-rubric.test.mjs`（3~16）、`test-adapter/category-keyword.test.mjs`
+  （16 词上限替换）、`test/recall-computable-block.test.mjs`（归档侧上限 16、查询/归档同为 16）；
+  `test/message-preview.test.mjs` 新增 2 例（JSON 对话行判定：QQ 对话 JSON 保留、普通工具 JSON 丢弃）。
+  `test-adapter/recall-tool-1.6.0.test.mjs` 新增满页提示位于第一个 `### 回忆` 之前的断言。
+- `node tools/verify-1.4.0.mjs` = **8/8 PASS**（`tools/gate-baseline.json` → **1314**；
+  **1314 unique / 1334 summed with e2e re-runs**）；e2e-adapter 12/12、e2e-real-data 8/8。
+- `test/config-consistency.test.mjs` 通过：版本 1.5.4、CHANGELOG 有 `## [1.5.4]` 段、
+  `DEFAULT_CONFIG` 与随包 `config.json` 的 `keywords.max=16` 一致、README §3 / SPEC §2 文档值一致。
+- 评分可见性人工核对：`记忆评分任务` 区块逐条为 `head + 原文： + 全对话`；纯 tool/system 消息被
+  `conversationalMessagesText` 丢弃；QQ JSON tool result 中携带的对话仍保留（`messagePreview`
+  判定 conversational）；无对话文件夹显示「（无真实对话内容：纯工具输出 / 协议消息，按过程日志评分）」；
+  超预算条目显示截断标记。
+- 满页提示位置人工核对：`renderRecallResult` 输出中 `【本页已满…】` 位于 header/count 与约束行之后、
+  第一个 `### 回忆` 之前（`text.indexOf('【本页已满') < text.indexOf('### 回忆 1')`）。
+
+### 29.2 复跑命令
+
+```bash
+export PATH="<node-bin>:$PATH"
+cd <repo>
+node --test
+node --test test-adapter/scoring-pressure.test.mjs test-adapter/plugin-mock.test.mjs \
+  test-adapter/recall-tool-1.6.0.test.mjs test-adapter/category-keyword.test.mjs \
+  test/recall-computable-block.test.mjs
+node tools/verify-1.4.0.mjs
+```
+
+### 29.3 版本
+
+`package.json` / `engine/package.json` = **1.5.4**；`tools/gate-baseline.json` = **1316**；
+`keywords.max` = **16**（engine 默认 + 随包配置）；README §1.16 / SPEC §26 / CHANGELOG [1.5.4] 已同步。
+
+---
+
+## 30. v1.5.5 最终验证（2026-11-09）
+
+**范围**：① 关键词规则（覆盖所有事、信息密度决定数量、所有人物/地点必须包含、人物/地点/事件设置后复查、
+助手原话也要进 keywords 或 assistant 原话通道）；② 高相关命中保底配额（`recall.highRelevance`）；
+③ assistant 原话抽取修复（只抽真实对话、每轮最后回复优先、JSON/token 后置过滤）；④ 版本 1.5.4 → 1.5.5。
+
+### 30.1 测试与门禁（本机实测）
+
+- `node --test` = **1330 tests / 1328 pass / 0 fail / 2 skip**（2 skip 为 Node zstd 平台条件跳过）。
+  相对 1.5.4（1316）新增 14 例：`test/high-relevance-quota.test.mjs`（7）、
+  `test/assistant-keywords-1.5.5.test.mjs`（6）、prompt/config 断言（scoring-rubric、
+  plugin-mock rubric、config-consistency 的 `recall.highRelevance`）；同时更新既有
+  `audit-fix-archive`（纯数字不再进 assistant 关键词）与 `scoring-pressure`（rubric 增大后的
+  truncation 夹具窗口 4000→5000）。
+- `node tools/verify-1.4.0.mjs` = **8/8 PASS**（`tools/gate-baseline.json` → **1330**；
+  **1330 unique / 1350 summed with e2e re-runs**）；e2e-adapter 12/12、e2e-real-data 8/8。
+- `test/config-consistency.test.mjs` 通过：版本 1.5.5、CHANGELOG 有 `## [1.5.5]` 段、
+  `recall.highRelevance` 在 `DEFAULT_CONFIG` 与随包 `config.json` 中一致。
+- 高相关人工核对：低 α 但命中 3 个查询关键词的记忆在 quota=1 的 fair 轮次中替换掉单关键词高 α 尾部命中；
+  `deterministic` 与分页路径不生效；助手原话/多子句保底命中不会被替换。适配器 `recall-block`
+  遥测已转发 `highRelevanceEnabled/Candidates/Picks/Replaced`（plugin-mock 断言），stats.jsonl 可观察保底触发。
+- 助手原话人工核对：`[tool-call …]` / JSON payload / `role=tool` 不产生关键词；content blocks 只取 text；
+  两个 turn 时第二个 turn 的最短回复仍获得槽位；`alpha/beta/keywords/mem-…/12345/readthroughseq` 被过滤。
+
+### 30.2 复跑命令
+
+```bash
+export PATH="<node-bin>:$PATH"
+cd <repo>
+node --test
+node --test test/high-relevance-quota.test.mjs test/assistant-keywords-1.5.5.test.mjs \
+  test-adapter/scoring-rubric.test.mjs test-adapter/plugin-mock.test.mjs test/config-consistency.test.mjs
+node tools/verify-1.4.0.mjs
+```
+
+### 30.3 版本
+
+`package.json` / `engine/package.json` = **1.5.5**；`tools/gate-baseline.json` = **1330**；
+`recall.highRelevance` = `{enabled:true, minMatches:2, reserveSlots:2}`（engine 默认 + 随包配置一致）；
+README §1.17 / SPEC §6.2/§26 / CHANGELOG [1.5.5] 已同步。
+
+---
+
+## 31. v1.5.6 最终验证（2026-11-09）
+
+**范围**：① 评分期关键词规则——多话题文件夹必须覆盖**每个话题**的关键事实（每个话题至少 1 个能独立检索到
+它的关键词，不得只写第一个/最主要话题，也不得用泛词凑数）；② 记忆相关问题主动召回规则
+（`MEMORY_RULES_TEXT` 新增第 6 条（共 9 条）「记忆相关问题（v1.5.6）」）；③ 版本 1.5.5 → 1.5.6。
+
+### 31.1 测试与门禁（本机实测）
+
+- `node --test` = **1332 tests / 1330 pass / 0 fail / 2 skip**（2 skip 为 Node zstd 平台条件跳过）。
+  相对 1.5.5（1330）新增 2 例：`test-adapter/scoring-rubric.test.mjs`（多话题关键词规则：TOOL_DESCRIPTION
+  + `keywords` 参数说明）、`test-adapter/plugin-rules-1.6.0.test.mjs`（「记忆相关问题」规则文本/顺序/
+  规则 section 长度守卫）；同步更新 `test-adapter/plugin-mock.test.mjs` 的评分 rubric 关键词断言
+  （新增紧凑多话题句）。
+- `node tools/verify-1.4.0.mjs` = **8/8 PASS**（`tools/gate-baseline.json` → **1332**；
+  **1332 unique / 1352 summed with e2e re-runs**）；e2e-adapter 12/12、e2e-real-data 8/8。
+- `test/config-consistency.test.mjs` 通过：版本 1.5.6、CHANGELOG 有 `## [1.5.6]` 段、
+  `package.json` 与 `engine/package.json` 版本一致。
+- **P0-1 任务区块预算回归**：完整多话题规则放在 `memory_judge` 工具描述与 `keywords` 参数说明里，评分
+  rubric 只加一句紧凑规则；修复过程中发现直接新增一条完整 rubric 条目（约 +90 tokens）会挤掉小窗口下的
+  待评分条目，导致 `compat-integration`（1000-token 窗口）与 `scoring-pressure` F-05-01（12000-token
+  窗口）失败；改为紧凑句（约 +27 tokens）后两者恢复通过，证明没有牺牲任务条目展示预算。
+- 规则 section 长度：9 条实测 **984 字符**（`plugin-rules` 守卫上限 1200），系统提示词常驻成本可控。
+
+### 31.2 复跑命令
+
+```bash
+export PATH="<node-bin>:$PATH"
+cd <repo>
+node --test
+node --test test-adapter/scoring-rubric.test.mjs test-adapter/plugin-rules-1.6.0.test.mjs \
+  test-adapter/plugin-mock.test.mjs test-adapter/compat-integration.test.mjs \
+  test-adapter/scoring-pressure.test.mjs test/config-consistency.test.mjs
+node tools/verify-1.4.0.mjs
+```
+
+### 31.3 版本
+
+`package.json` / `engine/package.json` = **1.5.6**；`tools/gate-baseline.json` = **1332**；
+README §1.18 / SPEC §6.13/§27-28 / CHANGELOG [1.5.6] / `config.json` `_readme` 已同步；
+数据格式无变化，无需迁移。

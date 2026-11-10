@@ -60,11 +60,50 @@ test('memory_judge: α rubric weighs user preferences, β/keywords rubric intact
   // The β / keywords / keep clauses are unchanged by the α edit.
   assert.ok(description.includes('β（-10~10）是这条记忆能否当事实或指令使用的信赖度'))
   assert.ok(description.includes('可信的事实/决定/约定为正分'))
-  assert.ok(description.includes('新归档的待评分记忆需要同时给出 3~8 个关键词'))
+  assert.ok(description.includes('新归档的待评分记忆需要同时给出 3~16 个关键词（归档侧上限 16、下限 3）'))
   assert.ok(description.includes('keep=true 表示保持原值'))
   // v1.4.0 event rubric is part of the model-facing description.
   for (const phrase of ['event 表示这条记忆所属的事件', '一次旅行', '工作项目', '方案评审', '给「空」', '省略表示本次不修改']) {
     assert.ok(description.includes(phrase), `description must mention event rubric: ${phrase}`)
+  }
+})
+
+test('memory_judge v1.5.5: keywords cover everything, scale with density, re-check tags and assistant words', () => {
+  const description = definition().description
+  for (const phrase of [
+    '关键词规则（v1.5.5）',
+    '关键词要象征这条记忆里发生的所有事',
+    '信息密度低的记忆给少量关键词',
+    '信息密度高的可以给更多',
+    '复查 persons/locations/events 是否都出现在 keywords 里',
+    '助手自己说过的话（称呼约定、承诺、规则、决定）',
+    'assistant 原话通道',
+  ]) {
+    assert.ok(description.includes(phrase), `TOOL_DESCRIPTION must carry ${phrase}`)
+  }
+  const props = definition().parameters.properties.updates.items.properties
+  for (const phrase of ['信息密度低给少量', '所有人物、地点、事件', '复查这些标签是否都已出现在 keywords 中', '助手自己说过的话']) {
+    assert.ok(props.keywords.description.includes(phrase), `keywords description must carry ${phrase}`)
+  }
+  assert.ok(props.persons.description.includes('设置后复查该人物是否已写进 keywords'))
+  assert.ok(props.locations.description.includes('设置后复查该地点是否已写进 keywords'))
+})
+
+test('memory_judge v1.5.6: multi-topic folders must cover every topic in keywords', () => {
+  const description = definition().description
+  for (const phrase of [
+    '多话题文件夹（v1.5.6）',
+    '一条记忆包含多个话题',
+    'keywords 必须覆盖每个话题的关键事实',
+    '每个话题至少 1 个能独立检索到它的关键词',
+    '不得只覆盖第一个或最主要的话题',
+    '不得用泛词凑数',
+  ]) {
+    assert.ok(description.includes(phrase), `TOOL_DESCRIPTION must carry ${phrase}`)
+  }
+  const keywordsDescription = definition().parameters.properties.updates.items.properties.keywords.description
+  for (const phrase of ['多话题文件夹（v1.5.6）', '每个话题至少 1 个能独立检索到它的关键词', '不得只写第一个/最主要的话题']) {
+    assert.ok(keywordsDescription.includes(phrase), `keywords description must carry ${phrase}`)
   }
 })
 
@@ -78,7 +117,7 @@ test('memory_judge: alpha parameter carries the preference rule; other parameter
   assert.ok(props.alpha.description.includes('省略表示不修改'))
   // beta / keywords / keep / reason / id descriptions are untouched.
   assert.equal(props.beta.description, '信赖度 -10~10；省略表示不修改')
-  assert.ok(props.keywords.description.includes('3~8 个关键词；待评分新记忆必填，复核已有记忆可省略'))
+  assert.ok(props.keywords.description.includes('3~16 个关键词；待评分新记忆必填，复核已有记忆可省略'))
   assert.ok(props.keywords.description.includes('类别词'), 'v1.4.1 category-word rule is model-visible')
   assert.equal(props.keep.description, 'true 表示保持现有 α/β 不变（复核时无需修改可用）')
   assert.equal(props.reason.description, '一句话理由（可选）')
@@ -275,7 +314,7 @@ test('memory_judge: uniform α/β + repeated keywords + missing reasons warn but
     assert.ok(result.warnings.some((warning) => warning.includes('α 全部相同')))
     assert.ok(result.warnings.some((warning) => warning.includes('β 全部相同')))
     assert.ok(result.warnings.some((warning) => warning.includes('reason')))
-    assert.ok(result.warnings.some((warning) => warning.includes('没有 event 标签')), 'untagged new memories get a non-blocking reminder')
+    assert.ok(result.warnings.some((warning) => warning.includes('没有事件标签')), 'untagged new memories get a non-blocking reminder')
     // Quality warnings never block the write.
     assert.equal(readMeta(memoryDir, ids[0]).scored, true)
     assert.equal(readMeta(memoryDir, ids[0]).alpha, 0.1)
@@ -324,11 +363,11 @@ test('memory_judge: a single normal update makes no quality warnings (no false p
     // The only warning is the "new memory has no event" reminder — never a
     // quality/template warning for one normal update.
     assert.equal(result.warnings.length, 1)
-    assert.ok(result.warnings[0].includes('没有 event 标签'), result.warnings[0])
+    assert.ok(result.warnings[0].includes('没有事件标签'), result.warnings[0])
     for (const phrase of ['关键词有', 'α 全部相同', 'β 全部相同', 'reason']) {
       assert.ok(!result.warnings[0].includes(phrase), `no quality warning for one update: ${phrase}`)
     }
-    assert.deepEqual(result.eventStats, { assigned: 0, merged: 0, cleared: 0 })
+    assert.deepEqual(result.eventStats, { assigned: 0, merged: 0, cleared: 0, candidates: 0 })
     assert.equal(events.length, 1)
     assert.equal(events[0].event.batchSize, 1)
     assert.equal(events[0].event.updated, 1)

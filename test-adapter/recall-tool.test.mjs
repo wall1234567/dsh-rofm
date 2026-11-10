@@ -187,7 +187,7 @@ function assertLosslessJson(value) {
 // Definition contract
 // ---------------------------------------------------------------------------
 
-test('definition exposes the memory_recall contract (v1.4.0 schema)', () => {
+test('definition exposes the memory_recall contract (v1.5.0 schema)', () => {
   const tool = new MemoryRecallTool(makePlugin({ engine: makeEngine() }))
   const definition = tool.definition()
 
@@ -206,24 +206,34 @@ test('definition exposes the memory_recall contract (v1.4.0 schema)', () => {
   for (const phrase of ['事件约束', 'event', '「空」']) {
     assert.ok(definition.description.includes(phrase), `description must mention ${phrase}`)
   }
+  // v1.5.0: tag/time-tag filters, 20-entry pages and the assistant-said channel.
+  for (const phrase of ['20', 'locations', 'persons', 'events', 'timeText', 'assistantSaid', '标签']) {
+    assert.ok(definition.description.includes(phrase), `description must mention ${phrase}`)
+  }
 
   assert.equal(definition.parameters.type, 'object')
   // v1.4.0: keywords is optional when a time/event window is given (browse mode).
   assert.deepEqual(definition.parameters.required, [])
   const properties = definition.parameters.properties
   assert.deepEqual(Object.keys(properties).sort(), [
+    'assistantSaid',
     'event',
+    'events',
     'granularity',
     'keywords',
     'limit',
+    'locations',
     'offset',
+    'persons',
     'timeFrom',
+    'timeText',
     'timeTo',
   ])
   assert.equal(properties.keywords.type, 'string')
   assert.ok(properties.keywords.description.includes('可省略'), 'keywords is documented as optional with a time window')
   assert.equal(properties.limit.type, 'integer')
-  assert.ok(properties.limit.description.includes('1~8'))
+  assert.ok(properties.limit.description.includes('1~20'))
+  assert.ok(properties.limit.description.includes('20'), 'the 20-entry ceiling is documented')
   assert.equal(properties.offset.type, 'integer')
   assert.ok(properties.offset.description.includes('10000'), 'offset documents its cap')
   assert.equal(properties.timeFrom.type, 'string')
@@ -233,12 +243,30 @@ test('definition exposes the memory_recall contract (v1.4.0 schema)', () => {
   for (const name of ['day', 'month', 'year']) assert.ok(properties.granularity.description.includes(name))
   assert.equal(properties.event.type, 'string')
   for (const phrase of ['事件约束', '「空」', '省略']) assert.ok(properties.event.description.includes(phrase), phrase)
+  // v1.5.0 multi-value filters are string arrays; timeText is a string and the
+  // assistant-said switch is a boolean.
+  for (const name of ['locations', 'persons', 'events']) {
+    assert.equal(properties[name].type, 'array', `${name} is an array parameter`)
+    assert.deepEqual(properties[name].items, { type: 'string' })
+    assert.ok(properties[name].description.length > 0, `${name} is documented`)
+  }
+  assert.ok(properties.events.description.includes('合并'), 'events documents the event+events merge')
+  assert.ok(properties.event.description.includes('events'), 'event points at the events array')
+  assert.equal(properties.locations.description.includes('北京'), true)
+  assert.equal(properties.timeText.type, 'string')
+  for (const phrase of ['下周二', '昨天']) assert.ok(properties.timeText.description.includes(phrase), phrase)
+  assert.equal(properties.assistantSaid.type, 'boolean')
+  assert.ok(properties.assistantSaid.description.includes('你说过'), properties.assistantSaid.description)
 
-  // The output schema documents the v1.4.0 value shape (pagination + time + event).
+  // The output schema documents the v1.5.0 value shape (pagination + time + event
+  // + tag/timeTag + clause + assistantSaid).
   assert.equal(definition.output.schema.type, 'object')
   assert.deepEqual(Object.keys(definition.output.schema.properties).sort(), [
     'added',
+    'assistantInfo',
+    'assistantSaid',
     'attempted',
+    'clauseInfo',
     'degraded',
     'eventInfo',
     'found',
@@ -252,10 +280,20 @@ test('definition exposes the memory_recall contract (v1.4.0 schema)', () => {
     'nextOffset',
     'offset',
     'stopHint',
+    'tagInfo',
+    'timeTagInfo',
     'timeWindow',
     'warnings',
   ])
   assert.equal(definition.output.schema.properties.eventInfo.type, 'object')
+  assert.equal(definition.output.schema.properties.tagInfo.type, 'object')
+  assert.equal(definition.output.schema.properties.timeTagInfo.type, 'object')
+  assert.equal(definition.output.schema.properties.clauseInfo.type, 'array')
+  assert.equal(definition.output.schema.properties.assistantInfo.type, 'object')
+  assert.equal(definition.output.schema.properties.assistantSaid.type, 'boolean')
+  const missTypeDescription = definition.output.schema.properties.missType.description
+  assert.ok(missTypeDescription.includes("'tag'"), missTypeDescription)
+  assert.ok(missTypeDescription.includes("'time-tag'"), missTypeDescription)
   assert.equal(definition.output.schema.required, undefined, 'no output field is claimed as required')
   assert.equal(definition.output.schema.properties.images.items.properties.name.type, 'string')
   assert.equal(definition.output.schema.properties.images.items.properties.path.type, 'string')
@@ -559,7 +597,8 @@ test('empty or non-string keywords are rejected; a completely empty query is rej
   // v1.4.0: keywords may be omitted only when a time window or an event is given.
   for (const args of [{}, { keywords: undefined }, { keywords: null }, { event: '空' }, { timeFrom: '' }]) {
     await assert.rejects(tool.execute(args, exec()), {
-      message: 'memory_recall 需要 keywords（关键词），或 timeFrom/timeTo/granularity 时间参数，或 event 事件约束（三者至少给一个）',
+      message:
+        'memory_recall 需要 keywords（关键词），或任一过滤器（timeFrom/timeTo/granularity、timeText、event/events、locations、persons），至少给一个',
     })
   }
 })
@@ -586,9 +625,10 @@ test('an unavailable memory engine is rejected', async () => {
   await assert.rejects(tool.execute({ keywords: 'docker' }, exec()), { message: 'memory engine unavailable' })
 })
 
-test('limit is clamped to 1..8 with a default of 3', async () => {
-  const additions = Array.from({ length: 10 }, (_, index) => makeAddition({ meta: { id: `mem-${index}` } }))
+test('limit is clamped to 1..20 with a default of 3 (v1.5.0 ceiling)', async () => {
+  const additions = Array.from({ length: 25 }, (_, index) => makeAddition({ meta: { id: `mem-${index}` } }))
   const engine = makeEngine(
+    successResult(additions),
     successResult(additions),
     successResult(additions),
     successResult(additions),
@@ -606,8 +646,12 @@ test('limit is clamped to 1..8 with a default of 3', async () => {
   const zero = await tool.execute({ keywords: 'x', limit: 0 }, exec())
   assert.equal(zero.found, 1, '0 clamps up to 1')
 
+  const twenty = await tool.execute({ keywords: 'x', limit: 20 }, exec())
+  assert.equal(twenty.found, 20, 'the v1.5.0 ceiling allows a 20-entry page')
+
   const huge = await tool.execute({ keywords: 'x', limit: 99 }, exec())
-  assert.equal(huge.found, 8, '99 clamps down to 8')
+  assert.equal(huge.found, 20, '99 clamps down to 20')
+  assert.equal(engine.calls.at(-1).options.limit, 20, 'the clamped limit reaches the engine')
 })
 
 test('recalled ids from the session state are excluded from re-injection', async () => {
@@ -769,7 +813,8 @@ test('time.mode=off drops time arguments with a warning; a time-only call is rej
   assert.ok(textOf(render(tool, { keywords: 'docker' }, value)).includes('time.mode=off'))
 
   await assert.rejects(tool.execute({ timeFrom: '2026-10-31' }, exec()), {
-    message: 'memory_recall 需要 keywords（关键词），或 timeFrom/timeTo/granularity 时间参数，或 event 事件约束（三者至少给一个）',
+    message:
+      'memory_recall 需要 keywords（关键词），或任一过滤器（timeFrom/timeTo/granularity、timeText、event/events、locations、persons），至少给一个',
   })
 })
 
@@ -1383,7 +1428,7 @@ test('event is forwarded to engine.recall; event-only is a valid browse query', 
   const cleared = await tool.execute({ keywords: 'docker', event: '空' }, exec())
   assert.equal(engine.calls[2].options.event, '空')
   assert.equal(cleared.found, 1)
-  await assert.rejects(tool.execute({ event: '空' }, exec()), /三者至少给一个/)
+  await assert.rejects(tool.execute({ event: '空' }, exec()), /至少给一个/)
 })
 
 test('event exact is rendered with the constraint line; time+event render both (AND)', async () => {
@@ -1655,4 +1700,71 @@ test('B-01: fair mode passes paginate:true together with offset/limit', async ()
   assert.equal(engine.calls[0].options.paginate, true)
   assert.equal(engine.calls[0].options.offset, 6)
   assert.equal(engine.calls[0].options.limit, 3)
+})
+
+// ---------------------------------------------------------------------------
+// v1.5.4: memory_recall headings follow the recall-block time caliber
+// ---------------------------------------------------------------------------
+
+test('v1.5.4: memory_recall heading labels archive time and event time under computeDates', async () => {
+  const addition = makeAddition({
+    meta: {
+      createdAt: Date.parse('2026-04-19T13:10:00Z'),
+      keywords: ['docker'],
+      eventStart: Date.parse('2026-04-15T01:00:00Z'),
+      eventEnd: Date.parse('2026-04-15T10:00:00Z'),
+    },
+  })
+  addition.messages = [{ role: 'user', content: '明天上线', time: Date.parse('2026-05-27T04:00:00Z') }]
+  const cfg = makeConfig({
+    recall: { enabled: true, computeDates: true },
+    time: { timezone: 'Asia/Shanghai' },
+  })
+  const tool = new MemoryRecallTool(makePlugin({ engine: makeEngine(successResult([addition])), cfg }))
+  const value = await tool.execute({ keywords: 'docker' }, exec())
+  const text = textOf(render(tool, { keywords: 'docker' }, value))
+  // Same caliber as the automatic recall block: archive time labelled, event time
+  // in parentheses — never a bare archive date that the model could copy.
+  assert.match(
+    text,
+    /### 回忆 1 · α=0\.70 · β=\+3\.0 · 第1代 · 归档于 2026-04-19 周日 21:10（事件时间 2026-04-15 周三） · 关键词：docker/,
+    text,
+  )
+  assert.ok(!text.includes('· 2026-04-19 21:10'), 'no bare archive date heading')
+
+  // Legacy config (computeDates off / absent) keeps the v1.5.0 heading.
+  const legacyTool = new MemoryRecallTool(makePlugin({ engine: makeEngine(successResult([addition])) }))
+  const legacyValue = await legacyTool.execute({ keywords: 'docker' }, exec())
+  const legacyText = textOf(render(legacyTool, { keywords: 'docker' }, legacyValue))
+  assert.ok(!legacyText.includes('归档于'), legacyText)
+  assert.equal(legacyValue.entries[0].archiveTimeText, undefined, 'legacy entries carry no computable labels')
+})
+
+test('v1.5.4: memory_recall heading derives the event time from message.time when meta lacks it', async () => {
+  const addition = makeAddition({ meta: { createdAt: Date.parse('2026-04-19T13:10:00Z'), keywords: ['docker'] } })
+  addition.messages = [
+    { role: 'user', content: '第一句', time: Date.parse('2026-04-15T01:00:00Z') },
+    { role: 'assistant', content: '第二句', time: Date.parse('2026-04-16T10:00:00Z') },
+  ]
+  const cfg = makeConfig({ recall: { enabled: true, computeDates: true }, time: { timezone: 'Asia/Shanghai' } })
+  const tool = new MemoryRecallTool(makePlugin({ engine: makeEngine(successResult([addition])), cfg }))
+  const value = await tool.execute({ keywords: 'docker' }, exec())
+  const text = textOf(render(tool, { keywords: 'docker' }, value))
+  assert.match(text, /归档于 2026-04-19 周日 21:10（事件时间 2026-04-15 周三 ~ 2026-04-16 周四）/, text)
+})
+
+test('v1.5.4: browse mode still labels the event start, never the archive date', async () => {
+  const addition = makeAddition({
+    meta: {
+      createdAt: Date.parse('2026-04-19T13:10:00Z'),
+      keywords: [],
+      eventStart: Date.parse('2026-04-15T01:00:00Z'),
+    },
+  })
+  const cfg = makeConfig({ recall: { enabled: true, computeDates: true }, time: { timezone: 'Asia/Shanghai' } })
+  const tool = new MemoryRecallTool(makePlugin({ engine: makeEngine(successResult([addition])), cfg }))
+  const value = await tool.execute({ timeFrom: '2026-04-15', timeTo: '2026-04-18' }, exec())
+  const text = textOf(render(tool, { timeFrom: '2026-04-15', timeTo: '2026-04-18' }, value))
+  assert.match(text, /· 事件：2026-04-15 \d{2}:\d{2}/, text)
+  assert.ok(!text.includes('归档于'), 'browse stays an event-time view')
 })

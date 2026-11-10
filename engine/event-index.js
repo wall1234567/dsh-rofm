@@ -47,8 +47,16 @@ export const EVENT_METRICS = Object.freeze(['dice', 'avg', 'min'])
 export const EVENT_DEFAULTS = Object.freeze({
   mode: 'index',
   maxLabelLength: 60,
+  // v1.5.0: a memory may belong to several events; a similar-but-different label
+  // is never merged silently — the scoring model has to approve the merge by
+  // submitting the existing canonical label. The task block can list existing
+  // labels so the model can reuse one directly.
+  maxPerFolder: 4,
   similarity: Object.freeze({ metric: 'dice', threshold: 0.72, maxCandidates: 5 }),
   askUserHint: true,
+  mergeRequiresApproval: true,
+  showExisting: true,
+  showExistingLimit: 24,
 })
 
 /** Literal submissions that mean "not part of any event" (normalized first). */
@@ -106,10 +114,14 @@ export function eventConfig(cfg) {
   return {
     mode,
     maxLabelLength: clampInt(event.maxLabelLength, EVENT_DEFAULTS.maxLabelLength, 1, 200),
+    maxPerFolder: clampInt(event.maxPerFolder, EVENT_DEFAULTS.maxPerFolder, 1, 32),
     metric: EVENT_METRICS.includes(similarity.metric) ? similarity.metric : EVENT_DEFAULTS.similarity.metric,
     threshold: clampNumber(numberOr(similarity.threshold, EVENT_DEFAULTS.similarity.threshold), 0, 1),
     maxCandidates: clampInt(similarity.maxCandidates, EVENT_DEFAULTS.similarity.maxCandidates, 1, 10),
     askUserHint: event.askUserHint !== false,
+    mergeRequiresApproval: event.mergeRequiresApproval !== false,
+    showExisting: event.showExisting !== false,
+    showExistingLimit: clampInt(event.showExistingLimit, EVENT_DEFAULTS.showExistingLimit, 1, 200),
   }
 }
 
@@ -317,6 +329,7 @@ export function buildEventIndex(folders, cfg) {
   const list = Array.isArray(folders) ? folders : []
   const byKey = new Map()
   const byId = new Map()
+  const byIdAll = new Map()
   const seenIds = new Set()
   let folderCount = 0
   for (const folder of list) {
@@ -325,19 +338,39 @@ export function buildEventIndex(folders, cfg) {
     if (!id || seenIds.has(id)) continue
     seenIds.add(id)
     folderCount += 1
-    const label = normalizeEventLabel(folder.event, cfg)
-    if (!label) continue
-    const key = eventKeyOf(label, cfg)
-    let bucket = byKey.get(key)
-    if (!bucket) {
-      bucket = { label, key, ids: [], count: 0, firstAt: 0 }
-      byKey.set(key, bucket)
+    // v1.5.0: one folder may belong to several events. `folder.events` is the
+    // multi-label truth; the legacy single `folder.event` stays as a fallback for
+    // folders written before 1.5.0 (and for old indexes that mirror only `event`).
+    const submitted = []
+    if (Array.isArray(folder.events)) {
+      for (const raw of folder.events) submitted.push(raw)
     }
-    bucket.ids.push(id)
-    bucket.count += 1
-    const createdAt = numberOr(folder.createdAt, 0)
-    if (bucket.count === 1 || createdAt < bucket.firstAt) bucket.firstAt = createdAt
-    byId.set(id, { label: bucket.label, key })
+    if (submitted.length === 0 && folder.event !== undefined) submitted.push(folder.event)
+    const folderLabels = []
+    for (const raw of submitted) {
+      const label = normalizeEventLabel(raw, cfg)
+      if (!label || folderLabels.includes(label)) continue
+      folderLabels.push(label)
+      if (folderLabels.length >= effective.maxPerFolder) break
+    }
+    for (const label of folderLabels) {
+      const key = eventKeyOf(label, cfg)
+      let bucket = byKey.get(key)
+      if (!bucket) {
+        bucket = { label, key, ids: [], count: 0, firstAt: 0 }
+        byKey.set(key, bucket)
+      }
+      bucket.ids.push(id)
+      bucket.count += 1
+      const createdAt = numberOr(folder.createdAt, 0)
+      if (bucket.count === 1 || createdAt < bucket.firstAt) bucket.firstAt = createdAt
+    }
+    if (folderLabels.length > 0) {
+      const all = folderLabels.map((label) => ({ label, key: eventKeyOf(label, cfg) }))
+      byIdAll.set(id, all)
+      // Compatibility: `byId` keeps the first (canonical) label as before.
+      byId.set(id, all[0])
+    }
   }
   const labels = []
   for (const bucket of byKey.values()) labels.push({ label: bucket.label, key: bucket.key, count: bucket.count, firstAt: bucket.firstAt })
@@ -345,7 +378,7 @@ export function buildEventIndex(folders, cfg) {
   // builtAt is cache bookkeeping only; selection never reads it.
   const builtAt = Date.now()
   const signature = `event1|n=${folderCount}|labels=${stableSerialize(labels.map((item) => ({ key: item.key, count: item.count, firstAt: item.firstAt })))}|max=${effective.maxLabelLength}|metric=${effective.metric}|threshold=${effective.threshold}`
-  return { labels, byKey, byId, folderCount, builtAt, signature }
+  return { labels, byKey, byId, byIdAll, folderCount, builtAt, signature }
 }
 
 // ---------------------------------------------------------------------------
@@ -463,22 +496,32 @@ export function assignEventLabel(eventIndex, submitted, cfg) {
   const effective = eventConfig(cfg)
   const key = normalizeEventLabel(submitted, cfg)
   const warnings = []
-  if (!key) return { label: '', merged: null, warnings }
+  if (!key) return { label: '', merged: null, candidates: [], warnings }
   const index = normalizeEventIndex(eventIndex)
   const bucket = index ? index.byKey.get(key) : undefined
-  if (bucket) return { label: bucket.label, merged: null, warnings }
+  if (bucket) return { label: bucket.label, merged: null, candidates: [], warnings }
   const candidates = similarCandidates(index, key, effective)
   if (candidates.length) {
     const best = candidates[0]
-    // The `event-merged:` prefix is a stable marker for the adapter/tool layer
-    // (lib/memory-tool.js) so the judge summary can count merges without parsing
-    // the human-readable Chinese sentence.
+    if (effective.mergeRequiresApproval !== true) {
+      // Backwards-compatible rollback: the old v1.4.x behaviour silently merged a
+      // similar label into the existing canonical one. Kept only when the operator
+      // explicitly sets event.mergeRequiresApproval=false.
+      warnings.push(
+        `event-merged: 事件「${key}」与已有事件「${best.label}」高度相似（${best.score.toFixed(2)}），已归并到后者，保证同一事件标签一致`,
+      )
+      return { label: best.label, merged: { from: key, to: best.label, score: best.score }, candidates: [], warnings }
+    }
+    // v1.5.0: no silent merge. The submitted label is kept as its own canonical
+    // label; the candidates are surfaced so the model can approve the merge by
+    // re-submitting the existing label (an exact match then merges).
     warnings.push(
-      `event-merged: 事件「${key}」与已有事件「${best.label}」高度相似（${best.score.toFixed(2)}），已归并到后者，保证同一事件标签一致`,
+      `event-candidate: 事件「${key}」与已有事件「${best.label}」高度相似（${best.score.toFixed(2)}），尚未归并；` +
+        '如确认是同一事件，请用已有标签重新提交 memory_judge（event 传已有标签）以完成归并',
     )
-    return { label: best.label, merged: { from: key, to: best.label, score: best.score }, warnings }
+    return { label: key, merged: null, candidates, warnings }
   }
-  return { label: key, merged: null, warnings }
+  return { label: key, merged: null, candidates: [], warnings }
 }
 
 /**

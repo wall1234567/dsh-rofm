@@ -35,7 +35,7 @@
  * which reuses the production normalize/tokenize/keyword-matching truth.
  */
 
-import { extractKeywords, normalizeText, tokenize } from './tokenize.js'
+import { RECALL_KEYWORDS_MAX, extractKeywords, normalizeText, tokenize } from './tokenize.js'
 // B-02 (1.4.1): direction-2 matches are *generated* from the reverse token index
 // below and then verified with the authoritative bidirectional predicate, so the
 // product path and `engine/keyword-match.js` can never disagree.
@@ -94,6 +94,24 @@ function isCategorySeed(seed) {
 /** Synthetic seed for one category class key. */
 function categorySeed(key) {
   return CATEGORY_SEED_PREFIX + String(key)
+}
+
+// --- v1.5.0 assistant-utterance channel ------------------------------------
+// The assistant's own archived statements/advice/commitments are indexed in a
+// separate posting channel: "你说过…" / "你之前说…" queries ("assistant-said"
+// mode) also search this channel, while normal queries never see it. The
+// synthetic seed prefix keeps both channels in one posting map so the existing
+// deterministic k-way merge / lanes / trim code works unchanged.
+const ASSISTANT_SEED_PREFIX = '\u0003asst:'
+
+/** Whether a seed is a synthetic assistant-utterance seed. */
+export function isAssistantSeed(seed) {
+  return typeof seed === 'string' && seed.startsWith(ASSISTANT_SEED_PREFIX)
+}
+
+/** Synthetic seed for one assistant-utterance keyword. */
+function assistantSeed(keyword) {
+  return ASSISTANT_SEED_PREFIX + String(keyword)
 }
 
 /** Normalized `recall.categoryMatch` snapshot used by build/query. */
@@ -523,6 +541,20 @@ function normalizedKeywordsOf(folder) {
   return out
 }
 
+/** Normalized, de-duplicated assistant-utterance keywords of one folder entry. */
+function normalizedAssistantKeywordsOf(folder) {
+  const out = []
+  const seen = new Set()
+  const raw = folder && Array.isArray(folder.assistantKeywords) ? folder.assistantKeywords : []
+  for (const keyword of raw) {
+    const normalized = normalizeKeyword(keyword)
+    if (!normalized || seen.has(normalized)) continue
+    seen.add(normalized)
+    out.push(normalized)
+  }
+  return out
+}
+
 /** An empty index (used when callers pass garbage). */
 function emptyIndex() {
   return {
@@ -531,6 +563,10 @@ function emptyIndex() {
     postings: new Map(),
     /** B-02 direction-2 reverse index: user token → multi-token folder keywords. */
     tokenKeywords: new Map(),
+    /** v1.5.0 assistant-utterance channel (synthetic postings, own automaton). */
+    assistantPostings: new Map(),
+    assistantAutomaton: buildAutomaton([]),
+    assistantKeywordCount: 0,
     automaton: buildAutomaton([]),
     matchMode: 'contains',
     rareThreshold: Math.max(1, DEFAULT_FAIR.rareTerm.minPosting),
@@ -601,21 +637,27 @@ function buildTokenKeywordIndex(entries, cfg) {
 function normalizeIndex(index) {
   if (!index || typeof index !== 'object' || !Array.isArray(index.entries)) return emptyIndex()
   if (!(index.postings instanceof Map)) return emptyIndex()
+  const withAssistant = (value) => ({
+    ...value,
+    assistantPostings: value.assistantPostings instanceof Map ? value.assistantPostings : new Map(),
+    assistantAutomaton: value.assistantAutomaton ? value.assistantAutomaton : buildAutomaton([]),
+    assistantKeywordCount: Number.isFinite(Number(value.assistantKeywordCount)) ? Number(value.assistantKeywordCount) : 0,
+  })
   if (!(index.byId instanceof Map)) {
     const byId = new Map()
     index.entries.forEach((entry, at) => {
       if (entry && isValidId(entry.id) && !byId.has(entry.id)) byId.set(entry.id, at)
     })
-    return { ...index, byId }
+    return withAssistant({ ...index, byId })
   }
   if (!index.automaton) {
-    return {
+    return withAssistant({
       ...index,
-      automaton: buildAutomaton([...index.postings.keys()].filter((key) => !isCategorySeed(key))),
+      automaton: buildAutomaton([...index.postings.keys()].filter((key) => !isCategorySeed(key) && !isAssistantSeed(key))),
       categoryMatch: index.categoryMatch && typeof index.categoryMatch === 'object' ? index.categoryMatch : categoryConfigOf(undefined),
-    }
+    })
   }
-  return index
+  return withAssistant(index)
 }
 
 /**
@@ -655,6 +697,9 @@ export function buildRecallIndex(folders, cfg) {
       alpha: clampAlpha(numberOr(folder.alpha, 0)),
       createdAt: numberOr(folder.createdAt, 0),
       keywords: normalizedKeywordsOf(folder),
+      // v1.5.0: separately indexed assistant statements (never mixed into the
+      // normal keyword postings; searched only in assistant-said mode).
+      assistantKeywords: normalizedAssistantKeywordsOf(folder),
       folder,
     })
   }
@@ -701,6 +746,38 @@ export function buildRecallIndex(folders, cfg) {
       postings.set(categorySeed(key), posting)
     }
   }
+  // v1.5.0: assistant-utterance postings live in the same posting map under the
+  // synthetic `\u0003asst:` prefix so lanes/merge/trim work unchanged.
+  // v1.5.0 audit (F-04-03): `recall.assistantSaid.enabled === false` is the hard
+  // rollback switch — DESIGN §4.1 says the assistant postings/automaton are only
+  // built when the feature is enabled. Building them anyway left synthetic
+  // assistant postings (and assistantKeywordCount > 0) in a "disabled" profile.
+  const assistantEnabled = !(
+    cfg &&
+    cfg.recall &&
+    cfg.recall.assistantSaid &&
+    cfg.recall.assistantSaid.enabled === false
+  )
+  const assistantPostings = new Map()
+  const assistantPatternSet = new Set()
+  if (assistantEnabled) {
+    entries.forEach((entry, at) => {
+      for (const keyword of entry.assistantKeywords) {
+        assistantPatternSet.add(keyword)
+        const key = assistantSeed(keyword)
+        let posting = assistantPostings.get(key)
+        if (!posting) {
+          posting = []
+          assistantPostings.set(key, posting)
+        }
+        posting.push(at)
+      }
+    })
+    for (const [key, posting] of assistantPostings) {
+      posting.sort((left, right) => comparePriority(entries[left], entries[right]))
+      postings.set(key, posting)
+    }
+  }
   const folderCount = entries.length
   const rareThreshold = Math.max(
     effective.rareMinPosting,
@@ -716,8 +793,12 @@ export function buildRecallIndex(folders, cfg) {
     byId,
     postings,
     tokenKeywords: buildTokenKeywordIndex(entries, cfg),
-    // Category markers are synthetic posting keys, never literal text patterns.
-    automaton: buildAutomaton([...postings.keys()].filter((key) => !isCategorySeed(key))),
+    // Category/assistant markers are synthetic posting keys, never literal text
+    // patterns, so the normal automaton only holds literal folder keywords.
+    automaton: buildAutomaton([...postings.keys()].filter((key) => !isCategorySeed(key) && !isAssistantSeed(key))),
+    assistantPostings,
+    assistantAutomaton: buildAutomaton([...assistantPatternSet]),
+    assistantKeywordCount: assistantPatternSet.size,
     categoryMatch: category,
     matchMode,
     rareThreshold,
@@ -736,13 +817,18 @@ export function buildRecallIndex(folders, cfg) {
  * text (contains: CJK substring / Latin word boundary, via the same predicate
  * as engine/tokenize.js `keywordMatches`; exact: token dictionary).
  *
+ * v1.5.0: with `opts.assistantSaid === true` the assistant-utterance channel is
+ * searched too (synthetic `\u0003asst:` seeds); normal queries never see it.
+ *
  * @param {object} index
  * @param {string} userText
  * @param {object} [cfg]
+ * @param {{ assistantSaid?: boolean }} [opts]
  * @returns {{ seeds: string[], userKeywords: string[] }}
  */
-export function querySeeds(index, userText, cfg) {
+export function querySeeds(index, userText, cfg, opts = {}) {
   const safeIndex = normalizeIndex(index)
+  const options = opts && typeof opts === 'object' ? opts : {}
   const text = normalizeText(userText)
   const seeds = []
   const seen = new Set()
@@ -793,6 +879,17 @@ export function querySeeds(index, userText, cfg) {
       }
     }
   }
+  // --- v1.5.0 assistant-utterance channel ---------------------------------
+  // Only "你说过/你之前说…" style queries opt into this channel; the seeds are
+  // synthetic and point at the assistant-keyword postings built above.
+  if (options.assistantSaid === true && safeIndex.assistantAutomaton) {
+    for (const keyword of scanAutomaton(safeIndex.assistantAutomaton, text)) {
+      const seed = assistantSeed(keyword)
+      if (!keyword || seen.has(seed) || !safeIndex.postings.has(seed)) continue
+      seen.add(seed)
+      seeds.push(seed)
+    }
+  }
   // --- Plan A (v1.4.1 addendum): deterministic category layer -------------
   // A query that uses a synonym of a closed category (喜好/偏好/喜欢…) seeds the
   // synthetic posting of that class, so high-α memories whose keywords carry
@@ -818,7 +915,9 @@ export function querySeeds(index, userText, cfg) {
     }
   }
   seeds.sort(idCompare)
-  const userKeywords = extractKeywords(userText, cfg || {}, { max: 16 })
+  // Query-side cap stays at the pre-1.6 value (16); this is telemetry/diagnostics
+  // for the query, not the archival cfg.keywords.max (16).
+  const userKeywords = extractKeywords(userText, cfg || {}, { max: RECALL_KEYWORDS_MAX })
   return { seeds, userKeywords }
 }
 
@@ -830,17 +929,19 @@ export function querySeeds(index, userText, cfg) {
  * Collect the candidate set C(Q) (∪ posting lists of the seeds).
  *
  * Filters, in order: `minAlpha` (α gate) → `timeIds` (time window W) →
- * `eventIds` (event constraint E). Time/event filters are pre-filters: they do
- * not consume quota and never move the frontier (a different window / event
- * must be able to surface the memory later).
+ * `eventIds` (event constraint E) → `constrainIds` (v1.5.0 location/person and
+ * other tag constraints T). All are pre-filters: they do not consume quota and
+ * never move the frontier (a different window / event / tag must be able to
+ * surface the memory later).
  *
  * @param {object} index
  * @param {string[]} seeds
- * @param {{ minAlpha?: number, timeIds?: Set<string>|null, eventIds?: Set<string>|null }} [options]
+ * @param {{ minAlpha?: number, timeIds?: Set<string>|null, eventIds?: Set<string>|null,
+ *   constrainIds?: Set<string>|null }} [options]
  * @returns {{
  *   indices: number[], windowIndices: number[], matchCount: Map<number, number>,
  *   filteredByAlpha: number, filteredByTime: number, filteredByEvent: number,
- *   windowSet: Set<number>,
+ *   filteredByTag: number, windowSet: Set<number>,
  * }}
  */
 function scanCandidates(index, seeds, options = {}) {
@@ -849,6 +950,7 @@ function scanCandidates(index, seeds, options = {}) {
   const minAlpha = clampAlpha(numberOr(options.minAlpha, 0))
   const timeIds = options.timeIds || null
   const eventIds = options.eventIds || null
+  const constrainIds = options.constrainIds || null
   const indices = []
   const windowIndices = []
   const windowSet = new Set()
@@ -856,6 +958,7 @@ function scanCandidates(index, seeds, options = {}) {
   let filteredByAlpha = 0
   let filteredByTime = 0
   let filteredByEvent = 0
+  let filteredByTag = 0
   for (const seed of seeds) {
     const posting = postings.get(seed)
     if (!posting || !posting.length) continue
@@ -882,24 +985,30 @@ function scanCandidates(index, seeds, options = {}) {
         filteredByEvent += 1
         continue
       }
+      if (constrainIds && !constrainIds.has(entry.id)) {
+        filteredByTag += 1
+        continue
+      }
       windowIndices.push(at)
       windowSet.add(at)
     }
   }
-  return { indices, windowIndices, matchCount, filteredByAlpha, filteredByTime, filteredByEvent, windowSet }
+  return { indices, windowIndices, matchCount, filteredByAlpha, filteredByTime, filteredByEvent, filteredByTag, windowSet }
 }
 
 /**
- * |C(Q)∩W∩E| — deduplicated candidates matched by the seeds, after the query-time
- * `minAlpha` gate, the optional `timeIds` window filter and the optional
- * `eventIds` event constraint (all three are part of the candidate definition
- * for the rank bound: `rank` must be defined on C(Q)∩W∩E).
+ * |C(Q)∩W∩E∩T| — deduplicated candidates matched by the seeds, after the
+ * query-time `minAlpha` gate, the optional `timeIds` window filter, the optional
+ * `eventIds` event constraint and the v1.5.0 `constrainIds` tag constraint (all
+ * are part of the candidate definition for the rank bound: `rank` must be
+ * defined on C(Q)∩W∩E∩T).
  *
  * Not on the per-turn hot path (tests/tools/telemetry only).
  *
  * @param {object} index
  * @param {string[]} seeds
- * @param {{ minAlpha?: number, timeIds?: Set<string>|null, eventIds?: Set<string>|null }} [options]
+ * @param {{ minAlpha?: number, timeIds?: Set<string>|null, eventIds?: Set<string>|null,
+ *   constrainIds?: Set<string>|null }} [options]
  * @returns {number}
  */
 export function countCandidates(index, seeds, options = {}) {
@@ -964,6 +1073,7 @@ function keyOf(entry) {
  *   minAlpha?: number,
  *   timeIds?: Set<string>|null,
  *   eventIds?: Set<string>|null,
+ *   constrainIds?: Set<string>|null,
  *   frontier?: Map<string, {key: object, length: number}>|null,
  *   picked?: object[],
  *   seenIndices?: Set<number>,
@@ -982,6 +1092,7 @@ function mergeSigma(index, seeds, context) {
   const minAlpha = clampAlpha(numberOr(context.minAlpha, 0))
   const timeIds = context.timeIds || null
   const eventIds = context.eventIds || null
+  const constrainIds = context.constrainIds || null
   const frontier = context.frontier || null
   const picked = context.picked || []
   const seenIndices = context.seenIndices || new Set()
@@ -1071,8 +1182,9 @@ function mergeSigma(index, seeds, context) {
       advanceList(node)
       continue
     }
-    // Time window / event pre-filters: skip without touching the quota or the
-    // frontier (a different window/event must be able to surface the memory later).
+    // Time window / event / tag pre-filters: skip without touching the quota or
+    // the frontier (a different window/event/tag must be able to surface the
+    // memory later).
     if (timeIds && !timeIds.has(entry.id)) {
       if (stats) stats.filteredByTime = (stats.filteredByTime || 0) + 1
       advanceList(node)
@@ -1080,6 +1192,11 @@ function mergeSigma(index, seeds, context) {
     }
     if (eventIds && !eventIds.has(entry.id)) {
       if (stats) stats.filteredByEvent = (stats.filteredByEvent || 0) + 1
+      advanceList(node)
+      continue
+    }
+    if (constrainIds && !constrainIds.has(entry.id)) {
+      if (stats) stats.filteredByTag = (stats.filteredByTag || 0) + 1
       advanceList(node)
       continue
     }
@@ -1191,6 +1308,7 @@ export function selectSigma(index, seeds, options = {}) {
   const minAlpha = clampAlpha(numberOr(opts.minAlpha, 0))
   const timeIds = toIdFilter(opts.timeIds)
   const eventIds = toIdFilter(opts.eventIds)
+  const constrainIds = toIdFilter(opts.constrainIds)
   const frontier = opts.frontier instanceof Map ? opts.frontier : null
   const maxPops = integerOr(opts.maxPops, MAX_MERGE_POPS)
   const stats = {
@@ -1202,6 +1320,7 @@ export function selectSigma(index, seeds, options = {}) {
     frontierHits: 0,
     filteredByTime: 0,
     filteredByEvent: 0,
+    filteredByTag: 0,
     hasMore: false,
   }
   const seedList = []
@@ -1221,6 +1340,7 @@ export function selectSigma(index, seeds, options = {}) {
     minAlpha,
     timeIds,
     eventIds,
+    constrainIds,
     frontier,
     picked,
     seenIndices,
@@ -1254,6 +1374,7 @@ export function selectSigma(index, seeds, options = {}) {
         minAlpha,
         timeIds,
         eventIds,
+        constrainIds,
         frontier,
         picked: hopPicked,
         seenIndices,
@@ -1290,6 +1411,7 @@ function scanRareTerms(index, seeds, options = {}) {
   const minAlpha = clampAlpha(numberOr(options.minAlpha, 0))
   const timeIds = options.timeIds || null
   const eventIds = options.eventIds || null
+  const constrainIds = options.constrainIds || null
   const entries = index.entries
   const infos = []
   for (const seed of seeds) {
@@ -1310,6 +1432,7 @@ function scanRareTerms(index, seeds, options = {}) {
       if (minAlpha > 0 && entry.alpha < minAlpha) continue
       if (timeIds && !timeIds.has(entry.id)) continue
       if (eventIds && !eventIds.has(entry.id)) continue
+      if (constrainIds && !constrainIds.has(entry.id)) continue
       scored.set(at, (scored.get(at) || 0) + weight)
     }
   }
@@ -1554,6 +1677,7 @@ function emptySelectStats(round, mode) {
     degraded: false,
     filteredByTime: 0,
     filteredByEvent: 0,
+    filteredByTag: 0,
     filteredByAlpha: 0,
     categorySeeds: [],
     round,
@@ -1593,8 +1717,11 @@ function capPool(pool, max) {
  *   lanes?: LaneState, cfg?: object, round?: number,
  *   blockIds?: Set<string>|string[], ledger?: Set<string>|string[],
  *   excludeIds?: Set<string>|string[], minAlpha?: number,
- *   timeIds?: Set<string>|null, eventIds?: Set<string>|null, k?: number,
- *   mode?: 'fair'|'deterministic', hops?: number,
+ *   timeIds?: Set<string>|null, eventIds?: Set<string>|null,
+ *   constrainIds?: Set<string>|null,   // v1.5.0 tag constraint (location/person/…)
+ *   assistantSaid?: boolean,           // v1.5.0 also search the assistant channel
+ *   assistantOnly?: boolean,           // v1.5.0 reserved pass: assistant channel only
+ *   k?: number, mode?: 'fair'|'deterministic', hops?: number,
  * }} [options]
  * @returns {{
  *   picks: Array<{id: string, lane: string, alpha: number, createdAt: number, generation: number, sigmaRank: number|null, rareScore: number}>,
@@ -1635,6 +1762,8 @@ export function selectRecall(index, userText, options = {}) {
   const minAlpha = clampAlpha(numberOr(opts.minAlpha, numberOr(recall.minAlpha, 0)))
   const timeIds = toIdFilter(opts.timeIds)
   const eventIds = toIdFilter(opts.eventIds)
+  const constrainIds = toIdFilter(opts.constrainIds)
+  const assistantSaid = opts.assistantSaid === true
   const thetaHigh = effective.thetaHigh
   const exploreRatio = effective.exploreRatio
   const r = rotationRate(k, exploreRatio)
@@ -1642,14 +1771,20 @@ export function selectRecall(index, userText, options = {}) {
   const hops = Math.max(0, integerOr(opts.hops, integerOr(recall.hops, 0)))
   const stats = emptySelectStats(round, mode)
 
-  const seeds = querySeeds(safeIndex, userText, cfg).seeds
+  // v1.5.0 `assistantOnly`: the reserved assistant-utterance pass looks only at
+  // that channel (the normal keywords and the assistant channel stay separate).
+  const assistantOnly = opts.assistantOnly === true
+  const seeds = assistantOnly
+    ? querySeeds(safeIndex, userText, cfg, { assistantSaid: true }).seeds.filter(isAssistantSeed)
+    : querySeeds(safeIndex, userText, cfg, { assistantSaid }).seeds
   stats.categorySeeds = seeds.filter(isCategorySeed).map((seed) => seed.slice(CATEGORY_SEED_PREFIX.length))
+  stats.assistantSeeds = seeds.filter(isAssistantSeed).length
   if (k <= 0 || entries.length === 0) {
     stats.hasMore = entries.length > 0 && seeds.length > 0
     stats.degraded = lanes.degraded === true
     return { picks: [], stats, hasMore: stats.hasMore, lanes, warnings }
   }
-  const scan = scanCandidates(safeIndex, seeds, { minAlpha, timeIds, eventIds })
+  const scan = scanCandidates(safeIndex, seeds, { minAlpha, timeIds, eventIds, constrainIds })
   // `candidates` is the rank domain |C(Q)∩W∩E| (after the α/time/event
   // pre-filters); `candidatesAll` additionally counts the candidates rejected by
   // the time window, and `filteredByEvent` the time-passed candidates rejected by
@@ -1659,6 +1794,7 @@ export function selectRecall(index, userText, options = {}) {
   stats.filteredByAlpha = scan.filteredByAlpha
   stats.filteredByTime = scan.filteredByTime
   stats.filteredByEvent = scan.filteredByEvent
+  stats.filteredByTag = scan.filteredByTag
   const windowIndices = scan.windowIndices
   const windowSet = scan.windowSet
   const matchCount = scan.matchCount
@@ -1683,6 +1819,7 @@ export function selectRecall(index, userText, options = {}) {
       minAlpha,
       timeIds,
       eventIds,
+      constrainIds,
       frontier: lanes.frontier,
       hops,
       maxPops: MAX_MERGE_POPS,
@@ -1696,6 +1833,7 @@ export function selectRecall(index, userText, options = {}) {
     // `filteredByEvent` are the deduplicated candidate counts from scanCandidates.
     stats.laneTimeSkips = result.stats.filteredByTime
     stats.laneEventSkips = result.stats.filteredByEvent
+    stats.laneTagSkips = result.stats.filteredByTag
     const picks = result.picked
       .map((item) => {
         const entry = entries[item.index]
@@ -1736,6 +1874,7 @@ export function selectRecall(index, userText, options = {}) {
     minAlpha,
     timeIds,
     eventIds,
+    constrainIds,
     scanCap: effective.rareScanCap,
   })
   const rareHigh = []
@@ -1812,6 +1951,10 @@ export function selectRecall(index, userText, options = {}) {
       pendingRecords.push({ id, round: enqueuedRound, at: indexAt })
       continue
     }
+    if (constrainIds && !constrainIds.has(id)) {
+      pendingRecords.push({ id, round: enqueuedRound, at: indexAt })
+      continue
+    }
     pendingRecords.push({ id, round: enqueuedRound, at: indexAt })
   }
   pendingRecords.sort((left, right) => comparePriority(entries[left.at], entries[right.at]))
@@ -1823,6 +1966,7 @@ export function selectRecall(index, userText, options = {}) {
       && !extraExclude.has(record.id)
       && !(timeIds && !timeIds.has(record.id))
       && !(eventIds && !eventIds.has(record.id))
+      && !(constrainIds && !constrainIds.has(record.id))
     if (canInject && pushPick(record.at, 'register', 0, 1)) continue
     keptPending.push(record)
   }
@@ -1866,6 +2010,7 @@ export function selectRecall(index, userText, options = {}) {
       minAlpha: Math.max(minAlpha, thetaHigh),
       timeIds,
       eventIds,
+      constrainIds,
       frontier: lanes.frontier,
       picked: lanePicked,
       seenIndices: new Set(),
@@ -1880,6 +2025,7 @@ export function selectRecall(index, userText, options = {}) {
     stats.excludedSkips += mergeStats.excludedSkips
     stats.laneTimeSkips = (stats.laneTimeSkips || 0) + mergeStats.filteredByTime
     stats.laneEventSkips = (stats.laneEventSkips || 0) + mergeStats.filteredByEvent
+    stats.laneTagSkips = (stats.laneTagSkips || 0) + (mergeStats.filteredByTag || 0)
     let slots = remainingHigh
     const deferred = []
     for (const item of lanePicked) {
@@ -1999,6 +2145,10 @@ export function selectRecall(index, userText, options = {}) {
         kept.push(item)
         continue
       }
+      if (constrainIds && !constrainIds.has(entry.id)) {
+        kept.push(item)
+        continue
+      }
       if (pickedIds.has(entry.id) || blockIds.has(entry.id) || extraExclude.has(entry.id)) {
         kept.push(item)
         continue
@@ -2034,7 +2184,7 @@ export function selectRecall(index, userText, options = {}) {
       const expansionSeeds = [...expansion].sort(idCompare).slice(0, hopKeywordCap)
       for (const keyword of expansionSeeds) seedSet.add(keyword)
       const hopPicked = []
-      const hopStats = { pops: 0, frontierHits: 0, duplicates: 0, excludedSkips: 0, filteredByTime: 0, filteredByEvent: 0, lists: 0 }
+      const hopStats = { pops: 0, frontierHits: 0, duplicates: 0, excludedSkips: 0, filteredByTime: 0, filteredByEvent: 0, filteredByTag: 0, lists: 0 }
       const hopExclude = new Set(excludedFromLanes)
       for (const id of pickedIds) hopExclude.add(id)
       mergeSigma(safeIndex, expansionSeeds, {
@@ -2044,6 +2194,7 @@ export function selectRecall(index, userText, options = {}) {
         minAlpha,
         timeIds,
         eventIds,
+        constrainIds,
         frontier: lanes.frontier,
         picked: hopPicked,
         seenIndices: new Set(),
@@ -2058,6 +2209,7 @@ export function selectRecall(index, userText, options = {}) {
       stats.excludedSkips += hopStats.excludedSkips
       stats.laneTimeSkips = (stats.laneTimeSkips || 0) + hopStats.filteredByTime
       stats.laneEventSkips = (stats.laneEventSkips || 0) + hopStats.filteredByEvent
+      stats.laneTagSkips = (stats.laneTagSkips || 0) + (hopStats.filteredByTag || 0)
       for (const item of hopPicked) pushPick(item.index, 'hi', 0, item.generation)
     }
   }

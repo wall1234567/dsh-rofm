@@ -372,6 +372,12 @@ function makeOverrides(memoryDir) {
       applyToMainSessions: true,
       triggerSourceKinds: ['user', 'agent-message'],
     },
+    // v1.5.0: the dedicated memory-usage rules section is registered always, but
+    // this suite pins the pre-1.5.0 prompt/archiving behaviour. The fake sessions
+    // use a 1000-token window on purpose, so the new section's text would push
+    // archival past hardLimit; the section's own text is covered by
+    // test-adapter/plugin-rules-1.5.0.test.mjs.
+    rules: { enabled: false },
     importance: { min: 0.01, max: 1, warnAbove: 0.8 },
     keywords: { min: 3, max: 8 },
     storage: { dir: memoryDir, perSession: false },
@@ -462,11 +468,17 @@ function writeFolderFixture(memoryDir, id, options = {}) {
     createdAt = Date.now(),
     scored = true,
     rescorePending = false,
+    events,
+    event,
   } = options
   const dir = path.join(memoryDir, id)
   mkdirSync(dir, { recursive: true })
   const messages = [{ role: 'user', content: text }]
   writeFileSync(path.join(dir, 'context.json'), JSON.stringify({ version: 1, id, createdAt, messages }))
+  const optionalTags = {
+    ...(Array.isArray(events) ? { events } : {}),
+    ...(typeof event === 'string' ? { event } : {}),
+  }
   writeFileSync(
     path.join(dir, 'meta.json'),
     JSON.stringify({
@@ -483,6 +495,7 @@ function writeFolderFixture(memoryDir, id, options = {}) {
       keywordsSource: scored ? 'heuristic' : 'pending',
       betaSource: scored ? 'default' : 'pending',
       stats: { messages: messages.length, chars: text.length, tokens: 10 },
+      ...optionalTags,
     }),
   )
   let index = { version: 1, updatedAt: Date.now(), nextCounter: 1, folders: [] }
@@ -492,7 +505,20 @@ function writeFolderFixture(memoryDir, id, options = {}) {
     index = { version: 1, updatedAt: Date.now(), nextCounter: 1, folders: [] }
   }
   index.folders = (index.folders ?? []).filter((folder) => folder.id !== id)
-  index.folders.push({ id, createdAt, alpha, beta, keywords, chars: text.length, tokens: 10, messageCount: 1, title: text, scored, rescorePending })
+  index.folders.push({
+    id,
+    createdAt,
+    alpha,
+    beta,
+    keywords,
+    chars: text.length,
+    tokens: 10,
+    messageCount: 1,
+    title: text,
+    scored,
+    rescorePending,
+    ...optionalTags,
+  })
   writeFileSync(path.join(memoryDir, 'index.json'), JSON.stringify(index))
 }
 
@@ -539,8 +565,8 @@ test('start() registers the memory-tasks section and the memory_judge + memory_r
     const plugin = new RofmPlugin(ctx, makeOverrides(path.join(dir, 'memory')))
     plugin.start()
 
-    // --- prompt sections: recall block + memory-scoring tasks (v1.1 layout)
-    assert.equal(capture.sections.length, 2, 'two system prompt sections are registered')
+    // --- prompt sections: recall block + memory-scoring tasks + memory rules
+    assert.equal(capture.sections.length, 3, 'three system prompt sections are registered')
     const recallSection = sectionOf(capture, 'dsh-rofm:recall')
     assert.ok(recallSection, 'recall section registered')
     assert.equal(recallSection.order, 100)
@@ -551,9 +577,17 @@ test('start() registers the memory-tasks section and the memory_judge + memory_r
     assert.equal(tasks.order, 101)
     assert.equal(tasks.interpolate, false)
     assert.equal(typeof tasks.text, 'function')
+    // v1.5.0: the memory-usage rules section is registered unconditionally; with
+    // `rules.enabled=false` its text provider returns the empty string.
+    const rules = sectionOf(capture, 'dsh-rofm:memory-rules')
+    assert.ok(rules, 'memory-rules section registered')
+    assert.equal(rules.order, 102)
+    assert.equal(rules.interpolate, false)
+    assert.equal(typeof rules.text, 'function')
     // The text providers read the session from context.agent.session.
     assert.equal(recallSection.text({ agent: { session } }), '')
     assert.equal(tasks.text({ agent: { session } }), '')
+    assert.equal(rules.text({ agent: { session } }), '', 'rules.enabled=false keeps the section text empty')
 
     // --- tool definitions (contract §2.1/§I5)
     assert.equal(capture.tools.length, 3, 'memory_judge, memory_recall and memory_image are registered')
@@ -587,23 +621,29 @@ test('start() registers the memory-tasks section and the memory_judge + memory_r
     assert.equal(tool.parameters.properties.updates.type, 'array')
     const item = tool.parameters.properties.updates.items
     assert.deepEqual(item.required, ['id'])
-    // The core update fields stay stable; the v1.4.0 event constraint may add an
-    // optional `event` string (tools-lib), so it is excluded from the exact set
-    // and asserted separately when present.
-    const itemKeys = Object.keys(item.properties).filter((key) => key !== 'event').sort()
-    assert.deepEqual(itemKeys, ['alpha', 'beta', 'id', 'keep', 'keywords', 'reason'])
+    // The core update fields stay stable; v1.4.0 added the optional legacy
+    // `event` string and v1.5.0 the locations/persons/events arrays.
+    const itemKeys = Object.keys(item.properties).sort()
+    assert.deepEqual(itemKeys, ['alpha', 'beta', 'event', 'events', 'id', 'keep', 'keywords', 'locations', 'persons', 'reason'])
     assert.equal(item.properties.alpha.type, 'number')
     assert.equal(item.properties.beta.type, 'number')
     assert.equal(item.properties.keep.type, 'boolean')
     assert.equal(item.properties.keywords.type, 'array')
-    if ('event' in item.properties) {
-      assert.equal(item.properties.event.type, 'string', 'memory_judge accepts an optional event tag')
-      assert.match(item.properties.event.description ?? '', /事件/)
+    assert.equal(item.properties.event.type, 'string', 'memory_judge accepts the legacy event shorthand')
+    assert.match(item.properties.event.description ?? '', /事件/)
+    for (const field of ['locations', 'persons', 'events']) {
+      assert.equal(item.properties[field].type, 'array', `${field} is a v1.5.0 tag array`)
+      assert.deepEqual(item.properties[field].items, { type: 'string' }, `${field} holds strings`)
+      assert.match(item.properties[field].description ?? '', /地点|人物|事件/, `${field} has a rubric description`)
     }
     assert.deepEqual(tool.output.schema.properties.updated.items, { type: 'string' })
     assert.deepEqual(tool.output.schema.properties.kept.items, { type: 'string' })
     assert.equal(tool.output.schema.properties.rejected.items.type, 'object')
     assert.equal(tool.output.schema.properties.warnings.items.type, 'string')
+    // v1.5.0 output additions (old fields stay untouched).
+    assert.equal(tool.output.schema.properties.eventStats.properties.candidates.type, 'number')
+    assert.equal(tool.output.schema.properties.tagStats.properties.events.type, 'number')
+    assert.equal(tool.output.schema.properties.eventMergeCandidates.type, 'array')
     assert.equal(tool.timeoutMs, 5000)
     assert.equal(tool.isConcurrencySafe(), false)
     // Rendered text summary (not the raw JSON) is what the model reads back.
@@ -824,6 +864,69 @@ test('turn end archives the early context as pending folders and replaces it wit
   })
 })
 
+test('v1.5.4: context.json stores each message time; recall title labels archive vs event time', async () => {
+  await withTempDirAsync(async (dir) => {
+    const memoryDir = path.join(dir, 'memory')
+    // Event days are fixed in April while the archive wall clock is today: a
+    // createdAt anchor would be visibly wrong, so this test proves the adapter
+    // stores the messages' own logical times and the recall renderer uses them.
+    const eventDay = Date.parse('2026-04-15T01:00:00Z') // 09:00 Asia/Shanghai, Wednesday
+    const session = new FakeSession({ id: 'session-message-time', contextWindow: 1000 })
+    appendSystem(session)
+    for (let index = 0; index < 12; index += 1) {
+      const userTime = eventDay + index * 60 * 60 * 1000
+      session.append(
+        'user/message',
+        userMessage(`u-time-${index}`, `第${index}轮：昨天讨论的 docker 端口参数 ${index} 再确认一下。`),
+        { surfaceOp: 'append' },
+      )
+      session.events.at(-1).time = userTime
+      session.append(
+        'assistant/message',
+        { turn: 1, step: 1, message: assistantMessage(`a-time-${index}`, `收到，第 ${index} 轮。`), stream: [] },
+        { surfaceOp: 'append' },
+      )
+      session.events.at(-1).time = userTime + 1000
+    }
+    const { ctx, capture } = makeContext(session)
+    const plugin = new RofmPlugin(ctx, makeOverrides(memoryDir))
+    plugin.start()
+    await plugin.compressWithEscalation(session, 1, plugin.currentConfig(), 'test')
+
+    const folders = readIndexFile(memoryDir).folders
+    assert.ok(folders.length >= 1, 'archiving wrote at least one folder')
+    for (const folder of folders) {
+      const context = JSON.parse(readFileSync(path.join(memoryDir, folder.id, 'context.json'), 'utf8'))
+      assert.ok(context.messages.length > 0)
+      // Every archived message keeps its own event time (v1.5.4 requirement):
+      // `messageAnchorMs` then never has to fall back to the folder createdAt.
+      for (const message of context.messages) {
+        assert.ok(Number.isFinite(message.time), `context.json message must carry time: ${JSON.stringify(message)}`)
+        assert.ok(message.time >= eventDay && message.time < eventDay + 12 * 60 * 60 * 1000, 'time is the source event time')
+      }
+      const meta = readMeta(memoryDir, folder.id)
+      assert.equal(meta.eventTimeSource, 'messages')
+      assert.equal(meta.eventStart, Math.min(...context.messages.map((message) => message.time)))
+      assert.equal(meta.eventEnd, Math.max(...context.messages.map((message) => message.time)) + 1)
+    }
+
+    // Score the folders, then recall through the adapter's real prompt section.
+    await judgeAllPending(memoryDir, capture, session, { keywords: ['docker', '端口', '部署'] })
+    const keyword = readIndexFile(memoryDir).folders[0].keywords[0]
+    plugin.onInboxInserted({ agent: { id: 'session-message-time', session }, message: userMessage('u-recall', `${keyword} docker 端口是什么？`) })
+    const block = recallText(capture, session)
+    assert.ok(block.includes('记忆回忆'), block.slice(0, 120))
+    // Title: archive time explicitly labelled, event time in the parentheses.
+    assert.match(block, /### 回忆 1 · 归档于 \d{4}-\d{2}-\d{2} 周[一二三四五六日] \d{2}:\d{2}（事件时间 2026-04-15 周三）/, block.slice(0, 400))
+    assert.ok(!block.includes('（事件时间 2026-11'), 'the archive date is never rendered as the event date')
+    // Relative phrases are annotated from each message's own event time (04-15
+    // -> 昨天 = 04-14), not from the archive date.
+    assert.ok(block.includes('昨天(2026-04-14)'), `annotation must use message.time, got: ${block.slice(0, 600)}`)
+    // The computable form also appends the time-caliber rule to the preamble.
+    assert.ok(block.includes('归档于 X'), 'the time-caliber rule is part of the computable block')
+  })
+})
+
 test('archiving never calls the model, even when a model service is present', async () => {
   await withTempDirAsync(async (dir) => {
     const memoryDir = path.join(dir, 'memory')
@@ -897,6 +1000,14 @@ test('user message with matching keywords injects recalled context before thinki
     const recall = readStatsEvents(memoryDir).filter((event) => event.type === 'recall').at(-1)
     assert.ok(Number.isFinite(recall.addedPercentOfContext), 'addedPercentOfContext recorded')
     assert.ok(recall.addedChars > 0, 'addedChars recorded')
+    // v1.5.5: the adapter's recall-block event forwards the high-relevance
+    // guarantee telemetry so stats.jsonl shows whether a guaranteed pick happened.
+    const blockEvent = readStatsEvents(memoryDir).filter((event) => event.type === 'recall-block').at(-1)
+    assert.ok(blockEvent, 'recall-block telemetry written')
+    assert.equal(typeof blockEvent.highRelevanceEnabled, 'boolean')
+    assert.equal(Number.isFinite(Number(blockEvent.highRelevanceCandidates)), true)
+    assert.equal(Number.isFinite(Number(blockEvent.highRelevancePicks)), true)
+    assert.equal(Number.isFinite(Number(blockEvent.highRelevanceReplaced)), true)
 
     const first = await plugin.onPreStep({ agent: { session }, turn: 1, step: 1 }, async () => ({ kind: 'enter', messages: [] }))
     assert.equal(first.startsRequestSeries, true, 'first pre-step after recall starts a new series')
@@ -1213,10 +1324,10 @@ test('recalled context is re-injected after a host restart without a new user me
 // "记忆评分任务" section (contract §4, §9.2.4)
 // ---------------------------------------------------------------------------
 
-test('memory-tasks section lists pending folders with title, summary and the rubric', async () => {
+test('memory-tasks section lists pending folders with title, full conversation and the rubric (v1.5.4)', async () => {
   await withTempDirAsync(async (dir) => {
     const memoryDir = path.join(dir, 'memory')
-    const { session, capture } = await archiveConversation(memoryDir)
+    const { session, capture, plugin } = await archiveConversation(memoryDir)
     const index = readIndexFile(memoryDir)
     const text = tasksText(capture, session)
     assert.ok(text.includes('## 记忆评分任务（dsh-rofm）'), text.slice(0, 100))
@@ -1230,26 +1341,65 @@ test('memory-tasks section lists pending folders with title, summary and the rub
     for (const folder of index.folders) {
       assert.ok(text.includes(`id=${folder.id}`), 'lists the pending folder id')
       assert.ok(text.includes('标题='), 'shows a title')
-      assert.ok(text.includes('摘要='), 'shows a bounded summary')
     }
+    // v1.5.4: the item carries the archived conversation body (non-dialogue
+    // messages are filtered), not the old 160-char summary. The full-body marker
+    // assertions live in scoring-pressure (a wide window is needed there).
+    assert.ok(text.includes('原文：'), 'shows the archived conversation body')
+    assert.ok(!text.includes('摘要='), 'the bounded summary is gone')
     assert.ok(text.includes('评分口径：'))
     assert.ok(text.includes('- α（0.01~1）'))
     assert.ok(text.includes('用户明确表达的喜好/厌恶/习惯/长期偏好'), 'α rubric includes user preference (I1)')
     assert.ok(text.includes('- β（-10~10）'))
-    assert.ok(text.includes('- keywords（3~8 个）'))
-    // v1.4.0 event constraint (contract §6.2): the rubric teaches the model to
-    // tag each memory with the event it belongs to.
-    assert.ok(text.includes('- event（可选但建议）'), 'rubric lists the event scoring rule')
+    assert.ok(text.includes('- keywords（3~16 个）'))
+    // v1.4.0/v1.5.0 tag rubric (contract §6.2/§6.10): the judge is the only place
+    // a memory gets its event/location/person tags. The wording is owned by
+    // lib/plugin.js, so assert the stable semantic fragments.
+    assert.match(text, /events（可选但建议/, 'rubric lists the (multi-)event scoring rule')
     assert.ok(text.includes('寒暄问候、一次性闲聊、纯过程日志给「空」'), 'rubric explains what is NOT an event')
     assert.ok(text.includes('同一事件在全库内用同一个标签'), 'rubric requires a stable event label')
-    assert.ok(text.indexOf('- keywords（3~8 个）') < text.indexOf('- event（可选但建议）'), 'event rule follows keywords')
+    assert.match(text, /locations\/persons|locations（可选但建议）/, 'rubric lists the location scoring rule')
+    assert.match(text, /persons/, 'rubric lists the person scoring rule')
+    assert.match(text, /时间标签由系统按.*原文自动换算/, 'rubric says time tags are computed by the system')
+    assert.match(text, /不会自动归并/, 'rubric explains the event-merge approval')
+    assert.ok(text.indexOf('- keywords（3~16 个）') < text.indexOf('events（可选但建议'), 'event rule follows keywords')
+    // v1.5.5: the keyword bullet also carries the density/coverage/re-check rules
+    // and the assistant's own words requirement.
+    for (const phrase of [
+      'keywords 要象征本条记忆里发生的所有事',
+      '信息密度低给少量',
+      '信息密度高可给更多',
+      '复查 persons/locations/events 是否都已写进 keywords',
+      '助手自己说过的话（称呼约定、承诺、规则、决定）',
+      // v1.5.6: multi-topic coverage rule (compact clause in the keywords bullet)
+      '多话题记忆必须覆盖每个话题的关键事实',
+      '每个话题至少 1 个独立可检索关键词',
+      '不得只写主要话题',
+    ]) {
+      assert.ok(text.includes(phrase), `scoring rubric must carry ${phrase}`)
+    }
     assert.ok(text.includes('keep=true'))
-    // The summary is bounded, not the full body.
-    const summaryLine = text.split('\n').find((line) => line.includes('摘要='))
-    assert.ok(summaryLine.length < 400, 'summary is bounded')
     // The section reads the session from context.agent.session.
     const section = sectionOf(capture, 'dsh-rofm:memory-tasks')
     assert.equal(section.text({ agent: { session } }), text)
+
+    // v1.5.0: existing canonical event labels are listed so the model reuses one
+    // instead of creating a near-duplicate (an event merge now needs approval).
+    writeFolderFixture(memoryDir, 'mem-20260104T000000Z-0001', {
+      alpha: 0.6,
+      beta: 1,
+      keywords: ['星港', '灰度'],
+      events: ['日本旅行'],
+      text: '既有事件标签的引用记录',
+      createdAt: Date.now() - 60_000,
+    })
+    plugin.engineFor(session, plugin.currentConfig()).reload()
+    const withEvents = tasksText(capture, session)
+    assert.ok(
+      withEvents.includes('### 已有事件标签（同一事件请复用，不要另造近义标签）'),
+      'the task block lists the existing canonical event labels',
+    )
+    assert.ok(withEvents.includes('日本旅行（1）'), 'each existing label is listed with its memory count')
   })
 })
 
@@ -1378,23 +1528,44 @@ test('memory-tasks section is empty with no work and nudges when a recall block 
 // v1.4.0 event constraint: adapter-side rubric + empty-recall hint (contract §7)
 // ---------------------------------------------------------------------------
 
-test('memory-tasks rubric teaches the event scoring rule (v1.4.0 event constraint)', async () => {
+test('memory-tasks rubric teaches the v1.5.0 event/location/person scoring rules', async () => {
   await withTempDirAsync(async (dir) => {
     const memoryDir = path.join(dir, 'memory')
     const { session, capture } = await archiveConversation(memoryDir)
     const text = tasksText(capture, session)
-    const eventLine = text.split('\n').find((line) => line.startsWith('- event（可选但建议）'))
-    assert.ok(eventLine, `the rubric has an event line, got: ${JSON.stringify(text.split('\n').filter((line) => line.startsWith('- ')))}`)
-    // The exact wording is the contract §6.2 rubric (owned by this adapter).
-    assert.ok(eventLine.includes('这次对话围绕的事件/主题'), 'defines an event')
-    assert.ok(eventLine.includes('一次旅行、一个工作项目、一次方案评审或决定线程、一段持续排查的故障'), 'gives representative examples')
-    assert.ok(eventLine.includes('用简短名词短语命名'), 'requires a short noun phrase')
-    assert.ok(eventLine.includes('寒暄问候、一次性闲聊、纯过程日志给「空」'), 'excludes greetings/chatter/process logs')
-    assert.ok(eventLine.includes('同一事件在全库内用同一个标签'), 'requires a store-wide stable label')
-    // Ordering: α/β/keywords first, then event, then the keep guidance.
+
+    // The rubric wording is owned by lib/plugin.js; assert the semantic contract
+    // instead of one exact line (v1.5.0 may fold rules into one compact line).
+    assert.match(text, /events（可选但建议/, 'the rubric has an events scoring rule')
+    for (const phrase of [
+      '这次对话围绕的事件/主题',
+      '一次旅行、一个工作项目、一次方案评审或决定线程、一段持续排查的故障',
+      '用简短名词短语命名',
+      '寒暄问候、一次性闲聊、纯过程日志给「空」',
+      '同一事件在全库内用同一个标签',
+    ]) {
+      assert.ok(text.includes(phrase), `the events rule must mention: ${phrase}`)
+    }
+    assert.match(text, /events 可多个|一条记忆可以属于多个事件/, 'states the v1.5.0 multi-event rule')
+    // v1.5.0 location/person rules (explicit tags only; "家" is a valid place).
+    assert.match(text, /locations/, 'the rubric has a locations scoring rule')
+    assert.match(text, /persons/, 'the rubric has a persons scoring rule')
+    assert.ok(text.includes('明确出现'), 'locations/persons must be explicit in the archived text')
+    assert.match(text, /「家」「小明(的)?家」|小明家/, 'home-like places are independent locations')
+    // Time tags are computed deterministically by the archive path, not the model.
+    assert.match(text, /时间标签由系统按.*原文自动换算/, 'the rubric says the system computes time tags')
+    assert.ok(text.includes('不需要'), 'the model is told not to submit time fields')
+    // Keywords must cover the tag names, otherwise tag recall cannot hit them.
+    assert.match(text, /keywords 必须覆盖|keywords 里请包含/, 'the rubric requires keywords to cover tag names')
+    // v1.5.0 no-silent-merge: a near-duplicate stays a candidate until approved.
+    assert.ok(text.includes('不会自动归并'), 'the rubric says a similar event is not merged automatically')
+    assert.match(text, /已有标签重新提交|重新提交一次/, 're-submitting the existing label approves the merge')
+
+    // Ordering: α/β/keywords first, then the event tag rule, then the keep guidance
+    // last (the compact v1.5.0 tag line must not drift above keywords).
     const indexOf = (needle) => text.indexOf(needle)
-    assert.ok(indexOf('- keywords（3~8 个）') < indexOf('- event（可选但建议）'), 'event comes after keywords')
-    assert.ok(indexOf('- event（可选但建议）') < indexOf('无法判断或不需要修改时'), 'event comes before the keep guidance')
+    assert.ok(indexOf('- keywords（3~16 个）') < indexOf('events（可选但建议'), 'the event rule comes after keywords')
+    assert.ok(indexOf('事件归并') < indexOf('无法判断或不需要修改时'), 'the keep guidance stays last')
   })
 })
 
@@ -1843,7 +2014,7 @@ test('plugin registers only disposables (no timers/processes)', async () => {
       ['memory_image', 'memory_judge', 'memory_recall'],
       'all model-facing tools are registered',
     )
-    assert.equal(capture.sections.length, 2, 'two prompt sections (recall + memory-tasks)')
+    assert.equal(capture.sections.length, 3, 'three prompt sections (recall + memory-tasks + memory-rules)')
     assert.equal(plugin.listenerCount?.() ?? 0, 0)
   })
 })
@@ -1945,6 +2116,12 @@ test('re-archiving drops the oldest recalled memories, marks rescorePending and 
     if (remainingPercent > 0) assert.ok(applied.length >= 1, 'remaining share runs the plain archival pass')
     else assert.equal(applied.length, 0, 'plain archival deferred to the next pre-step')
 
+    // v1.6.0: the pending-scoring rubric grew (the persons pronoun-disambiguation
+    // rule); judge the freshly archived pending folders first so the re-review
+    // list is not truncated by the pending list's share of the task-block budget
+    // (both lists render into the same fixed-size system-prompt block).
+    await judgeAllPending(memoryDir, capture, session)
+
     // Re-archived memories appear in the review list for the current model.
     const tasks = tasksText(capture, session)
     assert.ok(tasks.includes('待复核'), 'review section appears')
@@ -1960,6 +2137,11 @@ test('re-archived memories can be re-judged or kept, clearing the review flag', 
     assert.ok(rearchive, 're-archive telemetry exists')
     const removedIds = rearchive.removedIds
     assert.ok(removedIds.length > 0)
+
+    // v1.6.0: the pending-scoring rubric grew (the persons pronoun-disambiguation
+    // rule); judge the freshly archived pending folders first so this re-review
+    // list is not truncated by the pending list's share of the task-block budget.
+    await judgeAllPending(memoryDir, capture, session)
 
     // The review list names every re-archived id with its current α/β.
     const tasksBefore = tasksText(capture, session)
@@ -2828,7 +3010,7 @@ test('D-01: duplicate ids in one memory_judge batch apply in order (last value w
   })
 })
 
-test('D-02: near-identical event labels in one batch merge into one canonical label', async () => {
+test('D-02: near-identical event labels in one batch are candidates, not an automatic merge', async () => {
   await withTempDirAsync(async (dir) => {
     const memoryDir = path.join(dir, 'memory')
     // Two pending folders (the judge only needs meta/index + context on disk).
@@ -2839,14 +3021,30 @@ test('D-02: near-identical event labels in one batch merge into one canonical la
     const plugin = new RofmPlugin(ctx, makeOverrides(memoryDir))
     plugin.start()
     const result = await executeJudge(capture, session, [
-      { id: 'mem-ev-1', alpha: 0.5, beta: 1, keywords: ['日本', '旅行', '行程'], event: '日本旅行' },
-      { id: 'mem-ev-2', alpha: 0.5, beta: 1, keywords: ['日本', '旅行', '酒店'], event: '日本 旅行' },
+      { id: 'mem-ev-1', alpha: 0.5, beta: 1, keywords: ['日本', '旅行', '行程'], events: ['日本旅行'] },
+      { id: 'mem-ev-2', alpha: 0.5, beta: 1, keywords: ['日本', '旅行', '酒店'], events: ['日本 旅行'] },
     ])
-    assert.equal(result.eventStats.assigned, 1, 'the first label defines the canonical event')
-    assert.equal(result.eventStats.merged, 1, 'the second label is merged inside the same batch')
-    assert.equal(readMeta(memoryDir, 'mem-ev-1').event, '日本旅行')
+    assert.equal(readMeta(memoryDir, 'mem-ev-1').event, '日本旅行', 'the first label defines the canonical event')
+    // v1.5.0: the second label sees the batch-local canonical label (D-02) but
+    // keeps its own spelling — merging now needs the model's approval.
+    assert.equal(result.eventStats.assigned, 2, 'both updates are reported (the second one as a candidate)')
+    assert.equal(result.eventStats.merged, 0, 'nothing is merged silently')
+    assert.equal(result.eventStats.candidates, 1, 'the near-duplicate is reported as a candidate')
+    assert.equal(readMeta(memoryDir, 'mem-ev-2').event, '日本 旅行', 'the submitted spelling is kept')
+    assert.deepEqual(readMeta(memoryDir, 'mem-ev-2').events, ['日本 旅行'])
+    assert.deepEqual(
+      result.eventMergeCandidates.map((item) => ({ submitted: item.submitted, existing: item.existing })),
+      [{ submitted: '日本 旅行', existing: '日本旅行' }],
+      'the batch-local canonical label is offered as the merge candidate',
+    )
+    assert.ok(result.warnings.some((warning) => warning.startsWith('event-candidate:')), 'the candidate is reported to the model')
+    assert.ok(!result.warnings.some((warning) => warning.startsWith('event-merged:')), 'approval mode never merges silently')
+
+    // Re-submitting the existing canonical label approves the merge.
+    const approved = await executeJudge(capture, session, [{ id: 'mem-ev-2', events: ['日本旅行'] }])
+    assert.equal(approved.eventStats.merged, 1, 'the approved merge is counted')
     assert.equal(readMeta(memoryDir, 'mem-ev-2').event, '日本旅行', 'both folders carry one canonical label')
-    assert.ok(result.warnings.some((warning) => warning.includes('event-merged')), 'the merge is reported')
+    assert.deepEqual(readMeta(memoryDir, 'mem-ev-2').events, ['日本旅行'])
   })
 })
 

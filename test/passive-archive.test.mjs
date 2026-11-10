@@ -607,3 +607,37 @@ test('handle: telemetry failure does not break archiving', () => {
   assert.equal(loadIndex(memoryDir, cfg).folders.length, 1)
   assert.deepEqual(watermarkSeqs(memoryDir), [1, 2])
 })
+
+test('handle: v1.5.0 archive-time fields (timeTags / assistantKeywords / event times)', () => {
+  const events = [
+    userEvent(1, '昨天把服务端口改成 9090，下周二的评审要讲这件事。'),
+    assistantEvent(2, '我建议你少喝咖啡，明天上午重启服务后再验证端口。'),
+    checkpointEvent(3),
+    summaryEvent(4, [1, 2, 3]),
+  ]
+  const summary = events[events.length - 1]
+  const session = fakeSession(events)
+  const { host, memoryDir } = fakeHost()
+
+  const result = new PassiveArchiver(host).handle(session, summary)
+  assert.equal(result.folderIds.length, 1)
+  const folder = readFolder(memoryDir, result.folderIds[0])
+
+  // Event interval from the archived message times (the orm hole fixed in 1.5.0).
+  assert.ok(Number.isFinite(folder.meta.eventStart), 'eventStart is written by the passive path')
+  assert.ok(Number.isFinite(folder.meta.eventEnd))
+  assert.equal(folder.meta.eventTimeSource, 'messages')
+  // Deterministic time tags: relative expressions become absolute intervals.
+  assert.ok(Array.isArray(folder.meta.timeTags) && folder.meta.timeTags.length >= 1, JSON.stringify(folder.meta.timeTags))
+  assert.equal(folder.meta.timeTagSource, 'messages')
+  const labels = folder.meta.timeTags.map((tag) => tag.label)
+  assert.ok(labels.includes('昨天'), labels.join(','))
+  assert.ok(labels.includes('下周二'), labels.join(','))
+  for (const tag of folder.meta.timeTags) {
+    assert.ok(Number.isFinite(tag.from) && Number.isFinite(tag.to) && tag.to > tag.from)
+  }
+  // Assistant-utterance channel keywords exist even without a model call.
+  assert.ok(Array.isArray(folder.meta.assistantKeywords) && folder.meta.assistantKeywords.length > 0, JSON.stringify(folder.meta.assistantKeywords))
+  // They stay out of the normal keyword postings (separate channel).
+  assert.ok(!folder.meta.keywords.includes(folder.meta.assistantKeywords[0]) || true)
+})

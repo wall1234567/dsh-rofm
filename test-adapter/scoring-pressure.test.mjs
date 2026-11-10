@@ -309,10 +309,12 @@ function writeFolder(memoryDir, id, options = {}) {
     scored = true,
     rescorePending = false,
     messages = null,
+    events = null,
   } = options
   const dir = path.join(memoryDir, id)
   mkdirSync(dir, { recursive: true })
   const body = Array.isArray(messages) && messages.length > 0 ? messages : [{ role: 'user', content: text }]
+  const optionalTags = Array.isArray(events) ? { events } : {}
   writeFileSync(path.join(dir, 'context.json'), JSON.stringify({ version: 1, id, createdAt, messages: body }))
   writeFileSync(
     path.join(dir, 'meta.json'),
@@ -328,6 +330,7 @@ function writeFolder(memoryDir, id, options = {}) {
       rescorePending,
       pendingSince: scored ? undefined : createdAt,
       stats: { messages: body.length, chars: text.length, tokens: 10 },
+      ...optionalTags,
     }),
   )
   let index = { version: 1, updatedAt: Date.now(), nextCounter: 1, folders: [] }
@@ -350,6 +353,7 @@ function writeFolder(memoryDir, id, options = {}) {
     scored,
     rescorePending,
     pendingSince: scored ? undefined : createdAt,
+    ...optionalTags,
   })
   writeFileSync(path.join(memoryDir, 'index.json'), JSON.stringify(index))
 }
@@ -403,8 +407,62 @@ test('task block is capped by min(scoring.taskMaxTokens, window*scoring.taskBudg
   const plugin2 = new RofmPlugin(ctx2, makeOverrides(memoryDir, { scoring: { taskMaxTokens: 400, taskBudgetPercent: 15 } }))
   plugin2.start()
   const text2 = tasksText(capture2, session)
-  assert.ok(estimateTokens(text2) <= 400 + 60, `taskMaxTokens binds (got ${estimateTokens(text2)} tokens)`)
+  // F-05-01: the compact fallback is part of the measured block, so the strict
+  // invariant also holds here (the old assertion allowed 60 tokens of slack).
+  assert.ok(estimateTokens(text2) <= 400, `taskMaxTokens binds (got ${estimateTokens(text2)} tokens)`)
   assert.ok(text2.includes('任务区块预算不足'), 'a too-small budget degrades to the compact notice')
+}))
+
+test('task block with event.showExisting labels stays within the P0-1 budget (F-05-01)', withTempDir(async (dir) => {
+  const memoryDir = path.join(dir, 'memory')
+  mkdirSync(memoryDir, { recursive: true })
+  // 24 DISTINCT 60-char canonical event labels (the v1.5.0 「已有事件标签」 list).
+  const eventLabel = (index) => `${'事'.repeat(56)}${String(index).padStart(4, '0')}`
+  for (let index = 0; index < 24; index += 1) {
+    writeFolder(memoryDir, `mem-tag-${String(index).padStart(2, '0')}`, {
+      events: [eventLabel(index)],
+      text: `event label holder ${index}`,
+      alpha: 0.6,
+      createdAt: Date.now() - 7200_000 + index,
+    })
+  }
+  // Plus a backlog so the per-item lists fill whatever the labels leave over.
+  for (let index = 0; index < 30; index += 1) {
+    writePending(memoryDir, `mem-budget-label-${String(index).padStart(3, '0')}`, {
+      createdAt: Date.now() - 60_000 - index,
+      text: `PENDING-LABEL-${String(index).padStart(3, '0')} ${'甲'.repeat(280)}`,
+    })
+  }
+  const patch = {
+    scoring: { includeLegacy: false, taskMaxTokens: 12000, taskBudgetPercent: 15 },
+    event: { showExisting: true, showExistingLimit: 24 },
+  }
+  // 12000 window: the label list fits and must still be within the 1800 budget.
+  const wideSession = new FakeSession({ id: 'session-budget-labels-wide', contextWindow: 12000 })
+  appendSystem(wideSession)
+  const wide = makeContext(wideSession)
+  const widePlugin = new RofmPlugin(wide.ctx, makeOverrides(memoryDir, patch))
+  widePlugin.start()
+  const wideText = tasksText(wide.capture, wideSession)
+  const wideBudget = Math.min(12000, 12000 * 0.15) // 1800 tokens
+  assert.ok(wideText.includes('### 已有事件标签（同一事件请复用，不要另造近义标签）'), wideText.slice(0, 400))
+  assert.ok(
+    estimateTokens(wideText) <= wideBudget,
+    `window=12000: the whole block including the event-label list stays <= ${wideBudget} (got ${estimateTokens(wideText)})`,
+  )
+
+  // 8000 window: the label list no longer fits; the block degrades instead of
+  // overshooting the 1200-token budget by +75% (the pre-fix behaviour).
+  const narrowSession = new FakeSession({ id: 'session-budget-labels-narrow', contextWindow: 8000 })
+  appendSystem(narrowSession)
+  const narrow = makeContext(narrowSession)
+  const narrowPlugin = new RofmPlugin(narrow.ctx, makeOverrides(memoryDir, patch))
+  narrowPlugin.start()
+  const narrowText = tasksText(narrow.capture, narrowSession)
+  assert.ok(
+    estimateTokens(narrowText) <= 1200,
+    `window=8000: the task block stays within the 1200-token budget (got ${estimateTokens(narrowText)})`,
+  )
 }))
 
 test('task block lists only current-era pending by default (scoring.includeLegacy)', withTempDir(async (dir) => {
@@ -515,7 +573,7 @@ test('pending task items show content type and waiting age', withTempDir(async (
   assert.match(text, /id=mem-user-0001 · 类型=user · 已等待 刚刚/, text)
 }))
 
-test('pending task summary shows QQ tool-result conversation, not raw JSON (v1.4.3)', withTempDir(async (dir) => {
+test('pending task body shows the QQ tool-result conversation, not raw JSON (v1.4.3/v1.5.4)', withTempDir(async (dir) => {
   const memoryDir = path.join(dir, 'memory')
   mkdirSync(memoryDir, { recursive: true })
   // The Derpyu bridge answers qq_get_unread_messages with serializeModelData(...):
@@ -541,15 +599,18 @@ test('pending task summary shows QQ tool-result conversation, not raw JSON (v1.4
   const plugin = new RofmPlugin(ctx, makeOverrides(memoryDir))
   plugin.start()
   const text = tasksText(capture, session)
-  const line = text.split('\n').find((entry) => entry.includes('id=mem-qq-json-0001'))
-  assert.ok(line, `pending item is listed: ${text.slice(0, 400)}`)
-  assert.ok(line.includes('摘要=私聊：我决定以后所有项目都用 python'), line)
-  assert.equal(line.includes('"messageId"'), false, 'JSON field names must not reach the model')
-  // The folder now carries the conversation, so it is not process-log-only.
-  assert.ok(line.includes('类型=decision'), line)
+  const head = text.split('\n').find((entry) => entry.includes('id=mem-qq-json-0001'))
+  assert.ok(head, `pending item is listed: ${text.slice(0, 400)}`)
+  // The JSON tool result carries real conversation, so its dialogue is rendered
+  // in the full-text body (v1.5.4: no 160-char summary anymore).
+  assert.ok(head.includes('类型=decision'), head)
+  assert.ok(text.includes('原文：'), text.slice(0, 500))
+  assert.ok(text.includes('私聊：我决定以后所有项目都用 python'), 'the conversation inside the JSON is rendered')
+  assert.ok(text.includes('assistant: 好的，记下了。'), 'the rest of the conversation follows')
+  assert.equal(text.includes('"messageId"'), false, 'JSON field names must not reach the model')
 }))
 
-test('pending task summary never splits an emoji at the 160-code-unit window (v1.4.4)', withTempDir(async (dir) => {
+test('pending task full body never leaves a lone surrogate (v1.4.4/v1.5.4)', withTempDir(async (dir) => {
   const memoryDir = path.join(dir, 'memory')
   mkdirSync(memoryDir, { recursive: true })
   // `user: ` plus 153 ASCII puts the emoji's high surrogate on unit 159; the
@@ -568,20 +629,71 @@ test('pending task summary never splits an emoji at the 160-code-unit window (v1
   const plugin = new RofmPlugin(ctx, makeOverrides(memoryDir))
   plugin.start()
   const text = tasksText(capture, session)
-  const line = text.split('\n').find((entry) => entry.includes('id=mem-surrogate-0001'))
-  assert.ok(line, text.slice(0, 400))
-  assert.ok(line.includes('摘要=user: AAAA'), line)
+  assert.ok(text.includes('原文：'), text.slice(0, 300))
+  assert.ok(text.includes('AAAA'), text.slice(0, 400))
+  assert.ok(text.includes(emoji), 'the full body keeps the emoji intact')
   assert.equal(hasLoneSurrogate(text), false, 'system-prompt text must be well-formed UTF-16')
   // The exact defect: JSON.stringify of an unpaired surrogate emits this escape
   // and the DeepSeek Messages API rejects the request with 400.
   assert.equal(JSON.stringify(text).includes(`${String.fromCharCode(92)}ud83e`), false)
 }))
 
-test('pending task content type stays tool when no readable conversation exists', withTempDir(async (dir) => {
+test('pending task body is the full conversation, not the old 160-char summary (v1.5.4)', withTempDir(async (dir) => {
+  const memoryDir = path.join(dir, 'memory')
+  mkdirSync(memoryDir, { recursive: true })
+  // The tail marker sits far beyond the old 160-char preview window, so finding
+  // it in the task section proves the full body is rendered.
+  const longText = `FULL-BEGIN-${'乙'.repeat(260)}-FULL-END-MARKER`
+  writePending(memoryDir, 'mem-full-body-0001', {
+    createdAt: Date.now() - 3600_000,
+    text: longText,
+    messages: [
+      { role: 'user', content: longText },
+      { role: 'assistant', content: '收到，我记下了。' },
+    ],
+  })
+  const session = new FakeSession({ id: 'session-full-body', contextWindow: 20000 })
+  appendSystem(session)
+  const { ctx, capture } = makeContext(session)
+  const plugin = new RofmPlugin(ctx, makeOverrides(memoryDir))
+  plugin.start()
+  const text = tasksText(capture, session)
+  assert.ok(text.includes('原文：'), text.slice(0, 300))
+  assert.ok(text.includes('FULL-END-MARKER'), 'full conversation body, not the 160-char summary')
+  assert.ok(text.includes('user: FULL-BEGIN-'), 'role prefixes are kept')
+  assert.ok(text.includes('assistant: 收到，我记下了。'), 'the whole conversation is rendered')
+  assert.ok(text.length > longText.length, 'the task section really contains the full body')
+}))
+
+test('pending task body drops non-conversation messages (v1.5.4)', withTempDir(async (dir) => {
+  const memoryDir = path.join(dir, 'memory')
+  mkdirSync(memoryDir, { recursive: true })
+  writePending(memoryDir, 'mem-filtered-0001', {
+    createdAt: Date.now() - 3600_000,
+    text: 'FIXTURE',
+    messages: [
+      { role: 'user', content: '我喜欢深色主题，以后都用深色。' },
+      { role: 'tool', content: 'RAW-TOOL-OUTPUT-MUST-NOT-REACH-THE-JUDGE' },
+      { role: 'assistant', content: '记下了，以后都用深色主题。' },
+    ],
+  })
+  const session = new FakeSession({ id: 'session-filtered', contextWindow: 20000 })
+  appendSystem(session)
+  const { ctx, capture } = makeContext(session)
+  const plugin = new RofmPlugin(ctx, makeOverrides(memoryDir))
+  plugin.start()
+  const text = tasksText(capture, session)
+  assert.ok(text.includes('user: 我喜欢深色主题，以后都用深色。'), text.slice(0, 400))
+  assert.ok(text.includes('assistant: 记下了，以后都用深色主题。'))
+  assert.equal(text.includes('RAW-TOOL-OUTPUT-MUST-NOT-REACH-THE-JUDGE'), false, 'pure tool output is not real conversation')
+}))
+
+test('pending task body flags a folder with no real conversation (v1.5.4)', withTempDir(async (dir) => {
   const memoryDir = path.join(dir, 'memory')
   mkdirSync(memoryDir, { recursive: true })
   // A truncated JSON tool payload cannot be parsed into conversation: the folder
-  // must keep the legacy summary and the legacy "tool" label (no regression).
+  // keeps the legacy "tool" label and now says explicitly that there is no real
+  // dialogue to score (v1.5.4 drops non-conversation messages from the body).
   const truncated = '{"id":"task-2","revision":1,"subject":"阶段A-1: engine/recall-index.js'
   writePending(memoryDir, 'mem-tool-truncated-0001', {
     text: truncated,
@@ -594,10 +706,10 @@ test('pending task content type stays tool when no readable conversation exists'
   const plugin = new RofmPlugin(ctx, makeOverrides(memoryDir))
   plugin.start()
   const text = tasksText(capture, session)
-  const line = text.split('\n').find((entry) => entry.includes('id=mem-tool-truncated-0001'))
-  assert.ok(line, text.slice(0, 400))
-  assert.ok(line.includes('类型=tool'), line)
-  assert.ok(line.includes(`摘要=tool: ${truncated.slice(0, 40)}`), line)
+  const head = text.split('\n').find((entry) => entry.includes('id=mem-tool-truncated-0001'))
+  assert.ok(head, text.slice(0, 400))
+  assert.ok(head.includes('类型=tool'), head)
+  assert.ok(text.includes('（无真实对话内容：纯工具输出 / 协议消息，按过程日志评分）'), text.slice(0, 500))
 }))
 
 test('re-review body renders QQ tool-result JSON readably (v1.4.3)', withTempDir(async (dir) => {
@@ -637,16 +749,18 @@ test('re-review entries are truncated to the task-block budget instead of growin
     messages: [{ role: 'user', content: `LONG-BODY-BEGIN-${'甲'.repeat(4000)}-LONG-BODY-END` }],
     rescorePending: true,
   })
-  const session = new FakeSession({ id: 'session-rescore-budget', contextWindow: 4000 })
+  const session = new FakeSession({ id: 'session-rescore-budget', contextWindow: 5000 })
   appendSystem(session)
   const { ctx, capture } = makeContext(session)
   const plugin = new RofmPlugin(ctx, makeOverrides(memoryDir))
   plugin.start()
   const text = tasksText(capture, session)
-  const budget = Math.min(12000, 4000 * 0.15) // 600 tokens
+  const budget = Math.min(12000, 5000 * 0.15) // 750 tokens (v1.5.5 rubric grew a little)
   assert.ok(text.includes('待复核的已召回记忆'), 'the re-review section is still rendered')
   assert.ok(text.includes('受任务区块预算限制，原文已截断'), 'the full body is truncated to fit the budget')
-  assert.ok(estimateTokens(text) <= budget * 1.35, `task block stays bounded (got ${estimateTokens(text)} tokens for a ${budget}-token budget)`)
+  // F-05-01: the rendered block is re-checked against the strict P0-1 budget
+  // (the v1.5.0 audit fix removed the old 1.35x allowance for estimate rounding).
+  assert.ok(estimateTokens(text) <= budget, `task block stays bounded (got ${estimateTokens(text)} tokens for a ${budget}-token budget)`)
 }))
 
 test('P0-1: the task block alone can never reach the compress trigger', withTempDir(async (dir) => {

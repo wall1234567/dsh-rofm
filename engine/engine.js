@@ -22,13 +22,22 @@ import {
     validateConfig,
 } from './config.js'
 import { commitCompression, planCompression } from './compress.js'
-import { buildEventIndex, resolveEventQuery } from './event-index.js'
+import { buildEventIndex, normalizeEventLabel, resolveEventQuery } from './event-index.js'
 import { buildRecallBlock, loadRecallAdditions, recall as runRecall } from './recall.js'
+import {
+    buildTagIndex,
+    buildTimeTagIndex,
+    normalizeTagQuery,
+    resolveTagQuery,
+    resolveTimeTagIds,
+} from './tag-index.js'
+import { detectQueryTimes } from './relative-time.js'
 import {
     buildRecallIndex,
     countCandidates,
     deserializeLanes,
     emptyLanes,
+    isAssistantSeed,
     lanesFingerprint,
     PAGINATE_MAX_K,
     querySeeds,
@@ -138,10 +147,18 @@ function uniqueCandidateCounts(index, seeds, options = {}) {
   const alphaFloor = Number.isFinite(minAlpha) ? Math.min(1, Math.max(0, minAlpha)) : 0
   const timeIds = options.timeIds instanceof Set ? options.timeIds : null
   const eventIds = options.eventIds instanceof Set ? options.eventIds : null
+  // v1.5.0 audit (F-02-05): the location/person tag filter and the time-tag
+  // filter are counted separately so `tagFiltered` no longer swallows the
+  // time-tag exclusions (telemetry keeps a real `timeTagFiltered`).
+  const tagIds = options.tagIds instanceof Set ? options.tagIds : null
+  const timeTagIds = options.timeTagIds instanceof Set ? options.timeTagIds : null
+  const constrainIds = options.constrainIds instanceof Set ? options.constrainIds : null
   const seen = new Set()
   let all = 0
   let inWindow = 0
   let inEvent = 0
+  let inEventTag = 0
+  let inTag = 0
   for (const seed of Array.isArray(seeds) ? seeds : []) {
     const posting = postings.get(seed)
     if (!Array.isArray(posting)) continue
@@ -156,9 +173,14 @@ function uniqueCandidateCounts(index, seeds, options = {}) {
       inWindow += 1
       if (eventIds && !eventIds.has(entry.id)) continue
       inEvent += 1
+      if (tagIds && !tagIds.has(entry.id)) continue
+      inEventTag += 1
+      if (timeTagIds && !timeTagIds.has(entry.id)) continue
+      if (constrainIds && !constrainIds.has(entry.id)) continue
+      inTag += 1
     }
   }
-  return { all, inWindow, inEvent }
+  return { all, inWindow, inEvent, inEventTag, inTag }
 }
 
 export class MemoryEngine {
@@ -196,6 +218,10 @@ export class MemoryEngine {
     this._eventIndexCache = undefined
     /** v1.4.0 deterministic recall index (wave-2). */
     this._recallIndexCache = undefined
+    /** v1.5.0 in-memory location/person/event tag index (derived, never persisted). */
+    this._tagIndexCache = undefined
+    /** v1.5.0 in-memory time-tag index (derived from folder.timeTags). */
+    this._timeTagIndexCache = undefined
     /** v1.4.0 in-memory FAIR-DRI lane state when the caller does not pass one. */
     this._lanes = undefined
     this._round = 0
@@ -271,6 +297,8 @@ export class MemoryEngine {
     this._timeIndexCache = undefined
     this._eventIndexCache = undefined
     this._recallIndexCache = undefined
+    this._tagIndexCache = undefined
+    this._timeTagIndexCache = undefined
     this._lanes = undefined
     this._round = 0
     this._loaded = false
@@ -379,6 +407,31 @@ export class MemoryEngine {
     const mode = this.recallMode(opts)
     const timePlan = this._recallTimePlan(opts)
     const eventPlan = this._recallEventPlan(opts)
+    // v1.5.0: location/person tag constraint + fuzzy-time (time-tag) constraint.
+    const tagPlan = this._recallTagPlan(opts)
+    const timeTagPlan = this._recallTimeTagPlan(opts)
+    // v1.5.0 audit (F-04-03): `recall.assistantSaid.enabled === false` is a hard
+    // rollback switch: the automatic path already honoured it, but an explicit
+    // `memory_recall assistantSaid:true` used to bypass it. Gate the request once
+    // here so every downstream path (and the echoed `assistantSaid`/"effective"
+    // flags) agree with what was actually searched.
+    const assistantSaidCfg = this.cfg?.recall?.assistantSaid && typeof this.cfg.recall.assistantSaid === 'object'
+      ? this.cfg.recall.assistantSaid
+      : {}
+    const assistantSaid = opts.assistantSaid === true && assistantSaidCfg.enabled !== false
+    // Pre-filter intersection of the non-time/non-event constraints (the time
+    // ladder and the event filter keep their own counters/semantics).
+    const restrictIds = (() => {
+      const parts = []
+      if (tagPlan.enforced === true && tagPlan.ids instanceof Set) parts.push(tagPlan.ids)
+      if (timeTagPlan.enforced === true && timeTagPlan.ids instanceof Set) parts.push(timeTagPlan.ids)
+      if (parts.length === 0) return null
+      const out = new Set(parts[0])
+      for (let index = 1; index < parts.length; index += 1) {
+        for (const id of out) if (!parts[index].has(id)) out.delete(id)
+      }
+      return out
+    })()
     // Pure browsing works in every mode (it is a lookup, not a recall decision):
     // `memory_recall` without keywords returns the folders inside the requested
     // time window and/or event, ordered by event start.
@@ -389,7 +442,9 @@ export class MemoryEngine {
       typeof userText === 'string' &&
       userText.trim().length === 0 &&
       ((timePlan.active === true && timePlan.enforced === true) ||
-        (eventPlan.active === true && eventPlan.enforced === true))
+        (eventPlan.active === true && eventPlan.enforced === true) ||
+        (tagPlan.active === true && tagPlan.enforced === true) ||
+        (timeTagPlan.active === true && timeTagPlan.enforced === true))
     // C-05: make the "normalized but not enforced" case explicit instead of
     // silently returning the whole library.
     if (typeof userText === 'string' && userText.trim().length === 0 && timePlan.active === true && timePlan.enforced !== true) {
@@ -415,16 +470,20 @@ export class MemoryEngine {
       const configuredFirstGenMax = Number.isFinite(Number(this.cfg?.recall?.firstGenMax))
         ? Math.max(0, Math.floor(Number(this.cfg.recall.firstGenMax)))
         : 10
+      const quota = Number.isFinite(Number(opts.quota)) ? Math.max(0, Math.floor(Number(opts.quota))) : configuredFirstGenMax
       result = this._browseRecall({
         index: this.recallIndex(),
         opts,
         timePlan,
         eventPlan,
+        tagPlan,
+        timeTagPlan,
+        restrictIds,
         context: ctx,
         offset: clampInt(opts.offset, 0, 1_000_000, 0),
         take: Number.isFinite(Number(opts.limit)) && Number(opts.limit) > 0
           ? Math.min(1000, Math.floor(Number(opts.limit)))
-          : configuredFirstGenMax,
+          : quota,
         warnings: [],
       })
     } else if (mode === 'legacy') {
@@ -438,6 +497,14 @@ export class MemoryEngine {
         mode,
         timePlan,
         eventPlan,
+        restrictIds,
+        quota: Number.isFinite(Number(opts.quota)) ? Math.max(0, Math.floor(Number(opts.quota))) : undefined,
+        clauses: Array.isArray(opts.clauses) ? opts.clauses : null,
+        assistantSaid,
+        // v1.5.0 audit (F-02-05): the per-kind filter id sets let the telemetry
+        // split `tagFiltered` (location/person) from `timeTagFiltered`.
+        tagIds: tagPlan.enforced === true && tagPlan.ids instanceof Set ? tagPlan.ids : null,
+        timeTagIds: timeTagPlan.enforced === true && timeTagPlan.ids instanceof Set ? timeTagPlan.ids : null,
         startedAt: typeof performance !== 'undefined' && performance && typeof performance.now === 'function' ? performance.now() : undefined,
       })
     }
@@ -455,13 +522,16 @@ export class MemoryEngine {
         // v1.4.0: first-generation filters (C(Q) ∩ W ∩ E).
         timeIds: timePlan.ids,
         eventIds: eventPlan.ids,
+        // v1.5.0: tag / time-tag constraints (legacy path keeps its probability
+        // semantics but honours the pre-filter, rollback parity is otherwise kept).
+        restrictIds,
       })
     }
     const stats = result.stats || {}
     const additions = Array.isArray(result.additions) ? result.additions : []
     // Time/event input warnings (ignored/failed/normalized) are part of the result
     // the adapter and the model tool surface; never drop them.
-    for (const plan of [timePlan, eventPlan]) {
+    for (const plan of [timePlan, eventPlan, tagPlan, timeTagPlan]) {
       if (Array.isArray(plan.warnings) && plan.warnings.length > 0) {
         result.warnings = [...(Array.isArray(result.warnings) ? result.warnings : []), ...plan.warnings]
       }
@@ -496,15 +566,28 @@ export class MemoryEngine {
     const matchedFolders = Number(stats.matchedFolders) || 0
     const timeFiltered = Number(stats.timeFiltered) || 0
     const eventFiltered = Number(stats.eventFiltered) || 0
-    const preFilterCandidates = matchedFolders + timeFiltered + eventFiltered
-    const afterTimeFilter = matchedFolders + eventFiltered
+    const tagFiltered = Number(stats.tagFiltered) || 0
+    const timeTagFiltered = Number(stats.timeTagFiltered) || 0
+    const preFilterCandidates = matchedFolders + timeFiltered + eventFiltered + tagFiltered + timeTagFiltered
+    const afterTimeFilter = matchedFolders + eventFiltered + tagFiltered + timeTagFiltered
     let missType = null
     if (pageItems.length === 0) {
       if (ambiguous) missType = 'event-ambiguous'
-      else if (result.browse === true) missType = timePlan.active ? 'time' : eventPlan.active ? 'event' : 'keyword'
-      else if (preFilterCandidates === 0) missType = 'keyword'
+      else if (result.browse === true) {
+        if (timePlan.active) missType = 'time'
+        else if (eventPlan.active) missType = 'event'
+        else if (timeTagPlan.active) missType = 'time-tag'
+        else if (tagPlan.active) missType = 'tag'
+        else missType = 'keyword'
+      } else if (preFilterCandidates === 0) missType = 'keyword'
       else if (timePlan.active && afterTimeFilter === 0) missType = 'time'
-      else if (eventPlan.active && eventPlan.enforced && matchedFolders === 0) missType = 'event'
+      // v1.5.0 audit (F-02-04): a filter may only own the miss when it actually
+      // dropped candidates ("who caused the empty result"), never merely because
+      // the result is empty. The filters apply in time → event → tag → time-tag
+      // order, so the deepest filter that still had candidates to drop wins.
+      else if (timeTagPlan.active && timeTagPlan.enforced && timeTagFiltered > 0 && matchedFolders === 0) missType = 'time-tag'
+      else if (tagPlan.active && tagPlan.enforced && tagFiltered > 0 && matchedFolders === 0) missType = 'tag'
+      else if (eventPlan.active && eventPlan.enforced && eventFiltered > 0 && matchedFolders === 0) missType = 'event'
     }
 
     const eventInfo = eventPlan.active && eventPlan.visible !== false
@@ -515,6 +598,24 @@ export class MemoryEngine {
           count: eventPlan.count,
           candidates: eventPlan.candidates,
           enforced: eventPlan.enforced,
+        }
+      : null
+
+    const tagInfo = tagPlan.active && tagPlan.visible !== false
+      ? {
+          status: tagPlan.status,
+          requested: tagPlan.requested,
+          matched: tagPlan.matched,
+          unknown: tagPlan.unknown,
+          enforced: tagPlan.enforced,
+        }
+      : null
+    const timeTagInfo = timeTagPlan.active && timeTagPlan.visible !== false
+      ? {
+          status: timeTagPlan.status,
+          labels: timeTagPlan.labels,
+          windows: timeTagPlan.windows,
+          enforced: timeTagPlan.enforced,
         }
       : null
 
@@ -565,6 +666,18 @@ export class MemoryEngine {
       eventStatus: eventInfo ? eventInfo.status : 'absent',
       eventLabel: eventInfo ? eventInfo.label : null,
       eventFiltered,
+      // --- v1.5.0 tag / time-tag telemetry ---
+      tagStatus: tagInfo ? tagInfo.status : 'absent',
+      tagFiltered,
+      timeTagStatus: timeTagInfo ? timeTagInfo.status : 'absent',
+      timeTagLabels: timeTagInfo ? timeTagInfo.labels : [],
+      timeTagFiltered,
+      // v1.5.0 audit (F-04-03/F-04-05): echo only what the engine *actually*
+      // searched. The legacy path never scans the assistant channel and a
+      // disabled switch was already gated, so `opts.assistantSaid` alone is not
+      // evidence (it used to make `assistantInfo.effective` claim a search).
+      assistantSaid: result.assistantSaid === true,
+      clauseCount: Array.isArray(result.clauseInfo) ? result.clauseInfo.length : 0,
       timeWindow: timeWindow ? { from: timeWindow.from, to: timeWindow.to, level: timeWindow.level, widenedTo: timeWindow.widenedTo } : null,
       offset,
       limit,
@@ -588,6 +701,13 @@ export class MemoryEngine {
       page,
       timeWindow,
       eventInfo,
+      tagInfo,
+      timeTagInfo,
+      clauseInfo: Array.isArray(result.clauseInfo) ? result.clauseInfo : null,
+      // `assistantSaid` is the *effective* flag (did the engine search the
+      // assistant channel?); the tool derives `assistantInfo.requested` from
+      // the caller's argument and `effective` from this flag.
+      assistantSaid: result.assistantSaid === true,
       missType,
       mode,
       lanes: result.lanes,
@@ -623,6 +743,12 @@ export class MemoryEngine {
       const normalized = normalizeTimeQuery({ timeFrom: opts.timeFrom, timeTo: opts.timeTo, granularity: opts.granularity }, this.cfg, Date.now())
       const timeIndex = this.timeIndex()
       const query = queryTimeIndex(timeIndex, normalized, this.cfg)
+      // v1.5.0: time-tagged folders are filtered by their absolute time tags, not
+      // by eventStart/eventEnd ("回忆侧优先用标签"); untagged folders keep the
+      // historical interval semantics.
+      const preferredIds = this._applyTimeTagPreference(query.ids, normalized.from, normalized.to)
+      query.ids = preferredIds
+      query.count = preferredIds instanceof Set ? preferredIds.size : query.count
       // A caller-provided explicit *range* (both endpoints) is a HARD window: it
       // must not silently widen, because "no memory in that range" is exactly the
       // signal the model needs ("the time may be wrong — ask the user"). A single
@@ -671,6 +797,10 @@ export class MemoryEngine {
     const normalized = normalizeTimeQuery({ timeFrom: opts.timeFrom, timeTo: opts.timeTo, granularity: opts.granularity }, this.cfg, now)
     const timeIndex = this.timeIndex()
     const query = queryTimeIndex(timeIndex, normalized, this.cfg)
+    // v1.5.0 audit (F-02-06): SPEC §6.8 promises the same normalization + hit set
+    // as `engine.recall`, so the time-tag priority predicate must be applied here
+    // too — time-tagged folders are matched by their tags, not eventStart/End.
+    const preferredIds = this._applyTimeTagPreference(query.ids, normalized.from, normalized.to)
     return {
       normalized,
       from: normalized.from,
@@ -679,9 +809,9 @@ export class MemoryEngine {
       granularity: normalized.granularity,
       requested: normalized.requested,
       widenedTo: null,
-      enforced: query.ids !== null,
-      hits: query.count,
-      ids: query.ids,
+      enforced: preferredIds !== null,
+      hits: preferredIds instanceof Set ? preferredIds.size : query.count,
+      ids: preferredIds,
       timezone: typeof timeCfg.timezone === 'string' ? timeCfg.timezone : '',
       warnings: Array.isArray(normalized.warnings) ? normalized.warnings : [],
     }
@@ -704,6 +834,200 @@ export class MemoryEngine {
   }
 
   /**
+   * v1.5.0: the in-memory location/person/event tag index. Derived from
+   * `index.folders` on demand (never persisted, the folder meta is the single
+   * truth), rebuilt lazily when the loaded index or the tag caps change.
+   */
+  tagIndex() {
+    const refreshed = this._refresh()
+    const folders = Array.isArray(refreshed.index.folders) ? refreshed.index.folders : []
+    const keys = [
+      refreshed.mtimeMs,
+      refreshed.size ?? -1,
+      folders.length,
+      this.cfg?.location?.maxLabelLength ?? '',
+      this.cfg?.person?.maxLabelLength ?? '',
+      this.cfg?.event?.maxLabelLength ?? '',
+    ].join('|')
+    if (this._tagIndexCache && this._tagIndexCache.key === keys) return this._tagIndexCache.value
+    const value = buildTagIndex(folders, this.cfg)
+    this._tagIndexCache = { key: keys, value }
+    return value
+  }
+
+  /**
+   * v1.5.0: the in-memory time-tag index. Derived from `folder.timeTags`, which
+   * the archive path computes deterministically (engine/relative-time.js); it is
+   * never persisted as a second truth.
+   */
+  timeTagIndex() {
+    const refreshed = this._refresh()
+    const folders = Array.isArray(refreshed.index.folders) ? refreshed.index.folders : []
+    const key = `${refreshed.mtimeMs}|${refreshed.size ?? -1}|${folders.length}`
+    if (this._timeTagIndexCache && this._timeTagIndexCache.key === key) return this._timeTagIndexCache.value
+    const value = buildTimeTagIndex(folders, this.cfg)
+    this._timeTagIndexCache = { key, value }
+    return value
+  }
+
+  /**
+   * v1.5.0 "回忆侧优先用标签": for one absolute [from, to) window, folders that
+   * carry time tags are matched by their tags (eventStart/eventEnd ignored), the
+   * remaining folders keep the historical interval semantics.
+   *
+   * Returns `null` when the window is unusable / no constraint applies.
+   */
+  _timeIdsForWindow(from, to) {
+    const start = Number(from)
+    const end = Number(to)
+    if (!Number.isFinite(start) || !Number.isFinite(end) || !(end > start)) return null
+    try {
+      // Time-tag queries must work even when `time.mode` is 'index'/'off' (the
+      // timeTag group has its own mode): force the interval scan on.
+      const timeCfg = this.cfg?.time && typeof this.cfg.time === 'object' ? this.cfg.time : {}
+      const constrainCfg = { ...this.cfg, time: { ...timeCfg, mode: 'constrain' } }
+      const query = queryTimeIndex(this.timeIndex(), { from: start, to: end, level: 'day' }, constrainCfg)
+      return this._applyTimeTagPreference(query.ids, start, end)
+    } catch {
+      return null
+    }
+  }
+
+  /**
+   * v1.5.0: replace the interval filter of time-tagged folders with their time
+   * tags (conflict rule "回忆侧优先用标签"). Folders without tags are untouched.
+   */
+  _applyTimeTagPreference(ids, from, to) {
+    if (!(ids instanceof Set)) return ids
+    const ttCfg = this.cfg?.timeTag && typeof this.cfg.timeTag === 'object' ? this.cfg.timeTag : {}
+    if (ttCfg.mode !== 'constrain') return ids
+    const start = Number(from)
+    const end = Number(to)
+    if (!Number.isFinite(start) || !Number.isFinite(end) || !(end > start)) return ids
+    try {
+      const tagIndex = this.timeTagIndex()
+      if (!tagIndex || !(tagIndex.taggedIds instanceof Set) || tagIndex.taggedIds.size === 0) return ids
+      const tagIds = resolveTimeTagIds(tagIndex, [{ from: start, to: end }], this.cfg).ids
+      const corrected = new Set()
+      for (const id of ids) if (!tagIndex.taggedIds.has(id)) corrected.add(id)
+      for (const id of tagIds) corrected.add(id)
+      return corrected
+    } catch {
+      return ids
+    }
+  }
+
+  /**
+   * v1.5.0 tag constraint plan (location + person; events are resolved by
+   * `_recallEventPlan`). Multiple values of one kind are ORed, the kinds are
+   * ANDed. `ids === null` means "not constrained".
+   */
+  _recallTagPlan(options) {
+    const opts = options && typeof options === 'object' ? options : {}
+    const has = (key) => Object.prototype.hasOwnProperty.call(opts, key) && opts[key] !== undefined && opts[key] !== null
+    const inactive = {
+      active: false,
+      status: 'absent',
+      requested: { location: [], person: [], event: [] },
+      matched: { location: [], person: [], event: [] },
+      unknown: [],
+      ids: null,
+      enforced: false,
+      warnings: [],
+    }
+    if (!has('locations') && !has('persons')) return inactive
+    const locationCfg = this.cfg?.location && typeof this.cfg.location === 'object' ? this.cfg.location : {}
+    const personCfg = this.cfg?.person && typeof this.cfg.person === 'object' ? this.cfg.person : {}
+    if (locationCfg.mode === 'off' && personCfg.mode === 'off') {
+      return { ...inactive, active: true, status: 'off', warnings: ['recall: location/person arguments ignored because both modes are "off"'] }
+    }
+    try {
+      // `normalizeTagQuery` takes the singular kind keys (location/person/event).
+      const query = normalizeTagQuery({ location: opts.locations, person: opts.persons }, this.cfg)
+      const resolved = resolveTagQuery(this.tagIndex(), query, this.cfg)
+      const constrained = resolved.ids instanceof Set
+      return {
+        active: true,
+        visible: true,
+        status: resolved.status,
+        requested: resolved.requested,
+        matched: resolved.matched,
+        unknown: resolved.unknown,
+        ids: constrained ? resolved.ids : null,
+        enforced: constrained,
+        warnings: Array.isArray(resolved.warnings) ? resolved.warnings : [],
+      }
+    } catch (error) {
+      return { ...inactive, active: true, status: 'disabled', warnings: [`recall: tag query failed (${error && error.message ? error.message : error}); ignored`] }
+    }
+  }
+
+  /**
+   * v1.5.0 time-tag plan: a fuzzy time expression in the user message ("下周二",
+   * "昨天", …) or a model-submitted `timeText` is converted to absolute windows
+   * (engine/relative-time.js) and matched against the folders' time tags.
+   * Folders without time tags keep the interval semantics (`_timeIdsForWindow`).
+   */
+  _recallTimeTagPlan(options) {
+    const opts = options && typeof options === 'object' ? options : {}
+    const hasText = typeof opts.timeText === 'string' && opts.timeText.trim().length > 0
+    const inputWindows = Array.isArray(opts.timeTagWindows) ? opts.timeTagWindows : []
+    const inactive = { active: false, windows: [], ids: null, enforced: false, labels: [], warnings: [] }
+    if (!hasText && inputWindows.length === 0) return inactive
+    const ttCfg = this.cfg?.timeTag && typeof this.cfg.timeTag === 'object' ? this.cfg.timeTag : {}
+    if (ttCfg.mode === 'off') {
+      return { ...inactive, active: true, status: 'off', visible: false, warnings: ['recall: time-tag arguments ignored because timeTag.mode is "off"'] }
+    }
+    if (ttCfg.mode !== 'constrain') {
+      return { ...inactive, active: true, status: 'index', visible: true, warnings: ['recall: timeTag.mode is "index"; time tags are indexed but not enforced'] }
+    }
+    let rawWindows = inputWindows
+    if (hasText) {
+      try {
+        rawWindows = detectQueryTimes(opts.timeText, Date.now(), this.cfg)
+      } catch (error) {
+        return { ...inactive, active: true, status: 'disabled', warnings: [`recall: time-text parse failed (${error && error.message ? error.message : error}); ignored`] }
+      }
+    }
+    const windows = []
+    for (const item of Array.isArray(rawWindows) ? rawWindows : []) {
+      if (!item || typeof item !== 'object') continue
+      const from = Number(item.from)
+      const to = Number(item.to)
+      if (!Number.isFinite(from) || !Number.isFinite(to) || !(to > from)) continue
+      windows.push({ from, to, label: typeof item.label === 'string' ? item.label : '', granularity: typeof item.granularity === 'string' ? item.granularity : 'day' })
+      if (windows.length >= 8) break
+    }
+    if (windows.length === 0) {
+      return { ...inactive, active: true, status: 'empty', visible: true, warnings: ['recall: no time expression could be resolved from the submitted text'] }
+    }
+    const ids = new Set()
+    try {
+      for (const window of windows) {
+        const windowIds = this._timeIdsForWindow(window.from, window.to)
+        if (windowIds instanceof Set) for (const id of windowIds) ids.add(id)
+      }
+    } catch (error) {
+      return { ...inactive, active: true, status: 'disabled', windows, warnings: [`recall: time-tag query failed (${error && error.message ? error.message : error}); ignored`] }
+    }
+    return { active: true, visible: true, status: 'exact', windows, ids, enforced: true, labels: windows.map((window) => window.label), warnings: [] }
+  }
+
+  /** Effective per-round quota (v1.5.0 adaptive quota: complex questions get 20). */
+  recallQuota(analysis) {
+    const recallCfg = this.cfg?.recall && typeof this.cfg.recall === 'object' ? this.cfg.recall : {}
+    const base = Number.isFinite(Number(recallCfg.firstGenMax)) ? Math.max(0, Math.floor(Number(recallCfg.firstGenMax))) : 10
+    // v1.5.0 audit (F-04-04): `recall.firstGenMax=0` is the documented "recall
+    // disabled" kill switch (README/SPEC §6, B-05) and the 1.5.0 CHANGELOG does
+    // not change its semantics. The adaptive complex quota must never raise it.
+    if (base === 0) return 0
+    const adaptive = recallCfg.adaptiveQuota && typeof recallCfg.adaptiveQuota === 'object' ? recallCfg.adaptiveQuota : {}
+    if (adaptive.enabled === false || !analysis || analysis.complex !== true) return base
+    const complexQuota = Number.isFinite(Number(adaptive.complexQuota)) ? Math.max(1, Math.floor(Number(adaptive.complexQuota))) : 20
+    return Math.max(base, complexQuota)
+  }
+
+  /**
    * v1.4.0 event constraint: resolve the model-submitted `event` argument into a
    * folder-id filter (ANDed with any time window). Never throws; a bad value
    * degrades to "no constraint" + warning.
@@ -715,42 +1039,104 @@ export class MemoryEngine {
    */
   _recallEventPlan(options) {
     const opts = options && typeof options === 'object' ? options : {}
-    const hasInput = Object.prototype.hasOwnProperty.call(opts, 'event') && opts.event !== undefined && opts.event !== null
     const eventCfg = this.cfg?.event && typeof this.cfg.event === 'object' ? this.cfg.event : {}
     const inactive = {
       active: false,
       status: 'absent',
       requested: '',
       label: null,
+      labels: [],
       ids: null,
       candidates: [],
       count: null,
       enforced: false,
       warnings: [],
     }
-    if (!hasInput) return inactive
+    // v1.5.0: one recall may be constrained to several events (OR). The legacy
+    // single `event` string keeps working byte-for-byte for one label.
+    const submitted = []
+    if (Object.prototype.hasOwnProperty.call(opts, 'event') && opts.event !== undefined && opts.event !== null) submitted.push(opts.event)
+    if (opts.events !== undefined && opts.events !== null) {
+      if (Array.isArray(opts.events)) submitted.push(...opts.events)
+      else submitted.push(opts.events)
+    }
+    if (submitted.length === 0) return inactive
     if (eventCfg.mode === 'off') {
       return { ...inactive, active: true, status: 'off', visible: false, warnings: ['recall: event arguments ignored because event.mode is "off"'] }
     }
-    const submitted = typeof opts.event === 'string' ? opts.event : String(opts.event)
+    const labels = []
+    for (const raw of submitted) {
+      if (typeof raw !== 'string') continue
+      const label = normalizeEventLabel(raw, this.cfg)
+      if (label && !labels.includes(label)) labels.push(label)
+    }
+    if (labels.length === 0) return { ...inactive, active: true, status: 'empty', visible: true }
     try {
-      const resolved = resolveEventQuery(this.eventIndex(), submitted, this.cfg)
-      const constrained = eventCfg.mode === 'constrain' && (resolved.status === 'exact' || resolved.status === 'unknown')
-      let count = null
-      if (resolved.status === 'exact' && resolved.ids instanceof Set) count = resolved.ids.size
-      else if (resolved.status === 'unknown') count = 0
+      const index = this.eventIndex()
+      const parts = labels.map((label) => ({ label, resolved: resolveEventQuery(index, label, this.cfg) }))
+      const warnings = []
+      for (const part of parts) for (const warning of part.resolved.warnings || []) warnings.push(warning)
+      const similar = parts.filter((part) => part.resolved.status === 'similar')
+      // Ambiguity: never guess. Return every similar candidate so the model (or
+      // the user) can decide; nothing is enforced.
+      if (similar.length > 0) {
+        const candidates = []
+        for (const part of similar) {
+          for (const candidate of part.resolved.candidates || []) {
+            if (!candidates.some((item) => item.label === candidate.label)) candidates.push(candidate)
+          }
+        }
+        candidates.sort((left, right) => right.score - left.score || right.count - left.count || (left.label < right.label ? -1 : 1))
+        const maxCandidates = Number.isFinite(Number(eventCfg.similarity?.maxCandidates)) ? Number(eventCfg.similarity.maxCandidates) : 5
+        return {
+          active: true,
+          visible: true,
+          status: 'similar',
+          requested: labels.join('、'),
+          label: labels.length === 1 ? labels[0] : labels,
+          labels,
+          ids: null,
+          candidates: candidates.slice(0, Math.max(1, maxCandidates)),
+          count: null,
+          enforced: false,
+          warnings,
+        }
+      }
+      const exact = parts.filter((part) => part.resolved.status === 'exact')
+      const unknown = parts.filter((part) => part.resolved.status === 'unknown')
+      const constrained = eventCfg.mode === 'constrain' && (exact.length > 0 || unknown.length > 0)
+      let ids = null
+      if (constrained) {
+        ids = new Set()
+        for (const part of exact) for (const id of part.resolved.ids) ids.add(id)
+      }
+      // v1.5.0 audit (F-02-02): a non-similar resolution still carries the
+      // closest existing events (resolveEventQuery computed them; v1.4.4 passed
+      // them through). Dropping them made `renderEventUnknown`'s 「最接近的已有
+      // 事件」 hint unreachable for every unknown label.
+      const candidatePool = []
+      for (const part of parts) {
+        for (const candidate of Array.isArray(part.resolved.candidates) ? part.resolved.candidates : []) {
+          if (!candidate || typeof candidate.label !== 'string') continue
+          if (!candidatePool.some((item) => item.label === candidate.label)) candidatePool.push(candidate)
+        }
+      }
+      candidatePool.sort((left, right) => right.score - left.score || right.count - left.count || (left.label < right.label ? -1 : 1))
+      const maxCandidates = Number.isFinite(Number(eventCfg.similarity?.maxCandidates)) ? Number(eventCfg.similarity.maxCandidates) : 5
+      const status = exact.length > 0 ? 'exact' : unknown.length > 0 ? 'unknown' : 'disabled'
       return {
         active: true,
         visible: true,
-        status: resolved.status,
-        requested: resolved.requested,
-        label: resolved.label || null,
+        status,
+        requested: labels.join('、'),
+        label: labels.length === 1 ? labels[0] : labels,
+        labels,
         // `ids === null` means "not constrained" (empty/similar/disabled).
-        ids: constrained ? resolved.ids : null,
-        candidates: Array.isArray(resolved.candidates) ? resolved.candidates : [],
-        count,
+        ids,
+        candidates: candidatePool.slice(0, Math.max(1, maxCandidates)),
+        count: ids instanceof Set ? ids.size : null,
         enforced: constrained,
-        warnings: Array.isArray(resolved.warnings) ? resolved.warnings : [],
+        warnings,
       }
     } catch (error) {
       return {
@@ -786,6 +1172,11 @@ export class MemoryEngine {
     const timePlan = request.timePlan || { active: false, ids: null, enforced: false, normalized: null }
     const eventPlan = request.eventPlan || { active: false, ids: null, enforced: false }
     const eventIds = eventPlan.ids instanceof Set ? eventPlan.ids : null
+    // v1.5.0 tag/time-tag pre-filter (location/person/time tags).
+    const constrainIds = request.restrictIds instanceof Set ? request.restrictIds : null
+    // Per-kind id sets for the telemetry split (v1.5.0 audit, F-02-05).
+    const tagIds = request.tagIds instanceof Set ? request.tagIds : null
+    const timeTagIds = request.timeTagIds instanceof Set ? request.timeTagIds : null
     const mode = request.mode === 'deterministic' ? 'deterministic' : 'fair'
     const userText = typeof request.userText === 'string' ? request.userText : ''
 
@@ -805,9 +1196,60 @@ export class MemoryEngine {
     const configuredFirstGenMax = Number.isFinite(Number(recallCfg.firstGenMax))
       ? Math.max(0, Math.floor(Number(recallCfg.firstGenMax)))
       : 10
-    const take = requestedLimit ?? configuredFirstGenMax
+    const take = requestedLimit ?? (Number.isFinite(Number(request.quota)) ? Math.max(0, Math.floor(Number(request.quota))) : configuredFirstGenMax)
 
     const index = this.recallIndex()
+    // --- v1.5.0 multi-clause recall ----------------------------------------
+    // A user message with several clauses is searched per clause; every clause
+    // with candidates gets at least one slot while the rest of the quota keeps
+    // the global (whole-message) ranking. Clause coverage is best effort only
+    // when the quota is smaller than the number of clauses.
+    const assistantSaid = request.assistantSaid === true
+    // v1.5.0: `recall.assistantSaid.reserveSlots` slots of the quota are reserved
+    // for the assistant's own archived words when that channel is requested, so a
+    // "你说过…" question cannot be crowded out by ordinary keyword hits.
+    const assistantSaidCfg = recallCfg.assistantSaid && typeof recallCfg.assistantSaid === 'object' ? recallCfg.assistantSaid : {}
+    const configuredAssistantReserve = assistantSaid && assistantSaidCfg.enabled !== false
+      // v1.5.0 audit (F-04-02): clampInt(value, min, max, fallback) — the old call
+      // passed the fallback (8) as `max`, so every configured value was clamped to
+      // 0 and the reserved assistant pass was dead code.
+      ? clampInt(assistantSaidCfg.reserveSlots, 0, 8, 0)
+      : 0
+    const assistantReserveEffective = Math.min(configuredAssistantReserve, Math.max(0, take - 1))
+    // v1.5.5 high-relevance guaranteed quota (保底配额): a folder matching
+    // several distinct query keywords keeps a guaranteed slot even when the
+    // FAIR-DRI ranking would push it out of a small quota.
+    const highRelCfg = recallCfg.highRelevance && typeof recallCfg.highRelevance === 'object' ? recallCfg.highRelevance : {}
+    const highRelEnabled = highRelCfg.enabled !== false
+    const highRelMinMatches = clampInt(highRelCfg.minMatches, 1, 16, 2)
+    const highRelReserveSlots = clampInt(highRelCfg.reserveSlots, 0, 8, 2)
+    const clauseTexts = Array.isArray(request.clauses)
+      ? request.clauses.map((clause) => (typeof clause === 'string' ? clause.trim() : '')).filter((clause) => clause.length > 0)
+      : []
+    const useClauses = !paginate && clauseTexts.length > 1
+    const clauseSeeds = useClauses
+      ? clauseTexts.map((clause) => {
+          try {
+            return querySeeds(index, clause, cfg, { assistantSaid }).seeds
+          } catch {
+            return []
+          }
+        })
+      : []
+    const clauseHasCandidates = useClauses
+      ? clauseSeeds.map((seeds) => {
+          try {
+            return countCandidates(index, seeds, { minAlpha: opts.minAlpha, timeIds: null, eventIds, constrainIds }) > 0
+          } catch {
+            return false
+          }
+        })
+      : []
+    const reservedClauses = clauseHasCandidates.filter(Boolean).length
+    const reservedEffective = useClauses ? Math.min(reservedClauses, Math.max(0, take - assistantReserveEffective)) : 0
+    const mainTake = useClauses || assistantReserveEffective > 0
+      ? Math.max(1, take - reservedEffective - assistantReserveEffective)
+      : take
     const baseLanes = opts.lanes && typeof opts.lanes === 'object' && opts.lanes
       ? opts.lanes
       : this._lanes && typeof this._lanes === 'object'
@@ -878,9 +1320,15 @@ export class MemoryEngine {
         const timeIndex = this.timeIndex()
         for (const rung of timeFallbackLadder(timePlan.normalized, cfg)) {
           const query = queryTimeIndex(timeIndex, rung, cfg)
+          // v1.5.0 audit (F-LEAD-01/F-02-01): the "回忆侧优先用标签" rule must be
+          // applied to *every* widened rung too, not only to the requested window.
+          // Otherwise a tag-2020 memory whose eventStart happens to fall inside the
+          // rung is injected and the ladder stops early, hiding the memory that
+          // belongs to the wider window. `all` keeps ids=null (no constraint).
+          const preferredIds = this._applyTimeTagPreference(query.ids, rung.from, rung.to)
           attempts.push({
             // ids === null means "no constraint" (the `all` rung): never filter.
-            ids: query.ids,
+            ids: preferredIds,
             widenedTo: rung.widenedTo,
             level: rung.level,
           })
@@ -904,8 +1352,8 @@ export class MemoryEngine {
         const attempt = attempts[step]
         let candidates = 0
         try {
-          const seedList = querySeeds(index, userText, cfg).seeds
-          candidates = countCandidates(index, seedList, { minAlpha: opts.minAlpha, timeIds: attempt.ids, eventIds })
+          const seedList = querySeeds(index, userText, cfg, { assistantSaid }).seeds
+          candidates = countCandidates(index, seedList, { minAlpha: opts.minAlpha, timeIds: attempt.ids, eventIds, constrainIds })
         } catch {
           candidates = 0
         }
@@ -929,6 +1377,8 @@ export class MemoryEngine {
             minAlpha: opts.minAlpha,
             timeIds: attemptChosen.attempt.ids,
             eventIds,
+            constrainIds,
+            assistantSaid,
             k: pageWindow,
             paginate: true,
           })
@@ -938,7 +1388,7 @@ export class MemoryEngine {
       }
       chosen = { result: pageResult, attempt: attemptChosen.attempt }
     } else {
-      const k = requestedLimit === null && offset === 0 ? take : Math.min(2000, offset + take + 1)
+      const k = requestedLimit === null && offset === 0 ? mainTake : Math.min(2000, offset + take + 1)
       for (let step = 0; step < attempts.length; step += 1) {
         const attempt = attempts[step]
         const lanesForAttempt = deserializeLanes(laneSnapshot)
@@ -953,6 +1403,8 @@ export class MemoryEngine {
           minAlpha: opts.minAlpha,
           timeIds: attempt.ids,
           eventIds,
+          constrainIds,
+          assistantSaid,
           k,
           hops,
         })
@@ -972,8 +1424,98 @@ export class MemoryEngine {
     const attempt = chosen.attempt
     const selectStats = result.stats || {}
     const allPicks = Array.isArray(result.picks) ? result.picks : []
-    const pagePicks = allPicks.slice(offset, offset + take)
-    const pageHasMore = allPicks.length > offset + take
+    let finalPicks = allPicks
+    let finalLanes = result.lanes
+    let clauseInfo = null
+    let assistantPicked = 0
+    const assistantReservedIds = new Set()
+    let clauseGuaranteedIds = new Set()
+    // v1.5.0 reserved assistant-utterance pass ("你说过…"): the dedicated channel
+    // gets its reserved slots before the clause/leftover fill, so those memories
+    // are actually injected even when the main ranking is full.
+    if (assistantSaid && assistantReserveEffective > 0) {
+      const reserved = this._assistantReservePicks({
+        index,
+        userText,
+        opts,
+        round,
+        mode,
+        timeIds: attempt.ids,
+        eventIds,
+        constrainIds,
+        hops,
+        slots: assistantReserveEffective,
+        picks: finalPicks,
+        lanes: finalLanes,
+      })
+      if (reserved.lanes && typeof reserved.lanes === 'object') finalLanes = reserved.lanes
+      if (reserved.picks.length > 0) {
+        const merged = finalPicks.slice()
+        const seen = new Set(merged.map((pick) => pick.id))
+        for (const pick of reserved.picks) {
+          if (!pick || seen.has(pick.id)) continue
+          seen.add(pick.id)
+          merged.push(pick)
+        }
+        assistantPicked = merged.length - finalPicks.length
+        for (const pick of reserved.picks) if (pick && typeof pick.id === 'string') assistantReservedIds.add(pick.id)
+        finalPicks = merged
+      }
+    }
+    // v1.5.0 clause coverage: every clause with candidates gets one slot before
+    // the remaining quota is used for the global ranking.
+    if (useClauses) {
+      const coverage = this._clauseGuaranteePicks({
+        index,
+        userText,
+        clauses: clauseTexts,
+        clauseSeeds,
+        clauseHasCandidates,
+        opts,
+        round,
+        mode,
+        timeIds: attempt.ids,
+        eventIds,
+        constrainIds,
+        assistantSaid,
+        hops,
+        take,
+        picks: finalPicks,
+        lanes: finalLanes,
+        // The pre-round lane snapshot every clause pass must share (DESIGN §4.2);
+        // reusing `finalLanes` leaked the whole-message register into the clause
+        // slots (v1.5.0 audit F-04-01).
+        laneSnapshot,
+      })
+      finalPicks = coverage.picks
+      finalLanes = coverage.lanes || finalLanes
+      clauseInfo = coverage.clauseInfo
+      clauseGuaranteedIds = coverage.guaranteedIds instanceof Set ? coverage.guaranteedIds : new Set(Array.isArray(coverage.guaranteedIds) ? coverage.guaranteedIds : [])
+    }
+    // v1.5.5: high-relevance guaranteed quota runs after the FAIR-DRI, assistant
+    // and clause passes (so it cannot be crowded out) and before the page slice.
+    let highRelStats = { candidates: 0, picks: 0, replaced: 0 }
+    // `deterministic` mode is the pure-DRI research/rollback control: its oracle is
+    // the plain sigma top-k, so the fairness enhancement only runs in `fair` mode.
+    if (!paginate && mode === 'fair' && highRelEnabled && highRelReserveSlots > 0) {
+      const guarantee = this._highRelevanceGuarantee({
+        index,
+        userText,
+        opts,
+        timeIds: attempt.ids,
+        eventIds,
+        constrainIds,
+        take,
+        slots: highRelReserveSlots,
+        minMatches: highRelMinMatches,
+        picks: finalPicks,
+        protectedIds: new Set([...assistantReservedIds, ...clauseGuaranteedIds]),
+      })
+      finalPicks = guarantee.picks
+      highRelStats = guarantee.stats
+    }
+    const pagePicks = finalPicks.slice(offset, offset + take)
+    const pageHasMore = finalPicks.length > offset + take
 
     // --- load the folder bodies (same shape as the legacy path) -------------
     const picked = []
@@ -1041,19 +1583,29 @@ export class MemoryEngine {
     let candidatesAll = candidatesInWindow
     let timeFiltered = Number(selectStats.filteredByTime) || 0
     let eventFiltered = Number(selectStats.filteredByEvent) || 0
+    let tagFiltered = 0
+    let timeTagFiltered = 0
     try {
-      const seedList = querySeeds(index, userText, cfg).seeds
+      const seedList = querySeeds(index, userText, cfg, { assistantSaid }).seeds
       const counts = uniqueCandidateCounts(index, seedList, {
         minAlpha: opts.minAlpha,
         // B-07 (1.4.1): use the *chosen* ladder rung's window. Re-counting the
         // originally requested window made "returned 1, candidates 0" telemetry.
         timeIds: attempt.ids instanceof Set ? attempt.ids : null,
         eventIds,
+        // v1.5.0 audit (F-02-05): count the location/person tag filter and the
+        // time-tag filter separately; time-tag exclusions used to be folded into
+        // `tagFiltered`, leaving the documented `timeTagFiltered` a dead field.
+        tagIds,
+        timeTagIds,
+        constrainIds,
       })
       candidatesAll = counts.all
       timeFiltered = Math.max(0, counts.all - counts.inWindow)
       eventFiltered = Math.max(0, counts.inWindow - counts.inEvent)
-      candidatesInWindow = counts.inEvent
+      tagFiltered = Math.max(0, counts.inEvent - counts.inEventTag)
+      timeTagFiltered = Math.max(0, counts.inEventTag - counts.inTag)
+      candidatesInWindow = counts.inTag
     } catch {
       /* keep the selector counters when the recount fails */
     }
@@ -1108,8 +1660,23 @@ export class MemoryEngine {
       degraded: selectStats.degraded === true,
       timeFiltered,
       eventFiltered,
+      tagFiltered,
+      // v1.5.0 audit (F-02-05): real count of folders dropped by the time-tag
+      // preference (kept out of `tagFiltered` so the telemetry keys mean one
+      // thing each).
+      timeTagFiltered,
       filteredByAlpha: Number(selectStats.filteredByAlpha) || 0,
       categorySeeds: Array.isArray(selectStats.categorySeeds) ? selectStats.categorySeeds : [],
+      assistantSaid: assistantSaid === true,
+      assistantPicks: assistantPicked,
+      // v1.5.5 high-relevance guarantee telemetry (0 candidates/slots = inert).
+      highRelevanceEnabled: highRelEnabled,
+      highRelevanceMinMatches: highRelMinMatches,
+      highRelevanceReserveSlots: highRelReserveSlots,
+      highRelevanceCandidates: highRelStats.candidates,
+      highRelevancePicks: highRelStats.picks,
+      highRelevanceReplaced: highRelStats.replaced,
+      clauseCount: Array.isArray(clauseInfo) ? clauseInfo.length : 0,
       // B-03 (1.4.1): per-round character budget telemetry (null/0 = no drop).
       roundBudgetMaxChars: roundBudget.maxChars,
       roundBudgetDropped: roundBudget.dropped,
@@ -1120,9 +1687,9 @@ export class MemoryEngine {
     // Commit the winning lane state (the selector returns a normalized copy).
     // B-01: a paginated call never advances/writes back lane state — the pages
     // must be reproducible from the same snapshot on every request.
-    if (!paginate && result.lanes && typeof result.lanes === 'object') {
-      this._lanes = result.lanes
-      this._round = Number.isFinite(result.lanes.round) ? result.lanes.round : round
+    if (!paginate && finalLanes && typeof finalLanes === 'object') {
+      this._lanes = finalLanes
+      this._round = Number.isFinite(finalLanes.round) ? finalLanes.round : round
     }
     const hasMore = paginate ? pageHasMore : pageHasMore || result.hasMore === true
 
@@ -1130,7 +1697,9 @@ export class MemoryEngine {
       additions,
       stats,
       warnings,
-      lanes: paginate ? baseLanes : result.lanes,
+      lanes: paginate ? baseLanes : finalLanes,
+      clauseInfo,
+      assistantSaid: assistantSaid === true,
       // σ-ordered ids of C(Q)∩W: `engine.trimBlock` uses this set to trim
       // "not in the current query" entries first (plan §3.2.4).
       candidateIds: !paginate && Array.isArray(result.candidateIds) ? result.candidateIds : null,
@@ -1144,6 +1713,343 @@ export class MemoryEngine {
         hasMore,
       },
     }
+  }
+
+  /**
+   * v1.5.0 reserved assistant-utterance pass: search ONLY the assistant channel
+   * and return up to `slots` picks that are not already in `picks`.
+   *
+   * Feature-gated by `recall.assistantSaid.enabled` and the caller's
+   * `assistantSaid` request flag; a failure degrades to "no reserved picks"
+   * (never breaks the recall round).
+   *
+   * @param {{
+   *   index: object, userText: string, opts: object, round: number, mode: string,
+   *   timeIds: Set<string>|null, eventIds: Set<string>|null, constrainIds: Set<string>|null,
+   *   hops: number, slots: number, picks: object[], lanes: object,
+   * }} input
+   * @returns {{ picks: object[], lanes: object|null }}
+   */
+  _assistantReservePicks(input) {
+    const result = { picks: [], lanes: input.lanes }
+    try {
+      // v1.5.0 audit (F-04-02): same clampInt argument-order bug as the caller —
+      // `max` must be 8 and the fallback 0, otherwise the reserved pass is inert.
+      const slots = clampInt(input.slots, 0, 8, 0)
+      if (slots <= 0) return result
+      const pickedIds = new Set((Array.isArray(input.picks) ? input.picks : []).map((pick) => pick && pick.id).filter(Boolean))
+      const blockIds = new Set()
+      for (const id of toIdSet(input.opts?.blockIds)) blockIds.add(id)
+      for (const id of pickedIds) blockIds.add(id)
+      const reserved = selectRecall(input.index, input.userText, {
+        cfg: this.cfg,
+        lanes: input.lanes,
+        round: input.round,
+        mode: input.mode,
+        blockIds,
+        ledger: input.opts?.ledger,
+        excludeIds: input.opts?.excludeIds,
+        minAlpha: input.opts?.minAlpha,
+        timeIds: input.timeIds,
+        eventIds: input.eventIds,
+        constrainIds: input.constrainIds,
+        assistantSaid: true,
+        assistantOnly: true,
+        k: slots,
+        hops: input.hops,
+      })
+      if (reserved.lanes && typeof reserved.lanes === 'object') result.lanes = reserved.lanes
+      for (const pick of Array.isArray(reserved.picks) ? reserved.picks : []) {
+        if (!pick || pickedIds.has(pick.id)) continue
+        pickedIds.add(pick.id)
+        result.picks.push(pick)
+        if (result.picks.length >= slots) break
+      }
+    } catch {
+      // The reserved pass is an enhancement: never let it break the main recall.
+    }
+    return result
+  }
+
+  /**
+   * v1.5.0 multi-clause coverage: after the main (whole-message) selection,
+   * every clause whose seeds have candidates gets at least one dedicated slot
+   * (when the quota allows it); leftover quota tops the result back up with the
+   * global ranking. Returns the merged picks, the advanced lane state and one
+   * `clauseInfo` record per clause for the model-facing section.
+   *
+   * @param {{
+   *   index: object, userText: string, clauses: string[], clauseSeeds: string[][],
+   *   clauseHasCandidates: boolean[], opts: object, round: number, mode: string,
+   *   timeIds: Set<string>|null, eventIds: Set<string>|null, constrainIds: Set<string>|null,
+   *   assistantSaid: boolean, hops: number, take: number, picks: object[], lanes: object,
+   * }} input
+   * @returns {{ picks: object[], lanes: object|null, clauseInfo: object[] }}
+   */
+  _clauseGuaranteePicks(input) {
+    const {
+      index,
+      userText,
+      clauses,
+      clauseSeeds,
+      clauseHasCandidates,
+      opts,
+      round,
+      mode,
+      timeIds,
+      eventIds,
+      constrainIds,
+      assistantSaid,
+      hops,
+      take,
+    } = input
+    const picks = Array.isArray(input.picks) ? input.picks.slice() : []
+    let lanes = input.lanes
+    const pickedIds = new Set(picks.map((pick) => pick.id))
+    const guaranteedIds = new Set()
+    const seedsOf = (clauseAt) => new Set(Array.isArray(clauseSeeds[clauseAt]) ? clauseSeeds[clauseAt] : [])
+    const entryKeywords = (pick) => {
+      const at = index.byId instanceof Map ? index.byId.get(pick.id) : undefined
+      const entry = at === undefined ? null : index.entries[at]
+      return entry && Array.isArray(entry.keywords) ? entry.keywords : []
+    }
+    // A pick may only be attributed to a clause whose own seeds it matches.
+    const belongsToClause = (pick, seeds) => {
+      if (!pick || typeof pick.id !== 'string' || seeds.size === 0) return false
+      for (const keyword of entryKeywords(pick)) {
+        if (seeds.has(keyword)) return true
+      }
+      return false
+    }
+    const hitIdsOf = (clauseAt) => {
+      const seeds = seedsOf(clauseAt)
+      const ids = []
+      for (const pick of picks) {
+        if (belongsToClause(pick, seeds)) ids.push(pick.id)
+      }
+      return ids
+    }
+    const clauseInfo = clauses.map((text, clauseAt) => {
+      const seeds = Array.isArray(clauseSeeds[clauseAt]) ? clauseSeeds[clauseAt] : []
+      const ids = hitIdsOf(clauseAt)
+      return {
+        index: clauseAt,
+        text,
+        keywords: seeds.slice(0, 8),
+        quota: 0,
+        hits: ids.length,
+        // v1.5.0 audit (F-04-06): the ids actually attributed to this clause, so
+        // the caller can recompute the real hit count after a budget trim.
+        ids,
+        status: seeds.length === 0 ? 'no-keywords' : ids.length > 0 ? 'hit' : 'none',
+      }
+    })
+    // v1.5.0 audit (F-04-01): a per-clause pass must NOT reuse the lane state the
+    // whole-message selection just advanced — its `pendingHigh` register holds
+    // memories deferred for *other* clauses, and the register lane injects them
+    // without checking the seeds. DESIGN §4.2: every clause selectRecall shares
+    // the same pre-round attempt lane snapshot (blockIds accumulate) and only the
+    // chosen attempt's lane state is committed, so these passes are throwaway.
+    const hasSnapshot = input.laneSnapshot && typeof input.laneSnapshot === 'object'
+    const clauseLanes = () => (hasSnapshot ? deserializeLanes(input.laneSnapshot) : lanes)
+    const extra = (clauseText, k) => {
+      if (k <= 0) return null
+      const blockIds = new Set()
+      for (const id of toIdSet(opts.blockIds)) blockIds.add(id)
+      for (const id of pickedIds) blockIds.add(id)
+      try {
+        return selectRecall(index, clauseText, {
+          cfg: this.cfg,
+          lanes: clauseLanes(),
+          round,
+          mode,
+          blockIds,
+          ledger: opts.ledger,
+          excludeIds: opts.excludeIds,
+          minAlpha: opts.minAlpha,
+          timeIds,
+          eventIds,
+          constrainIds,
+          assistantSaid: assistantSaid === true,
+          k,
+          hops,
+        })
+      } catch {
+        return null
+      }
+    }
+    // 1) Guarantee one slot for every uncovered clause that has candidates.
+    for (let clauseAt = 0; clauseAt < clauses.length; clauseAt += 1) {
+      if (picks.length >= take) break
+      if (!clauseHasCandidates[clauseAt]) continue
+      if (clauseInfo[clauseAt].hits > 0) continue
+      const seeds = seedsOf(clauseAt)
+      const result = extra(clauses[clauseAt], 1)
+      if (!result) {
+        clauseInfo[clauseAt].status = 'miss'
+        continue
+      }
+      let added = 0
+      for (const pick of Array.isArray(result.picks) ? result.picks : []) {
+        if (!pick || typeof pick.id !== 'string' || pickedIds.has(pick.id)) continue
+        // Never let a memory of another clause fill this clause's guaranteed slot.
+        if (!belongsToClause(pick, seeds)) continue
+        pickedIds.add(pick.id)
+        picks.push(pick)
+        added += 1
+      }
+      clauseInfo[clauseAt].quota = 1
+      clauseInfo[clauseAt].status = added > 0 ? 'hit' : 'miss'
+      if (added > 0) for (const pick of picks.slice(-added)) if (pick && typeof pick.id === 'string') guaranteedIds.add(pick.id)
+    }
+    // 2) Leftover quota: continue the global ranking (no clause left starved).
+    const leftover = take - picks.length
+    if (leftover > 0) {
+      const result = extra(userText, leftover)
+      if (result && result.lanes && typeof result.lanes === 'object' && !hasSnapshot) lanes = result.lanes
+      if (result) {
+        for (const pick of Array.isArray(result.picks) ? result.picks : []) {
+          if (!pick || typeof pick.id !== 'string' || pickedIds.has(pick.id)) continue
+          pickedIds.add(pick.id)
+          picks.push(pick)
+        }
+      }
+    }
+    // 3) Real per-clause attribution over the final page (main selection + the
+    // guaranteed slots + the leftover fill): `hits` is the number of injected
+    // picks that actually belong to the clause — never `max(1, …)` padding.
+    for (let clauseAt = 0; clauseAt < clauses.length; clauseAt += 1) {
+      const ids = hitIdsOf(clauseAt)
+      const record = clauseInfo[clauseAt]
+      record.ids = ids
+      record.hits = ids.length
+      if (record.status === 'no-keywords') continue
+      if (ids.length > 0) record.status = 'hit'
+      else if (record.quota > 0) record.status = 'miss'
+      else record.status = 'none'
+    }
+    return { picks, lanes, clauseInfo, guaranteedIds }
+  }
+
+  /**
+   * v1.5.5 high-relevance guaranteed quota (保底配额).
+   *
+   * A folder is "highly relevant" when it matches at least `minMatches`
+   * *distinct* query keywords. Up to `slots` such folders must survive the
+   * round: free slots are filled first; when the quota is already full the
+   * lowest-priority unprotected tail pick is replaced (the assistant-utterance
+   * and multi-clause guarantees are never evicted). Applies to the whole-message
+   * query (clause passes keep their own guarantee) and never to paginated calls
+   * (a guarantee would make page N depend on the live lane state).
+   *
+   * Best effort by design: a malformed index/query degrades to "no guarantee"
+   * and never breaks the recall round.
+   *
+   * @param {{
+   *   index: object, userText: string, opts: object,
+   *   timeIds: Set<string>|null, eventIds: Set<string>|null,
+   *   constrainIds: Set<string>|null, take: number, slots: number,
+   *   minMatches: number, picks: object[], protectedIds: Iterable<string>,
+   * }} input
+   * @returns {{ picks: object[], stats: { candidates: number, picks: number, replaced: number } }}
+   */
+  _highRelevanceGuarantee(input) {
+    const result = { picks: Array.isArray(input.picks) ? input.picks.slice() : [], stats: { candidates: 0, picks: 0, replaced: 0 } }
+    try {
+      const index = input.index || this.recallIndex()
+      const entries = Array.isArray(index.entries) ? index.entries : []
+      const postings = index.postings instanceof Map ? index.postings : null
+      const slots = clampInt(input.slots, 0, 8, 0)
+      const take = clampInt(input.take, 0, 2000, 0)
+      if (slots <= 0 || take <= 0 || entries.length === 0 || !postings) return result
+      const picks = result.picks
+      // Offset pages (non-paginated path) keep their historical window shape.
+      if (picks.length > take) return result
+      const userText = typeof input.userText === 'string' ? input.userText : ''
+      if (userText.trim().length === 0) return result
+      const seeds = querySeeds(index, userText, this.cfg, { assistantSaid: false }).seeds.filter((seed) => {
+        if (typeof seed !== 'string' || seed.length === 0) return false
+        if (isAssistantSeed(seed)) return false
+        // Synthetic category seeds start with U+0002 (engine/recall-index.js);
+        // only real keyword seeds count for relevance.
+        return seed.charCodeAt(0) !== 2
+      })
+      if (seeds.length < 2) return result
+      const counts = new Map()
+      for (const seed of seeds) {
+        const posting = postings.get(seed)
+        if (!Array.isArray(posting)) continue
+        for (const at of posting) counts.set(at, (counts.get(at) || 0) + 1)
+      }
+      const minMatches = clampInt(input.minMatches, 2, 16, 2)
+      const blockIds = toIdSet(input.opts && input.opts.blockIds)
+      const excludeIds = toIdSet(input.opts && input.opts.excludeIds)
+      const ledgerIds = toIdSet(input.opts && input.opts.ledger)
+      // Mirror the selector: an explicit call floor wins, otherwise the
+      // configured recall.minAlpha gate applies (E-05). The guarantee must never
+      // re-admit a memory the configured floor hides.
+      const explicitFloor = Number(input.opts && input.opts.minAlpha)
+      const configuredFloor = Number(this.cfg && this.cfg.recall && this.cfg.recall.minAlpha)
+      const alphaRaw = Number.isFinite(explicitFloor) ? explicitFloor : Number.isFinite(configuredFloor) ? configuredFloor : 0
+      const alphaFloor = Math.min(1, Math.max(0, alphaRaw))
+      const candidates = []
+      for (const [at, count] of counts) {
+        if (count < minMatches) continue
+        const entry = entries[at]
+        if (!entry || typeof entry.id !== 'string') continue
+        if (alphaFloor > 0 && (Number(entry.alpha) || 0) < alphaFloor) continue
+        if (input.timeIds && !input.timeIds.has(entry.id)) continue
+        if (input.eventIds && !input.eventIds.has(entry.id)) continue
+        if (input.constrainIds && !input.constrainIds.has(entry.id)) continue
+        if (blockIds.has(entry.id) || excludeIds.has(entry.id) || ledgerIds.has(entry.id)) continue
+        candidates.push({ entry, count })
+      }
+      result.stats.candidates = candidates.length
+      if (candidates.length === 0) return result
+      candidates.sort(
+        (left, right) =>
+          right.count - left.count ||
+          (Number(right.entry.alpha) || 0) - (Number(left.entry.alpha) || 0) ||
+          (Number(left.entry.createdAt) || 0) - (Number(right.entry.createdAt) || 0) ||
+          (left.entry.id < right.entry.id ? -1 : left.entry.id > right.entry.id ? 1 : 0),
+      )
+      const highIds = new Set(candidates.map((candidate) => candidate.entry.id))
+      const protectedIds = toIdSet(input.protectedIds)
+      const pickedIds = new Set(picks.map((pick) => pick && pick.id).filter(Boolean))
+      let guaranteed = 0
+      for (const pick of picks) if (pick && highIds.has(pick.id)) guaranteed += 1
+      const target = Math.min(slots, candidates.length, take)
+      let need = Math.max(0, target - guaranteed)
+      for (const candidate of candidates) {
+        if (need <= 0) break
+        const entry = candidate.entry
+        if (pickedIds.has(entry.id)) continue
+        const pick = { id: entry.id, alpha: entry.alpha, createdAt: entry.createdAt, generation: 1, probability: 1, roll: 1, lane: 'highRel' }
+        if (picks.length < take) {
+          picks.push(pick)
+        } else {
+          let evictAt = -1
+          for (let at = picks.length - 1; at >= 0; at -= 1) {
+            const existing = picks[at]
+            if (!existing || typeof existing.id !== 'string') continue
+            if (protectedIds.has(existing.id)) continue
+            if (highIds.has(existing.id)) continue
+            evictAt = at
+            break
+          }
+          if (evictAt < 0) break
+          picks.splice(evictAt, 1, pick)
+          result.stats.replaced += 1
+        }
+        pickedIds.add(entry.id)
+        need -= 1
+        guaranteed += 1
+      }
+      result.stats.picks = picks.reduce((count, pick) => count + (pick && highIds.has(pick.id) ? 1 : 0), 0)
+    } catch {
+      // The guarantee is an enhancement: never let it break the main recall.
+    }
+    return result
   }
 
   /**
@@ -1169,15 +2075,34 @@ export class MemoryEngine {
     const warnings = Array.isArray(request.warnings) ? request.warnings : []
     const windowIds = timePlan.ids instanceof Set ? timePlan.ids : null
     const eventIds = eventPlan.ids instanceof Set ? eventPlan.ids : null
+    const tagPlan = request.tagPlan || {}
+    const timeTagPlan = request.timeTagPlan || {}
+    const tagIds = tagPlan.ids instanceof Set ? tagPlan.ids : null
+    const timeTagIds = timeTagPlan.ids instanceof Set ? timeTagPlan.ids : null
+    const restrictIds = request.restrictIds instanceof Set ? request.restrictIds : null
     const excluded = toIdSet(opts.excludeIds)
     const minAlphaRaw = Number(opts.minAlpha)
     const alphaFloor = Number.isFinite(minAlphaRaw) ? Math.min(1, Math.max(0, minAlphaRaw)) : 0
 
     const candidates = []
+    // v1.5.0 audit (F-02-05): browsing must report which constraint dropped the
+    // candidates (`tagFiltered`/`timeTagFiltered` were missing from this stats
+    // object entirely, so the telemetry always read 0). The filters are applied
+    // in the same order as the deterministic path: time window → event → tag →
+    // time tag (all ANDed; the counters only describe the drops).
+    let inEventCount = 0
+    let inTagCount = 0
+    let inRestrictCount = 0
     for (const entry of index.entries) {
       if (windowIds && !windowIds.has(entry.id)) continue
-      if (eventIds && !eventIds.has(entry.id)) continue
       if (alphaFloor > 0 && entry.alpha < alphaFloor) continue
+      if (eventIds && !eventIds.has(entry.id)) continue
+      inEventCount += 1
+      if (tagIds && !tagIds.has(entry.id)) continue
+      inTagCount += 1
+      if (timeTagIds && !timeTagIds.has(entry.id)) continue
+      if (restrictIds && !restrictIds.has(entry.id)) continue
+      inRestrictCount += 1
       if (excluded.has(entry.id)) continue
       const folder = entry.folder && typeof entry.folder === 'object' ? entry.folder : {}
       let range = null
@@ -1246,6 +2171,10 @@ export class MemoryEngine {
       reInjections: 0,
       degraded: false,
       timeFiltered: 0,
+      // v1.5.0 audit (F-02-05): a pure browse applies the same tag/time-tag
+      // constraints, so it must report how many folders those filters dropped.
+      tagFiltered: Math.max(0, inEventCount - inTagCount),
+      timeTagFiltered: Math.max(0, inTagCount - inRestrictCount),
       filteredByAlpha: 0,
       browse: true,
       round: Number.isFinite(Number(this._round)) ? this._round : 0,
@@ -1272,7 +2201,12 @@ export class MemoryEngine {
   recallIndex() {
     const refreshed = this._refresh()
     const folders = Array.isArray(refreshed.index.folders) ? refreshed.index.folders : []
-    const key = `${refreshed.mtimeMs}|${refreshed.size ?? -1}|${folders.length}|${lanesFingerprint(this.cfg)}`
+    // v1.5.0 audit (F-04-03): the assistant-utterance postings are only built when
+    // the channel is enabled, so the switch is part of the cache fingerprint.
+    const assistantSaidEnabled = !(
+      this.cfg?.recall?.assistantSaid && this.cfg.recall.assistantSaid.enabled === false
+    )
+    const key = `${refreshed.mtimeMs}|${refreshed.size ?? -1}|${folders.length}|${lanesFingerprint(this.cfg)}|asst=${assistantSaidEnabled ? 1 : 0}`
     if (this._recallIndexCache && this._recallIndexCache.key === key) return this._recallIndexCache.value
     const value = buildRecallIndex(folders, this.cfg)
     this._recallIndexCache = { key, value }

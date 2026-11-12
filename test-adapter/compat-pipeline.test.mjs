@@ -376,7 +376,10 @@ test('compat: activation injects the Derpyu tool whitelist patch (idempotent acr
   try {
     const { profileDir, file } = makeDerpyuProfile(root)
     withProfileEnv(profileDir, () => {
-      const first = makePlugin({ qqBots: 'auto' }, { root: path.join(root, 'run1'), id: 'qqb-g-1' })
+      // v1.5.7: the patch is gated by the whitelist consent prompt. This test
+      // pins the patch mechanics, so it pre-authorizes through the config
+      // (the prompt/pending/deny paths are covered by compat-consent.test.mjs).
+      const first = makePlugin({ qqBots: 'auto', derpyuConsent: 'allow' }, { root: path.join(root, 'run1'), id: 'qqb-g-1' })
       assert.equal(first.plugin.autopatchApplied, true, 'patch must be applied on activation')
       assert.equal(first.plugin.autopatchStatus.status, 'patched')
       const patched = readFileSync(file, 'utf8')
@@ -396,7 +399,7 @@ test('compat: activation injects the Derpyu tool whitelist patch (idempotent acr
 
       // Second activation: already patched, no new backup, file unchanged.
       const backupsBefore = readdirSync(dir).filter((name) => name.includes('.bak-rofm-')).length
-      const second = makePlugin({ qqBots: 'auto' }, { root: path.join(root, 'run2'), id: 'qqb-g-2' })
+      const second = makePlugin({ qqBots: 'auto', derpyuConsent: 'allow' }, { root: path.join(root, 'run2'), id: 'qqb-g-2' })
       assert.equal(second.plugin.autopatchApplied, true)
       assert.equal(readFileSync(file, 'utf8'), patched, 'second activation must not rewrite the file')
       assert.equal(readdirSync(dir).filter((name) => name.includes('.bak-rofm-')).length, backupsBefore)

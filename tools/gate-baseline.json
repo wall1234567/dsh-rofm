@@ -1,7 +1,7 @@
 {
-  "version": "1.5.6",
-  "updatedFor": "dsh-rofm 1.5.6 release gate",
-  "minFullSuiteTests": 1332,
+  "version": "1.5.8",
+  "updatedFor": "dsh-rofm 1.5.8 release gate",
+  "minFullSuiteTests": 1358,
   "maxFullSuiteSkipped": 4,
   "minE2eAdapterTests": 12,
   "maxE2eAdapterSkipped": 0,

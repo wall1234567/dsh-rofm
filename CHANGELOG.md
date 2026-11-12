@@ -7,6 +7,83 @@ The project follows a lightweight [SemVer](https://semver.org/) scheme.
 
 （下一个版本的变更写在这里。）
 
+## [1.5.8] — 2026-11-13
+
+**插件图标换成「水面涟漪」插画；本版是 1.5.6 之后第一次对外发布，因此 1.5.7 的白名单授权弹窗随本版首发。**
+
+- **图标（本次唯一的功能性改动）**：用户提供的「水面涟漪」插画经缩放到 256×256、四角 22% 圆角（透明）
+  后作为插件图标，文件名 `icon.png`（151 KB），替换原 `icon.svg`；按 DSH 插件显示元信息规范：
+  `package.json` 顶层 `icon: "icon.png"`（优先于 `./icon` 导出）、`exports["./icon"] = "./icon.png"`、
+  `files` 含 `icon.png`。图标是 PNG、远小于 Plugin Manager 的 256 KiB 上限，宿主读取后以
+  `data:image/png;base64,…` 交给插件页渲染（与官方插件同一机制）。
+- **1.5.7 内容随本版首发**：Derpyu/qq-bridge 白名单注入改为先弹窗授权——允许→注入四工具名；
+  不允许→记录决定并关闭 rofm（设置开关一并关闭，之后再打开视为允许）；未回答→保持 pending，
+  **绝不**在未授权时写第三方文件。细节见下方 [1.5.7] 段落。
+- **版本 / 文档**：`package.json` / `engine/package.json` = 1.5.8；README banner（v1.5.8）+ 目录树；
+  `docs/SPEC.md` revision note；`docs/VERIFICATION.md` §33；`docs/PUBLISHING.md` 当前版本；
+  `tools/gate-baseline.json`（1.5.8 / 1358）。无运行时、数据格式或配置变更，无需迁移。
+
+## [1.5.7] — 2026-11-10
+
+**Derpyu 白名单注入改为「先弹窗授权」；拒绝则默认关闭 rofm。**
+
+- **授权弹窗（核心）**：兼容检测第一次发现需要注入白名单的 Derpyu/qq-bridge
+  （`qq-agent-presets/qq-tool-restrict.mjs`）时，不再直接改第三方文件，而是在 DSH Web GUI
+  弹一个系统提示窗请求授权（新增浏览器半身 `client.js`：`window.__ModuleLoader__` 纯 JS、
+  零依赖、无需构建；同源接口 `GET/POST /api/rofm/derpyu-consent` 走 DSH 的
+  `connection.fetch.register` 认证通道）。文案逐字采用用户指定原文：
+  「由于qq-bridge的白名单机制会使rofm在QQ渠道失效且有恶劣影响，故请求您允许rofm将工具添加进白名单中，
+  如您不允许，为防止恶劣后果，rofm会默认关闭，您后续可自行开启。」
+- **允许**：不变——把 `memory_judge` / `memory_recall` / `memory_image` / `memory_group_recall`
+  注入 `SAFE_EXACT`（写前备份、原子替换、状态记录，行为与 1.5.6 一致），决定写入
+  机器级 `$DSH_HOME/rofm/.compat-consent.json`，只问一次。
+- **不允许**：记录 `denied` 决定，把 `enabled:false` 写入 gitignored 的本机
+  `config.local.json`，并在当前进程里**立即停用 rofm**（注销 4 个工具、3 个 prompt section、
+  事件监听器，引擎清空）；下一次启动按 `enabled:false` 直接空转。用户之后可自行重新开启
+  （删掉 `.compat-consent.json` 可让下一次检测重新询问；或设 `compat.derpyuConsent="allow"`）。
+- **门禁语义**：未决定 = 保持 pending，**绝不**在未授权时写第三方文件；Derpyu 通道评分自动回退
+  启发式（`autopatchApplied=false`），不会让归档卡在待评分。无 GUI/无人回答时同样保持 pending
+  （headless/CI 请显式设 `compat.derpyuConsent="allow"` 预授权）。
+- **配置**：`compat.derpyuConsent`（`"ask"` 默认 = 弹窗 / `"allow"` = 预授权不弹窗）；
+  `normalizeCompatConfig` 校验非法值（回退 `"ask"` 并 warning）；随包 `config.json` 同步。
+- **失败安全**：状态文件/`config.local.json` 写入失败只 WARN（`config.local.json` 损坏时**不覆盖**
+  用户文件）；deny 仍立即停用当前实例；GET/POST 对非法请求体返回 400，对已决定请求幂等返回
+  `already:true`；多标签页由 `already` / `pending:false` 收敛，不会重复弹窗。
+- **测试**：新增 `test/compat-consent.test.mjs`（9）、`test-adapter/compat-consent.test.mjs`（8）、
+  `test/client-half.test.mjs`（9）；`test-adapter/compat-pipeline.test.mjs` 的补丁机制用例改为
+  `derpyuConsent:"allow"` 预授权（弹窗/pending/deny 路径由新用例覆盖）；`test/config-consistency`
+  的版本与 CHANGELOG 门禁随 1.5.7 同步。全量 `node --test` = 1358 tests（1356 pass / 0 fail / 2 skip）。
+- **版本 / 文档**：`package.json` / `engine/package.json` = 1.5.7；README banner + §1.19 +
+  §3.2.5/§3.2.9；`docs/SPEC.md` §2 addendum + §29；`docs/VERIFICATION.md` §32；
+  `config.json` `_readme`；`tools/gate-baseline.json`（1358）；`index.js`/README 架构说明同步
+  「Host 半身 + 浏览器半身」。
+- **修复（同日补丁）**：弹窗里点「允许」必现「提交失败，请重试」。根因是宿主
+  `connection.fetch` 的 exact Fetch 路由表**按 path 唯一定位**（`Map<path, route>`，方法集挂在
+  路由值上），而 v1.5.7 把 GET / POST 拆成两次 `register` 注册同一路径 —— 第二次注册抛
+  `already registered` 后被 catch 吞掉，POST 路由从未生效（GET 正常，所以弹窗照弹、提交 404）。
+  现改为**一次注册** `methods:['GET','POST']`，在 handler 里按 `request.method` 分发；适配层
+  mock 同步改为「同路径重复注册即抛错」，allow 用例改为走真实路由（`route.fetch`）提交，
+  防止再次拆分成两条路由。
+- **安装/更新时序与「只问一次」加固（2026-11-12）**：
+  - 授权决定改为**机器级** `$DSH_HOME/rofm/.compat-consent.json`（默认 `~/.dsh/rofm/`），不再放在插件目录的 `memory/`：DSH 更新/重装（npm 包目录被替换）、改 `storage.dir`、换 profile 都不再重问；旧版安装级状态在首次读取时迁移；
+  - **拒绝 = 关闭设置开关，重新打开即允许**（2026-11-12 二次修订，替代“常驻关闭”语义）：拒绝时记录 `denied` + `closed:"bundle"`、当前进程立即停用，并异步通过宿主 `pluginManager.setBundleEnabled('dsh-rofm',false)` 关闭 rofm 在设置里的开关；用户之后在设置里重新打开 rofm，启动时即视为“自行开启”→ 自动升级为 `allowed`、注入白名单、不再弹窗。只有宿主没有 `pluginManager`（或关闭失败）时才回退为旧的硬关闭（`config.local.json enabled:false`，需删状态文件或 `derpyuConsent:"allow"`）；
+  - **零后台轮询（2026-11-12 修订）**：浏览器半身只在页面加载时查询一次，任何 `pending=false` 的响应（没有检测到 qq-bridge / 已决定 / 预授权 / 补丁关闭）都立即停止轮询——没 qq-bridge 时就是普通 rofm、零后台轮询；因此「先装 rofm、后装 qq-bridge」需要**刷新页面**后才弹窗（原 30s 慢速复查已移除）；失败重试仅用于页面加载时宿主接口未就绪的握手；
+  - 路由注册失败（旧实例残留路由等热更新场景）会显式 WARN 提示**完全重启 DSH**，不再静默无弹窗；
+  - 适配层新增时序用例：qq-bridge 后装 → GET 从 `detected:false` 翻回 `pending:true`；旧 `memory/` 决定迁移后保持关闭。
+- **同类风险加固（同日复查）**：
+  - 宿主路由改为**按 connection 的模块级 claimant bus**：多个实例/热重载/服务重挂载只会有
+    一条注册（新实例接管 handler，最后一个 claim 释放时才注销），re-entry 用例钉死「不重复注册、
+    不触发 duplicate 错误」；
+   路由 handler 的异常统一转成 JSON 500（不会留下 rejected promise）；
+  - `client.js` 新增 **× / Esc 关闭出口**：POST 一直失败或宿主接口消失时用户可退出弹窗，
+    关闭后本页停止轮询、宿主保持 pending（刷新页面重新询问）；连续 404 会提示「授权接口已不可用，
+    可关闭后刷新」；「本页已作答但宿主仍 pending」时停止轮询，不再空转；
+  - 关闭/重入守卫拆分为 `disposed`（生命周期幂等）与 `stopped`（本页不再询问），
+    `dispose()` 在用户关闭后仍会清 DOM/样式/监听器/定时器。
+  测试数不变（1358，断言并入既有 9+8+9 用例）。
+- **数据格式无变化**：不迁移、不回填；`.compat-consent.json` 与 `config.local.json` 都是本机文件，
+  不进 npm 包、不提交（`config.local.json` 已在 `.gitignore`）。
+
 ## [1.5.6] — 2026-11-09
 
 **修正版：评分期多话题关键词覆盖规则 + 记忆相关问题主动召回规则。**

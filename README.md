@@ -19,6 +19,29 @@
 > （N = 累计归档段数），归档不再把宿主会重新注入的 pinned 上下文写进注记；新增
 > `tools/selfcheck.mjs` 独立自检工具（见 §7）。
 >
+> **v1.5.8（本版：插件图标换成「水面涟漪」插画；1.5.6 之后首次对外发布，含 1.5.7 授权弹窗）**
+>
+> - **图标**：插件图标换成用户提供的「水面涟漪」插画——`icon.png`（256×256、圆角透明、151 KB），
+>   替换原 `icon.svg`；`package.json` 顶层 `icon` 与 `exports["./icon"]` 同时指向新文件，
+>   插件管理器按 DSH 规范读取为 `data:image/png;base64,…`。
+> - **1.5.7 随本版首发**：npm / GitHub 上 1.5.6 之后没有单独发布过 1.5.7，所以从 1.5.6 升上来
+>   会同时拿到「Derpyu 白名单先弹窗授权」这套行为（见下方 v1.5.7 说明）。
+> - 版本 1.5.7 → **1.5.8**。详见 CHANGELOG 1.5.8。
+>
+> **v1.5.7（Derpyu 白名单注入改为先弹窗授权，拒绝则默认关闭 rofm，必读）**
+>
+> - **授权弹窗**：兼容检测第一次发现需要注入白名单的 Derpyu/qq-bridge 时，不再直接改第三方文件；
+>   DSH Web GUI 会弹一个系统提示窗请求授权（新增浏览器半身 `client.js` + 同源接口
+>   `GET/POST /api/rofm/derpyu-consent`）。
+> - **允许**：行为不变——把 `memory_judge` / `memory_recall` / `memory_image` / `memory_group_recall`
+>   注入 `qq-tool-restrict.mjs`（写前备份、原子替换），决定写入机器级 `$DSH_HOME/rofm/.compat-consent.json`（默认 `~/.dsh/rofm/`），只问一次。
+> - **不允许**：记录拒绝并**立即关闭 rofm**（工具/section/监听器全部注销），同时把 rofm
+>   在“设置 → 插件”里的开关关掉（bundle 停用，不会硬写 `config.local.json`）；
+>   您之后在设置里重新打开 rofm 即视为允许（自动注入白名单，不再弹窗）。
+> - **未回答 = 保持 pending**：无 GUI / 无人回答时**绝不**在未授权时改第三方文件；
+>   headless/CI 可设 `compat.derpyuConsent="allow"` 预授权。
+> - 版本 1.5.6 → **1.5.7**。详见 §1.19 与 CHANGELOG 1.5.7。
+>
 > **v1.5.6（本版：评分期多话题关键词规则 + 记忆相关问题主动召回，必读）**
 >
 > - **评分期关键词规则（多话题文件夹）**：`memory_judge` 设置 keywords 时，一条记忆包含多个话题
@@ -257,11 +280,12 @@
 > **项目更名 / Renamed**：原名 `dsh-memory-recall`，为避免与 npm 上一个无关的同名包混淆，
 > 自 0.3.0 起改名为 **`dsh-rofm`**（`memory/` 数据格式与配置不变）。
 
-- 纯 Host 插件：**3 个模型工具（`memory_judge` / `memory_recall` / `memory_image`）
-  + 3 个 system-prompt sections（回忆块 / 记忆评分任务 / 记忆使用规则 v1.5.0）+ 3 个事件监听器**
-  （QQ 渠道兼容启用时另有第 4 个工具 **`memory_group_recall`**（仅 QQ 私聊主人可用）与 1 个 `session/event` 监听器；
-  `config.json` 的 `enabled:false` 时全部不注册），
-  无 Client 半区、无命令、无定时器、无子进程；
+- **Host 半身 + 浏览器半身**（v1.5.7）：Host 半身提供 **4 个模型工具（`memory_judge` / `memory_recall` /
+  `memory_image`，QQ 兼容启用时另有 `memory_group_recall`）+ 3 个 system-prompt sections
+  （回忆块 / 记忆评分任务 / 记忆使用规则 v1.5.0）+ 3 个事件监听器**（QQ 渠道兼容启用时另有 1 个
+  `session/event` 监听器；`config.json` 的 `enabled:false` 时全部不注册；无命令、无定时器、无子进程）；
+  浏览器半身（`client.js`）只负责 Derpyu 白名单授权弹窗（轮询同源接口 + 模态窗），
+  不注册任何 slot，`ctx` 释放时清理；
 - 记忆引擎（`engine/`）零依赖、不 import 任何 DSH 包，可脱离 DSH 单独运行；
 - 在 DSH 里禁用插件行 = 工具、section、监听器随 Cordis 上下文一起卸载，**真的停止**；
 - 所有参数都在插件目录的 `config.json`，改完保存即热加载，无需重启——**唯一例外是 `enabled`**
@@ -1326,6 +1350,74 @@ v1.5.0 在 1.4.x 的事件约束之上补齐三件事：**地点 / 人物 / 多�
   「所有依赖记忆的问题」，强调**至少一次**。
 - **版本**：`package.json` / `engine/package.json` = 1.5.6；CHANGELOG 当前段 [1.5.6]。
 
+### 1.19 v1.5.7：Derpyu 白名单注入的用户授权（系统提示窗）
+
+**背景**：v1.4.2 起 rofm 会在检测到 Derpyu 后自动把四个工具名注入
+`qq-agent-presets/qq-tool-restrict.mjs` 的 `SAFE_EXACT` 白名单——这是**修改第三方插件文件**。
+qq-bridge 的白名单机制会让 rofm 在 QQ 渠道“工具可见但执行被拒”（归档卡在待评分、不会主动回忆），
+影响恶劣，因此 v1.5.7 把这一步改成**先问用户**：
+
+1. 兼容检测第一次发现需要注入的 Derpyu 时，rofm 只进入 `pending`，不写任何第三方文件；
+2. DSH Web GUI 弹系统提示窗（标题“dsh-rofm：QQ 渠道白名单授权”，正文为用户指定原文：
+   「由于qq-bridge的白名单机制会使rofm在QQ渠道失效且有恶劣影响，故请求您允许rofm将工具添加进白名单中，
+   如您不允许，为防止恶劣后果，rofm会默认关闭，您后续可自行开启。」），按钮「允许 / 不允许」；
+3. **允许**：把决定写入机器级 `$DSH_HOME/rofm/.compat-consent.json`（默认 `~/.dsh/rofm/`；只问一次，DSH 更新/重装、改 `storage.dir`、换 profile 都不会重问），随后执行与 1.5.6 相同的
+   备份 + 原子注入；**不允许**：写入 `denied` 决定（`closed:"bundle"`），**在本进程立即停用 rofm**，
+   并异步把 rofm 在“设置 → 插件”里的开关关掉（bundle 停用）。用户之后在设置里重新打开 rofm，
+   即视为“自行开启”→ 自动升级为允许并注入白名单，不再弹窗；只有宿主没有 `pluginManager`
+   服务（或关闭开关失败）时才回退为写 `config.local.json` 的 `enabled:false` 硬关闭；
+4. 未回答（无 GUI / 无人值守）时保持 `pending`：`autopatchApplied=false`，Derpyu 通道自动回退
+   启发式评分（§3.2.4），**绝不**越过授权写第三方文件。
+
+实现分两半：
+
+- **宿主半（`lib/compat-consent.js` + `lib/plugin.js`）**：状态文件读写（原子写、坏文件不覆盖）、
+  门禁状态机、`/api/rofm/derpyu-consent` 的**单条** exact Fetch 路由（同一 path 同时声明 `GET`+`POST`，
+  按 `request.method` 分发；DSH 按 path 去重，重复注册会被拒绝——v1.5.7 首次实测的「弹窗卡死」就是
+  双路由注册导致 POST 缺失；重载/重启的实例通过模块级 claimant bus 复用现场路由，不再竞态注册）、
+  允许后立即补丁、拒绝后注销 4 个工具 + 3 个 section + 事件监听器；
+- **浏览器半（`client.js`，`package.json` `dsh.client` = `{platform:"web", immediately:true, inject:[]}`）**：
+  零依赖、无需构建的 `window.__ModuleLoader__` 脚本；页面加载后查询同源接口一次：
+  `pending` 时渲染模态窗并在弹窗期间每 5s 核对（`role=dialog` / `aria-modal`、
+  DSH 主题变量 + fallback、允许 primary / 不允许 secondary、成功提示 2s 后淡出、失败可重试，
+  另带 **× / Esc 关闭出口**：关闭后本页停止轮询、宿主仍保持 pending，刷新页面会重新询问；
+  接口连续 404 / 不可用时也会提示“可关闭后刷新”，不会把页面永久卡在遮罩下），
+  多标签页通过 `already:true` / `pending:false` 收敛，`ctx` 释放时清掉 DOM/样式/监听器/定时器。
+  弹窗**正文与按钮文案全部来自 GET 响应**，客户端不内嵌主文案（唯一真相在 `lib/compat-consent.js`）。
+  **非 pending 响应立即停止轮询**（包括没有检测到 qq-bridge、已决定、预授权、补丁关闭）：
+  没有 qq-bridge 时就是普通 rofm，**零后台轮询**；失败重试（2.5s→30s 退避、连续 404 六次停止）
+  只用于页面刚加载、宿主接口还没就绪的握手阶段。
+
+**配置与恢复**（见 §3.2.9）：
+
+- `compat.derpyuConsent`：`"ask"`（默认，弹窗）/ `"allow"`（显式预授权，不弹窗；headless/CI 用）；
+- 已拒绝后想重新开启 rofm：**在设置 → 插件里把 rofm 重新打开即可**——插件启动时看到
+  `closed:"bundle"` 会把你这次重新启用当作允许：自动升级决定为 `allowed`、注入白名单、不再弹窗。
+  想重新被询问：删掉 `~/.dsh/rofm/.compat-consent.json` 后重载插件；想强制预授权：设
+  `compat.derpyuConsent="allow"`。若宿主没有 `pluginManager` 服务而发生硬关闭回退，
+  则还需清掉 `config.local.json` 的 `enabled:false`（或删状态/设 allow）再重载。
+  拒绝**不会**改写/回滚已经存在的白名单文件（历史补丁保留，可用 `.bak-rofm-*` 备份或手删四行回滚，见 §3.2.5）；
+- 决定只认第一次：`.compat-consent.json` 一旦写入就不再弹窗；损坏/删除视为“未决定”。
+
+**安装/更新时序（v1.5.7-final）**：
+
+| 场景 | 何时弹窗 | 说明 |
+|---|---|---|
+| 已装 qq-bridge + 旧 rofm，更新到本版（AI 改文件或 DSH 更新） | 新版本插件**重载/重启后**、页面加载 `client.js` 后约 2.5s | 旧版没有决定文件 → 视为第一次；本机已有历史补丁也不会阻止弹窗 |
+| 已装 qq-bridge，再安装 rofm（AI 或 DSH） | rofm 启动后（`application: applied` 即生效），页面刷新/动态加载 `client.js` 后约 2.5s | 未加载页面时宿主保持 pending，不写第三方文件 |
+| 已装 rofm，再安装 qq-bridge | **刷新页面后**（页面加载首次查询时） | 浏览器半身没有常驻轮询：安装前若页面已打开，需要刷新一次才会重新检测并弹窗；宿主不写任何文件，pending 状态在刷新后弹出 |
+| 同时说“安装 rofm 和 qq-bridge” | 两者装好后打开/刷新页面时（rofm 启动并加载 client 半身后立即查询） | 顺序无关，只要最终两者都在；后装 qq-bridge 一律按上一条“刷新页面”处理 |
+| 已拒绝后 DSH 更新/重装 rofm | **不再弹**；rofm 的应用开关已被关闭，需要时在设置里重新打开即可 | 重新打开=视为允许（自动注入白名单，不再弹窗）；想重新被询问=删状态文件 |
+决定文件在 `$DSH_HOME/rofm/`（默认 `~/.dsh/rofm/`），与插件安装目录、`storage.dir`、profile 无关；旧版放在 `memory/` 的安装级状态会在首次读取时自动迁移。
+- **拒绝 = 关闭 rofm 的应用开关**：当前进程立即停用 + 设置里的 rofm 开关关闭；之后在设置里重新打开 rofm 即自动按允许处理（含白名单注入），不会第二次弹窗。仅当宿主没有 `pluginManager` 服务时回退为硬关闭（`config.local.json enabled:false`，需删状态文件或 `derpyuConsent="allow"` 才能重开）。
+
+**测试**：`test/compat-consent.test.mjs`（9，纯状态/门禁/payload/config.local 失败安全）、
+`test-adapter/compat-consent.test.mjs`（8，pending 不写文件、allow 立即注入并持久化、deny 停用当前实例、
+坏 config.local 不覆盖、两个显式开关、已拒绝后再开启不注入、`enabled:false` 早退）、
+`test/client-half.test.mjs`（9，浏览器半身语法/契约/manifest/体积）。
+
+- **版本**：`package.json` / `engine/package.json` = 1.5.7；CHANGELOG 当前段 [1.5.7]。
+
 ---
 
 ## 2. 安装
@@ -1854,7 +1946,8 @@ Derpyu 的两个 preset 都挂 `qq-tool-restrict`：`tools.restrict` 隐藏危�
 
 ### 3.2.5 自动补丁：Derpyu 工具白名单（可回滚）
 
-`compat.autoPatchDerpyu`（默认 `true`）让 rofm 在检测到 Derpyu 后**自动**做一件事：
+`compat.autoPatchDerpyu`（默认 `true`）让 rofm 在检测到 Derpyu 后做一件事
+（**v1.5.7 起第一次注入前会先弹窗授权**，见本节末尾）：
 
 1. 定位 `<profile>/node_modules/qq-agent-presets/qq-tool-restrict.mjs`
    （link 安装时写穿到用户仓库 `plugins/qq-agent-presets/qq-tool-restrict.mjs`）；
@@ -1866,6 +1959,15 @@ Derpyu 的两个 preset 都挂 `qq-tool-restrict`：`tools.restrict` 隐藏危�
 6. **失败安全**：结构无法识别（不是“逐行一个字符串字面量的 Set”）、只读、定位失败 → **只 WARN，不写、不猜**，
    并自动降级为启发式评分；
 7. `autoPatchDerpyu: false` 时**完全不碰第三方文件**（走启发式评分兜底）。
+
+**v1.5.7 授权门禁（默认 `compat.derpyuConsent="ask"`）**：上面的第 1 步之前先弹系统提示窗
+（§1.19）。用户选「允许」→ 记录机器级 `$DSH_HOME/rofm/.compat-consent.json` 并继续第 1–4 步；
+用户选「不允许」→ 记录 `denied`（`closed:"bundle"`）并立即关闭 rofm（当前进程注销工具/section/监听器），
+同时把 rofm 在“设置 → 插件”里的开关关掉；之后在设置里重新打开 rofm 即视为允许（自动注入白名单，
+不再弹窗）。宿主没有 `pluginManager` 时回退为写 `config.local.json enabled:false`。未回答时保持 pending、不写第三方文件，
+Derpyu 通道回退启发式评分。`compat.derpyuConsent="allow"` 直接预授权（headless/CI）。
+已存在的历史补丁不会因拒绝而被回滚；拒绝后如需重新获得补丁，删除 `.compat-consent.json`
+或设 `derpyuConsent="allow"` 后重载插件。
 
 只改这一个文件、只增加四个本地记忆工具名（不引入 shell/文件能力，不涉及网络）。
 
@@ -1955,6 +2057,7 @@ rofm 的归档阈值 60% **先于** preset/宿主压缩器的 80%，正常路径
   "ownerIds": [],
   "memberMinAlpha": 0.5,
   "autoPatchDerpyu": true,
+  "derpyuConsent": "ask",
   "channelScore": "model",
   "mediaRoots": [],
   "maxImageBytes": 8388608,
@@ -1976,6 +2079,7 @@ rofm 的归档阈值 60% **先于** preset/宿主压缩器的 80%，正常路径
 | `ownerIds` | `[]` | 主人 QQ 号（字符串或数字，自动转字符串）；为空时所有带标记的发送者都算非主人 |
 | `memberMinAlpha` | `0.5` | 非主人触发时的 α 下限；`0` = 关闭门控 |
 | `autoPatchDerpyu` | `true` | 自动向 Derpyu 注入工具白名单（§3.2.5）；`false` = 完全不碰第三方文件 |
+| `derpyuConsent` | `"ask"` | **v1.5.7**：第一次注入前是否先弹窗授权。`"ask"` = Web GUI 系统提示窗（默认）；`"allow"` = 预授权不弹窗（headless/CI）。拒绝后立即关闭 rofm 并关闭其在设置里的开关；之后在设置里重新打开 rofm 即视为允许（含白名单注入）。无 `pluginManager` 时回退为 `config.local.json enabled:false` |
 | `channelScore` | `"model"` | `model` / `heuristic` |
 | `mediaRoots` | `[]` | onebot 本地图片允许的根目录（**建议写绝对路径**，支持 `~/` 展开；空 = 不归档图片；Linux 大小写敏感、Windows 忽略大小写，见 §2.4） |
 | `maxImageBytes` | `8388608` | 单张图片大小上限（字节） |
@@ -2114,6 +2218,7 @@ dot 目录、文件）一律忽略；只读 `index.json` 与 `context.json`，�
 ```text
 dsh-rofm/
 ├── index.js                 # DSH Host 插件入口（apply）
+├── client.js                # ★ v1.5.7 浏览器半身（Derpyu 白名单授权弹窗；纯 JS、零依赖、无构建）
 ├── lib/                     # DSH 适配层（唯一 DSH-aware 部分）
 │   ├── plugin.js            # 归档（待评分）+ 图片归档 + 回忆 section + 评分任务 section + recall-state v3 + 再归档 + pinned 分类/注记合并 + v1.4.0 评分流水线/小窗口/回合保护
 │   ├── memory-tool.js       # ★ memory_judge 模型工具（当前会话模型提交 α/β/关键词；v1.4.0 maxItems/质量告警/judge 遥测）
@@ -2123,6 +2228,7 @@ dsh-rofm/
 │   ├── images.js            # 图片文件夹助手（占位符/路径展开/索引/存取，纯函数、无 DSH import）
 │   ├── compat.js            # ★ v1.3.0 QQ 渠道兼容：检测 / chat 键 / 群成员身份 / α 门控 / 评分模式（纯函数、零依赖）
 │   ├── compat-autopatch.js  # ★ v1.3.0 Derpyu 工具白名单自动补丁（幂等/备份/原子写/hash 状态/自愈/失败安全）
+│   ├── compat-consent.js    # ★ v1.5.7 白名单注入的用户授权门禁（状态文件/门禁状态机/浏览器 payload/config.local 关闭）
 │   ├── passive-archive.js   # ★ v1.3.0 被动归档：compaction/summary → 被 shadow 原文回收到 chat 记忆（水位去重；v1.4.0 写 scoreMode/archivedFrom/事件时间）
 │   ├── heuristic-score.js   # ★ v1.3.0 启发式评分降级路径（α=engine/importance、keywords=engine/tokenize）
 │   ├── qq-media.js          # ★ v1.3.0 onebot 本地图片路径解析/realpath 白名单校验/staging 暂存与清理
@@ -2170,7 +2276,7 @@ dsh-rofm/
 ├── config.json              # 主配置（v1.4.0 全部新键的产品默认值）
 ├── cordis.patch.yml         # bundle 挂载声明
 ├── locale/{zh,en}.json      # 插件管理器显示名/描述
-└── icon.svg
+└── icon.png
 ```
 
 ### 独立运行引擎（不启动 DSH）
@@ -2366,7 +2472,7 @@ node engine/cli.mjs --help        # 独立引擎 CLI
 | # | 步骤 | 内容 |
 |---|---|---|
 | 0 | privacy | `node tools/privacy-check.mjs`（门禁 preflight，不计入 8 steps；跟踪 config 含个人信息即 FAIL） | — |
-| 1 | unit-tests | `node --test` 全量（**1332 tests / 1330 pass / 0 fail / 2 skip**；门禁实测 ~45s（机器负载不同）；下限由 `tools/gate-baseline.json` 维护——当前 1332） |
+| 1 | unit-tests | `node --test` 全量（**1358 tests / 1356 pass / 0 fail / 2 skip**；门禁实测 ~50s（机器负载不同）；下限由 `tools/gate-baseline.json` 维护——当前 1358） |
 | 2 | simulate | `node test/simulate.mjs`（legacy 回归；<1s） |
 | 3 | selfcheck | `node tools/selfcheck.mjs`（配置/存储/时代/时间/公平性/事件/日志；~2s） |
 | 4 | cli-help | `node engine/cli.mjs --help` |
@@ -2375,14 +2481,14 @@ node engine/cli.mjs --help        # 独立引擎 CLI
 | 7 | e2e-adapter | `node --test test/e2e-adapter-simulate.test.mjs`（**12 用例**；skip 视为失败） |
 | 8 | e2e-real-data | `node --test test/e2e-real-data-readonly.test.mjs`（**8 用例**，基于 `test/fixtures/memory-snapshot/**` 夹具；skip 视为失败） |
 
-**结果（1.5.6 实测，2026-11-09）：8/8 PASS**；汇总 node:test 用例 = **1332 unique（1352 summed with e2e re-runs）**——
+**结果（1.5.7 实测，2026-11-10）：8/8 PASS**；汇总 node:test 用例 = **1358 unique（1378 summed with e2e re-runs）**——
 e2e 两步已包含在全量 `--test` 里，**不重复计入 unique**；脚本同时打印含两次 e2e 重跑的 summed 数；
-**1330 pass / 2 skip / 0 fail**（2 skip 为 Node zstd 平台条件跳过，非缺陷）。
+**1356 pass / 2 skip / 0 fail**（2 skip 为 Node zstd 平台条件跳过，非缺陷）。
 `npm run check` 是同一套检查的等价展开（把 e2e 换成 `npm test` 一步）。
 门禁不是“0 fail 即绿”：**测试数下限由 `tools/gate-baseline.json` 维护**
 （`minFullSuiteTests` / `maxFullSuiteSkipped` / e2e 12/8，取“记录值”与“静态扫描用例数×98%”的较大者；
 基线缺失/损坏直接 FAIL）。**新增或删除测试时必须同步更新该文件**，否则门禁会按旧下限误判。
-反证已通过：删掉一个 53-test 文件 → 门禁 FAIL（expected ≥1332, got 1279）；e2e 全 skip → FAIL；伪造失败 → FAIL。
+反证已通过：删掉一个 53-test 文件 → 门禁 FAIL（expected ≥1358, got 1305）；e2e 全 skip → FAIL；伪造失败 → FAIL。
 
 > 仓库零依赖，不需要 `npm install`；`npm test` 只是 `node --test` 的快捷方式。
 > 也可分别运行 `node --test test/*.test.mjs`（引擎）与

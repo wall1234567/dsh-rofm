@@ -6,6 +6,30 @@ anything from DeepSeek Harness (DSH). It can be executed standalone with
 `node engine/cli.mjs ...` and it is the only place where memory logic lives.
 The DSH plugin (`index.js` at the repo root) is a thin adapter around it.
 
+> **Revision note (2026-11-13, v1.5.8).** Packaging-only release: the Plugin
+> Manager icon moves from `icon.svg` to `icon.png` (256×256, rounded corners, 151 KB),
+> declared through the manifest `icon` field (which takes priority over the `./icon`
+> resource) and listed in `files`; `exports["./icon"]` resolves to the same file. The
+> Host base64-encodes it into a `data:image/png` URL exactly like the bundled official
+> plugins, so nothing about recall, scoring, storage or configuration changes. Both
+> `package.json` files are **1.5.8**, and because 1.5.7 was never published this is the
+> first released build that carries the v1.5.7 consent prompt.
+
+> **Revision note (2026-11-10, v1.5.7).** Privacy/consent release: the Derpyu
+> tool-whitelist auto-patch (which modifies a third-party file) now asks the user
+> through a DSH Web GUI system prompt the first time it is required. The answer is
+> persisted in `$DSH_HOME/rofm/.compat-consent.json` (machine-local, not part of the data
+> format); **allow** keeps the 1.5.6 patch behaviour, **deny** disables rofm in the
+> current process and turns rofm's Settings switch (bundle) off, so the user can
+> re-enable it from Settings later — that re-enable is treated as permission
+> (whitelist injection included, no second prompt). A host without the
+> `pluginManager` service falls back to the legacy hard close
+> (`enabled:false` in the git-ignored `config.local.json`). Nothing is written to
+> the third-party file while the answer is pending. New adapter-only config `compat.derpyuConsent` (`"ask"` default,
+> `"allow"` = pre-authorized/headless), new adapter modules
+> `lib/compat-consent.js` (consent state machine, `§2` addendum) and the browser
+> half `client.js` (`tests` §29). Both `package.json` files are **1.5.7**.
+
 > **Revision note (2026-11-07, v1.5.0).** Feature release: four tag kinds
 > (**location / person / multi-event / time tags**) with hard recall filters,
 > **event merge now requires explicit model approval** (no silent merge),
@@ -635,6 +659,102 @@ model); `time.timezone` drives every day/week/month/year boundary.
 > `compat.ownerIds` is fail-closed (the tool rejects and points at the config). The
 > tracked `config.json` carries the block with `ownerIds: []`; machine-local owner ids
 > belong in the git-ignored `config.local.json`.
+
+> **v1.5.7 addendum — `compat.derpyuConsent` (adapter-only).** The Derpyu
+> tool-whitelist patch modifies a third-party file, so the first required patch now
+> asks the user through the Web GUI instead of writing immediately. This is a
+> **browser-hosted consent gate**, not an engine feature: defaults and validation
+> live in `lib/compat.js` `DEFAULT_COMPAT_CONFIG.derpyuConsent` and
+> `normalizeCompatConfig` (only `"ask"` / `"allow"` are accepted; an invalid value
+> falls back to `"ask"` with a warning). The decision file and the route are
+> defined in `lib/compat-consent.js`.
+>
+> ```jsonc
+> "compat": {
+>   "derpyuConsent": "ask"   // "ask" = system prompt before the first patch (default)
+>                            // "allow" = pre-authorized, no prompt (headless/CI)
+> }
+> ```
+>
+> Gate semantics (normative):
+>
+> 1. **When**: `compat.autoPatchDerpyu !== false` AND Derpyu is detected AND no
+>    persisted decision AND `derpyuConsent === "ask"`. The gate then reports
+>    `pending`; `refreshAutopatch` MUST NOT write the third-party file and
+>    `autopatchApplied` stays `false` (Derpyu channel sessions degrade to heuristic
+>    scoring, §3.2.4), in the current process and on every later start until an
+>    answer exists.
+> 2. **Allow**: persist `{version:1, decision:"allowed"}` in
+>    `$DSH_HOME/rofm/.compat-consent.json` and run the same fail-safe patch as v1.5.6
+>    (backup + atomic write + state record) immediately. A persisted `allowed`
+>    decision or `derpyuConsent==="allow"` pre-authorizes every later start; no
+>    prompt is shown again.
+> 3. **Deny**: persist `{decision:"denied", closed:"bundle"}`, disable rofm in the
+>    current process (unregister the four tools, the three prompt sections, the
+>    event listeners and the compat media path, clear engines, and return `''` from
+>    the prompt providers), then asynchronously turn rofm's own profile bundle off
+>    through the host `pluginManager.setBundleEnabled()` service so the Settings
+>    toggle shows a clean OFF state. This path does not write `enabled:false` into
+>    `config.local.json`. If the host has no `pluginManager` service, or the switch
+>    cannot be closed, fall back to the legacy hard close: write `enabled:false`
+>    into the git-ignored `<pluginDir>/config.local.json` (existing keys preserved;
+>    a broken file is never overwritten) and record `closed:"hard"`.
+> 4. **Never unauthorized**: when no answer exists the third-party file MUST stay
+>    byte-identical; there is no timeout that grants permission. Headless installs
+>    that want the old automatic behaviour must set `derpyuConsent:"allow"`.
+> 5. **Idempotent API**: `GET /api/rofm/derpyu-consent` returns
+>    `{pending, detected, decision, patchAllowed, message:{zh,en}, ...}`;
+>    `POST /api/rofm/derpyu-consent` accepts exactly `{"decision":"allow"}` or
+>    `{"decision":"deny"}` (`400` otherwise), is a no-op with `already:true` once a
+>    decision exists, and is registered on the host's authenticated
+>    `connection.fetch` channel (same-origin DSH Web GUI only).
+> 6. **Re-enable path**: re-opening rofm from Settings after a `closed:"bundle"`
+>    deny is the documented "enable later" gesture and MUST be treated as permission:
+>    the next start upgrades the persisted decision to `allowed` (clearing the close
+>    marker and any legacy `config.local.json enabled:false`), applies the whitelist
+>    patch and shows no second prompt. For legacy `closed:"hard"` records the
+>    settings are: `derpyuConsent:"allow"` pre-authorizes/patches, while deleting
+>    `.compat-consent.json` makes the next detection ask again; a hard-close
+>    fallback also requires clearing `config.local.json enabled:false`.
+> 7. **One route per connection**: the host keys exact Fetch routes by path only,
+>    so the API registers exactly **one** route on `/api/rofm/derpyu-consent`
+>    declaring both `GET` and `POST` and dispatches on `request.method`.
+>    Registering the same path twice is rejected by the host; a hot-reloaded /
+>    restarted plugin instance therefore reuses the live registration through a
+>    module-level claimant bus instead of racing a duplicate one (a duplicate
+>    registration left POST unserved and produced the 2026-11-10 stuck consent
+>    dialog). The browser half can dismiss the dialog with `×` / `Esc`: that
+>    stops its polling for the current page, keeps the decision pending (a reload
+>    asks again) and surfaces a clear notice when the API is unreachable, so a
+>    failing endpoint can never trap the UI.
+> 8. **Location & lifecycle**: the decision lives in the machine-level state file
+>    `<dshHome>/rofm/.compat-consent.json` (default `~/.dsh/rofm/`), **not** in the
+>    plugin install directory or `memoryDir`. It therefore survives DSH updates,
+>    reinstallations, `storage.dir` changes and profile switches, so "ask once"
+>    holds across those events. A valid record found only at the legacy
+>    `<memoryDir>/.compat-consent.json` path is migrated on read (upgrade from a
+>    pre-release 1.5.7 build never re-asks). A refused decision records how rofm was
+>    closed: `closed:"bundle"` means its Settings switch was turned off, so a later
+>    start (the user re-enabled it) is treated as permission and patched without a
+>    second prompt; `closed:"hard"` is the legacy/fallback state where `start()`
+>    stays inert and the re-open paths are deleting the state file (next detection
+>    asks again) or `derpyuConsent:"allow"` (explicit override).
+> 9. **Install/update timing** (normative): the prompt is raised when the gate is
+>    pending and a browser page hosting the client half queries the API after page
+>    load. The client half performs **no background polling**: a non-pending answer
+>    (no Derpyu detected, already decided, pre-authorized, or the patch disabled)
+>    stops its timer immediately, so a plain rofm without qq-bridge has zero polling
+>    footprint. Consequently, if qq-bridge is installed while a page is already
+>    open, the user must **reload the page** to see the prompt (the host re-detects
+>    from profile mtimes on the next query; it never writes anything meanwhile).
+>    Failure retries (2.5 s → 30 s backoff, stop after six 404s) exist only for the
+>    page-load handshake while the host API is not ready yet. A page that was open
+>    while rofm itself was (re)installed may likewise need a refresh to load the
+>    newly added client bundle; the host API is already live.
+>
+> The state file `<dshHome>/rofm/.compat-consent.json` (default `~/.dsh/rofm/`) is machine-local
+> runtime state, **not** a memory data field: it is never shipped, never migrated
+> and never read by `engine/`.
 
 > **The packaged `config.json` uses product values.** `engine/config.js` is the
 > single default truth; the shipped `config.json` overrides exactly six keys on
@@ -4038,6 +4158,57 @@ Required coverage (v1.3.0 baseline, still enforced):
       budget tests keep passing (`scoring-pressure` F-05-01 at a 12000-token
       window and `compat-integration` rubric rendering at a 1000-token window).
 
+29. v1.5.7 coverage (2026-11-10):
+    - `test/compat-consent.test.mjs` (9): the popup text is pinned verbatim to the
+      user-specified Chinese sentence; status file round-trips atomically, corrupt
+      records/decisions are treated as "not decided", no temp files survive; the
+      gate truth table (no Derpyu / pending / allowed / denied / config `allow` /
+      `autoPatchDerpyu=false`); `normalizeConsentAction` accepts only the two
+      answers; the browser payload carries pending + localized copy + null decision;
+      a deny records `closed:"bundle"`; the fallback writes `enabled:false` into
+      `config.local.json` without losing other keys; a broken/non-object file is
+      never overwritten, and `clearLocalDisable` removes only the switch when rofm
+      is re-enabled;
+    - `test-adapter/compat-consent.test.mjs` (8): first Derpyu detection reports
+      `pending-consent`, registers **one** exact route on
+      `/api/rofm/derpyu-consent` declaring both `GET` and `POST` (the host keys
+      exact Fetch routes by path, so a second registration on the same path is
+      rejected — the mock throws like the host does), dispatches on
+      `request.method`, survives a connection-remount re-entry without a second
+      registration, and leaves the third-party file byte-identical
+      (no backup, no decision file); allow patches immediately, persists once and a
+      restart reports `already` without a prompt; deny records `closed:"bundle"`,
+      disposes every tool/section/listener, keeps the consent API alive and returns
+      `pending:false`; the deny test closes the Settings switch through the mocked
+      `pluginManager` (called with `('dsh-rofm', false)`), and a later re-enable (new
+      plugin instance) upgrades the decision to `allowed`, injects the whitelist and
+      re-registers every tool without a second prompt; without a `pluginManager` the
+      deny falls back to `closed:"hard"` + `config.local.json enabled:false` (a broken
+      local file warns but is not overwritten) and stays inert;
+      `derpyuConsent="allow"` pre-authorizes; `autoPatchDerpyu=false` never prompts;
+      `enabled:false` short-circuits before detection, tools and routes;
+    - install/update timing: the pending test removes the fake qq-bridge from the
+      profile → `GET` reports `detected:false`, restores it → `GET` flips back to
+      `pending:true` on the next query (the host re-detects without a plugin
+      restart; the client half deliberately has **no background polling**, so a
+      page open at install time needs a reload); the deny test proves the Settings
+      switch is closed through the mocked `pluginManager`, a later re-enable
+      upgrades the decision and re-registers every tool, and a legacy per-install
+      decision is migrated to `$DSH_HOME/rofm/`;
+    - `test/client-half.test.mjs` (9): `client.js` parses as a plain browser script,
+      declares the ModuleLoader entry, route and POST contract, pins the
+      `×`/`Esc` dismiss escape and the "stop polling once settled" rule (the
+      2026-11-10 stuck-dialog regression), does not embed the
+      host copy, pins `role=dialog`/`aria-modal`/theme variables with fallbacks, the
+      `dsh.client` manifest (`platform:"web"`, `immediately:true`, `exports["./client"]`)
+      and a ≤480-line budget;
+    - `test-adapter/compat-pipeline.test.mjs`: the patch-mechanics case now
+      pre-authorizes with `derpyuConsent:"allow"` (the prompt/pending/deny paths are
+      covered above), so the backup/atomic/idempotent assertions stay intact;
+    - docs/config gates: `compat.derpyuConsent` is present in the shipped
+      `config.json` and validated by `normalizeCompatConfig`; the version/CHANGELOG
+      gate (`config-consistency` + `release`) reads 1.5.7.
+
 
 As of the v1.2.1 revision the suites were **188/188 (engine)** and **115/115
 (adapter)**; v1.3.0 measured **493 (491 pass + 2 skip)**. The release gate is
@@ -4046,16 +4217,16 @@ As of the v1.2.1 revision the suites were **188/188 (engine)** and **115/115
 time-view `--help` / e2e-adapter / fixture e2e-real-data; all 8 exit 0 → PASS;
 since v1.4.1 every `node:test` step also enforces a minimum case count and a
 maximum skip count; the full-suite floor comes from `tools/gate-baseline.json`
-(recorded 1332 / max-skip 4 / e2e 12/8; effective floor = max(recorded, 98% of the
+(recorded 1358 / max-skip 2 / e2e 12/8; effective floor = max(recorded, 98% of the
 statically scanned declarations); missing/corrupt baseline = FAIL; update the
 baseline whenever tests change). Negative proofs: deleting a 53-test file FAILS
-(expected ≥1332, got 1279); skipping all e2e FAILS.
-**Current measured numbers (v1.5.6, 2026-11-09)**: full suite **1332 tests /
-1330 pass / 0 fail / 2 skip**; e2e-adapter **12/12**, fixture e2e **8/8**;
-gate `8/8 PASS` with **1332 unique** node:test cases (the two e2e steps are
+(expected ≥1358, got 1305); skipping all e2e FAILS.
+**Current measured numbers (v1.5.7, 2026-11-10)**: full suite **1358 tests /
+1356 pass / 0 fail / 2 skip**; e2e-adapter **12/12**, fixture e2e **8/8**;
+gate `8/8 PASS` with **1358 unique** node:test cases (the two e2e steps are
 already part of the full run and are not double-counted; the script also prints
 the summed number of the re-runs). Final numbers are recorded in
-`docs/VERIFICATION.md` §31 (current; §20–§30 historical) and printed by the gate — do not hardcode
+`docs/VERIFICATION.md` §32 (current; §20–§31 historical) and printed by the gate — do not hardcode
 them here (they drift every release). Run
 `node tools/verify-1.4.0.mjs`, `node --test test/*.test.mjs`,
 `node --test test-adapter/*.test.mjs`, `node test/simulate.mjs`,

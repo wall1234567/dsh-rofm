@@ -1,9 +1,10 @@
 {
   "name": "dsh-rofm",
-  "version": "1.5.6",
+  "version": "1.5.8",
   "description": "DSH 长期记忆插件：上下文超过阈值时把最早的一段对话归档进 memory/ 回忆文件夹（v1.4.1 起每次归档至少压到 releaseTargetPercent 以下），之后按关键词（双向匹配）、确定性优先级 α（FAIR-DRI）与可选时间/事件/地点/人物/时间标签约束自动回忆；v1.5.0 起支持四类标签硬过滤、多事件、自适应配额 20、多子句逐题作答与「你说过」助手原话召回。 · DSH long-term memory: archives the earliest context into memory/ folders, then recalls it deterministically by keywords, priority α, time windows, events and location/person/time tags (v1.5.0 adds hard tag filters, multi-event, adaptive quota 20, multi-clause recall and assistant-utterance recall).",
   "type": "module",
   "main": "index.js",
+  "icon": "icon.png",
   "scripts": {
     "test": "node --test",
     "simulate": "node test/simulate.mjs",
@@ -18,16 +19,18 @@
   "exports": {
     ".": "./index.js",
     "./locale/*.json": "./locale/*.json",
-    "./icon": "./icon.svg",
-    "./package.json": "./package.json"
+    "./icon": "./icon.png",
+    "./package.json": "./package.json",
+    "./client": "./client.js"
   },
   "files": [
     "index.js",
+    "client.js",
     "lib",
     "engine",
     "tools",
     "locale/*.json",
-    "icon.svg",
+    "icon.png",
     "cordis.patch.yml",
     "config.json",
     "memory/.gitkeep",
@@ -38,6 +41,11 @@
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": []
     }
   },
   "keywords": [

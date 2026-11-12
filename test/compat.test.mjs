@@ -61,6 +61,7 @@ test('normalizeCompatConfig: a missing block yields defaults with no warnings', 
     assert.deepEqual(compat.ownerIds, [])
     assert.equal(compat.memberMinAlpha, 0.5)
     assert.equal(compat.autoPatchDerpyu, true)
+    assert.equal(compat.derpyuConsent, 'ask', 'v1.5.7: the whitelist patch asks before writing')
     assert.equal(compat.channelScore, 'model')
     assert.deepEqual(compat.mediaRoots, [])
     assert.equal(compat.maxImageBytes, 8 * 1024 * 1024)
@@ -74,6 +75,7 @@ test('normalizeCompatConfig: invalid fields fall back to defaults with warnings'
     ownerIds: 'me',
     memberMinAlpha: 2,
     autoPatchDerpyu: 'yes',
+    derpyuConsent: 'deny',
     channelScore: 'magic',
     mediaRoots: 'C:/x',
     maxImageBytes: -1,
@@ -83,12 +85,14 @@ test('normalizeCompatConfig: invalid fields fall back to defaults with warnings'
   assert.deepEqual(compat.ownerIds, [])
   assert.equal(compat.memberMinAlpha, 0.5)
   assert.equal(compat.autoPatchDerpyu, true)
+  assert.equal(compat.derpyuConsent, 'ask')
   assert.equal(compat.channelScore, 'model')
   assert.deepEqual(compat.mediaRoots, [])
   assert.equal(compat.maxImageBytes, DEFAULT_COMPAT_CONFIG.maxImageBytes)
   assert.equal(compat.stagingTtlMs, DEFAULT_COMPAT_CONFIG.stagingTtlMs)
-  assert.equal(warnings.length, 8, warnings.join('\n'))
+  assert.equal(warnings.length, 9, warnings.join('\n'))
   assert.ok(warnings.some((warning) => warning.startsWith('compat.qqBots')))
+  assert.ok(warnings.some((warning) => warning.startsWith('compat.derpyuConsent')))
 })
 
 test('normalizeCompatConfig: valid values are kept and normalized', () => {
@@ -97,6 +101,7 @@ test('normalizeCompatConfig: valid values are kept and normalized', () => {
     ownerIds: [' 123 ', 456, 456],
     memberMinAlpha: 0,
     autoPatchDerpyu: false,
+    derpyuConsent: 'allow',
     channelScore: 'heuristic',
     mediaRoots: ['C:/media', 'C:/media', ''],
     maxImageBytes: 1024,
@@ -107,6 +112,7 @@ test('normalizeCompatConfig: valid values are kept and normalized', () => {
   assert.deepEqual(compat.ownerIds, ['123', '456'])
   assert.equal(compat.memberMinAlpha, 0)
   assert.equal(compat.autoPatchDerpyu, false)
+  assert.equal(compat.derpyuConsent, 'allow')
   assert.equal(compat.channelScore, 'heuristic')
   assert.equal(compat.mediaRoots.length, 1)
   assert.equal(compat.maxImageBytes, 1024)

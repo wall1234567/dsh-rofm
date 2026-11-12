@@ -14,8 +14,9 @@
 > 不再代表当前版本（数字统一以 `npm test` 实测为准，不在文档里写死）。
 > **v1.4.0 的验证记录见 §20**（确定性召回/公平性、时间辅助、小窗口、数据时代、兼容与性能）——
 > §20/§21 是 **v1.4.0 的历史记录**（2026-11-01/02 实测，数字已过时，仅作历史留档）。
-> **当前版本 v1.5.6 的最终验证记录见 §31**（2026-11-09 实测，含全量测试/门禁/自检/e2e/真实数据前后对比）；
-> §22–§30 为 v1.4.1–v1.5.5 的历史记录（其中 v1.4.3 见 §24、v1.6.0 见 §27、v1.5.5 见 §30）。
+> **当前版本 v1.5.8 的最终验证记录见 §33**（2026-11-13 实测，图标替换 + 全量测试/门禁/自检/e2e）；
+> §32 是 v1.5.7 的授权弹窗验证记录（2026-11-10/12，v1.5.8 未改其代码，结论仍适用）；
+> §22–§31 为 v1.4.1–v1.5.6 的历史记录（其中 v1.4.3 见 §24、v1.6.0 见 §27、v1.5.5 见 §30、v1.5.6 见 §31）。
 
 ## 1. 自动化测试
 
@@ -138,7 +139,7 @@ pre-step 归档（待评分，不调用模型）、超过 emergency 线后的多
 - 真机验证是在**子代理会话**上完成的（测试配置对主会话关闭，避免污染当前对话）；
   主会话与子代理会话走同一套代码路径，主会话路径由 `test-adapter` 的 mock 测试覆盖，
   但没有在主会话上真机触发归档；
-- 插件管理器的标题/描述/图标资源已按 DSH 规范导出（`locale/*.json`、`icon.svg`、
+- 插件管理器的标题/描述/图标资源已按 DSH 规范导出（`locale/*.json`、`icon.png`、
   package exports），但没有浏览器截图能力，**Plugins 页面的实际渲染未做视觉验证**；
 - `compress.contextWindowTokens > 0` 会强制覆盖宿主窗口（用于小窗口/测试），
   默认 0 表示使用 DSH 上报值。
@@ -1883,3 +1884,244 @@ node tools/verify-1.4.0.mjs
 `package.json` / `engine/package.json` = **1.5.6**；`tools/gate-baseline.json` = **1332**；
 README §1.18 / SPEC §6.13/§27-28 / CHANGELOG [1.5.6] / `config.json` `_readme` 已同步；
 数据格式无变化，无需迁移。
+
+---
+
+## 32. v1.5.7 最终验证（2026-11-10）
+
+**范围**：Derpyu 白名单注入改为「第一次需要时先弹系统提示窗授权」——
+① 允许 = 与 1.5.6 相同的备份 + 原子注入，决定写入机器级 `$DSH_HOME/rofm/.compat-consent.json`（默认 `~/.dsh/rofm/`，只问一次）；
+② 不允许 = 记录 `denied`（`closed:"bundle"`）、当前进程立即注销，并关闭 rofm 在设置里的开关（在设置里重新打开 rofm = 视为允许并注入白名单；无 `pluginManager` 时回退 `enabled:false`）
+工具/section/监听器（默认关闭，后续可自行开启）；
+③ 未回答 = 保持 pending，绝不写第三方文件（Derpyu 通道回退启发式评分）；
+④ 新增浏览器半身 `client.js`（`dsh.client = {platform:"web", immediately:true, inject:[]}`）+
+同源认证接口 `GET/POST /api/rofm/derpyu-consent`；
+⑤ 新配置 `compat.derpyuConsent`（`"ask"` 默认 / `"allow"` 预授权）。
+
+### 32.1 测试与门禁（本机实测）
+
+- `node --test`（全量，node 24.21.0）= **1358 tests / 1356 pass / 0 fail / 2 skip**
+  （2 skip 为 Node zstd 平台条件跳过）。相对 1.5.6（1332）新增 **26** 例：
+  `test/compat-consent.test.mjs`（9）、`test-adapter/compat-consent.test.mjs`（8）、
+  `test/client-half.test.mjs`（9）；`test-adapter/compat-pipeline.test.mjs` 的“补丁机制”用例
+  改为 `derpyuConsent:"allow"` 预授权（断言内容不变，弹窗/pending/deny 由新用例覆盖）。
+- `node tools/verify-1.4.0.mjs` = **8/8 PASS**（`tools/gate-baseline.json` → **1358**；
+  **1358 unique / 1378 summed with e2e re-runs**）；e2e-adapter 12/12、e2e-real-data 8/8。
+- `test/config-consistency.test.mjs` 通过：版本 1.5.7、CHANGELOG 有 `## [1.5.7]` 段、
+  两个 `package.json` 版本一致、`config.json` 是合法 JSON 且与 `DEFAULT_CONFIG` 一致。
+- `test/release.test.mjs` 通过（CHANGELOG 当前段可被 release 工具提取；npm 包文件清单含 `client.js`）。
+- `node tools/privacy-check.mjs` = PASS（跟踪的 `config.json` 无本机 QQ 号/路径；
+  `.compat-consent.json` 与 `config.local.json` 都是 gitignored 的本机文件）。
+
+### 32.2 授权门禁行为核对（适配层 mock，不需要 DSH）
+
+`test-adapter/compat-consent.test.mjs` 用临时假 profile + 真实 `detectQqCompat` + mock
+`connection.fetch` 路由，逐条钉死：
+
+1. **pending 不写文件**：首次检测到 Derpyu 时 `autopatchStatus.status="pending-consent"`、
+   `autopatchApplied=false`；第三方文件 sha/内容不变、无 `.bak-rofm-*`、无决定文件；
+   GET 返回 `pending:true` + 用户指定原文 + 真实 `targetFile`；非法 POST 返回 400 且仍 pending。
+2. **允许**：`POST {"decision":"allow"}` 返回 `decision:"allowed"/patch:"patched"`，立即注入四工具名并备份；
+   `memory/.compat-consent.json` 写入 `allowed`；第二个标签页/重复点击幂等 `already:true`；
+   重启（新实例、同 memoryDir）不发弹窗、`status:"already"`。
+3. **拒绝**：`POST {"decision":"deny"}` 后写入 `denied` 决定 + `config.local.json` 的 `enabled:false`
+   （保留其它键）；当前实例 `consentDenied=true`，4 个工具/3 个 section 全部注销、事件监听器为 0、
+   section 渲染返回 `''`、引擎清空；consent API 本身保留（页面再问拿到 `pending:false/decision:"denied"`，
+   不会永远重试）；第三方文件保持 byte-identical（拒绝不回滚历史补丁，也不新增写入）。
+4. **坏 `config.local.json`**：不覆盖用户文件，仅返回 `warning`，仍写入 `denied` 并停用当前实例。
+5. **显式开关**：`derpyuConsent:"allow"` = 无弹窗直接注入（headless/CI 逃生门）；
+   `autoPatchDerpyu:false` = 永不弹窗、永不写文件（`status:"disabled"`）。
+6. **已拒绝后再开启**：决定文件 `denied` + `enabled:true` 时启动不发弹窗、不注入，
+   日志 WARN 说明 QQ 渠道回退 heuristic；删决定文件或设 `derpyuConsent:"allow"` 才恢复补丁路径。
+7. **`enabled:false` 启动早退**：检测、工具、section、路由、监听器都不注册（与 1.5.6 的早退语义一致）。
+
+### 32.3 浏览器半身核对
+
+- `node --check client.js` = OK；`test/client-half.test.mjs` 9/9 PASS：纯浏览器脚本可解析、
+  `window.__ModuleLoader__.load({id:"dsh-rofm"})`、`exports.name/inject=[]/apply`、
+  路由 `/api/rofm/derpyu-consent`、POST `{"decision":"allow"|"deny"}`、`ctx.effect` 清理、
+  `role=dialog`/`aria-modal`/主题变量 + fallback、**不内嵌**主文案（唯一真相在宿主）、
+  `package.json` 的 `dsh.client` 与 `exports["./client"]`、≤480 行。
+- 额外做了一次**未提交**的 DOM/fetch 桩运行（临时脚本，不进仓库）：模拟
+  `window.__ModuleLoader__`/`document`/`fetch` 执行 `apply`，6 个场景全过——
+  ①pending 弹窗→点允许→POST allow→显示 allowedNotice→2s 淡出移除→ctx 清理；
+  ②重复 apply 只保留 1 个弹窗；③POST 500 显示重试且按钮恢复；④`already:true` 立即关窗；
+  ⑤fetch 持续失败不弹窗、不抛未捕获异常；⑥dispose 后不再发请求。
+- **真实浏览器端到端尚未执行（限制，不是缺陷）**：本机 desktop profile 当前**没有 `dsh-rofm`
+  的 Loader row**（`package.json` 里仍是 link 依赖，但 `dsh.profile.bundles` 与
+  `cordis.patch.yml` 都不含它，`plugin_manager list_plugins` 也查不到该行），所以运行中的
+  DSH 不会加载本插件、也不会加载/client.js。启用/重装 bundle 行并重载 DSH 后，页面加载时会
+  自动轮询 `/api/rofm/derpyu-consent`；本机已有历史补丁（`.compat-state.json` 1 条记录），
+  因此第一次应看到弹窗：允许 → `already` 直接恢复模型评分；不允许 → rofm 关闭
+  （可在 `config.local.json` 改回 `enabled:true` 后重载重新开启）。
+
+### 32.4 数据 / 隐私 / 回滚
+
+- **无数据迁移**：`memory/` 的 meta/context/index 格式不变（engine 测试全绿）；本机真实库
+  `tools/selfcheck.mjs` 只读 PASS：3 store / 1264 folder / 1264 index entry、2 pending / 1262 scored、
+  124 行 stats、2 个 recall-state 文件；本轮未写入真实 `memory/`。
+- `.compat-consent.json` 是本机运行状态（不是记忆数据、不进 npm 包、不提交、不迁移）；
+  `config.local.json` 早已在 `.gitignore`；允许/拒绝决定只落本机。
+- **回滚**：删 `$DSH_HOME/rofm/.compat-consent.json`（默认 `~/.dsh/rofm/`）可在下次检测重新询问；`derpyuConsent:"allow"` 恢复
+  1.5.6 的自动补丁；拒绝后想完全恢复补丁可用 `.bak-rofm-*` 备份或手删 SAFE_EXACT 里四行（§3.2.5）。
+
+### 32.5 复跑命令
+
+```bash
+export PATH="<node-bin>:$PATH"
+cd <repo>
+node --test
+node --test test/compat-consent.test.mjs test-adapter/compat-consent.test.mjs test/client-half.test.mjs
+node --test test-adapter/compat-pipeline.test.mjs test-adapter/compat-integration.test.mjs
+node tools/verify-1.4.0.mjs
+```
+
+### 32.6 版本
+
+`package.json` / `engine/package.json` = **1.5.7**；`tools/gate-baseline.json` = **1358**
+（max skip 4；e2e 12/8）；README §1.19 + §3.2.5/§3.2.9 / SPEC §2 addendum + §29 /
+CHANGELOG [1.5.7] / `config.json` `_readme` 已同步；数据格式无变化，无需迁移。
+
+### 32.7 弹窗卡死事故与同类风险复查（2026-11-10）
+
+**现象**：首次真机弹窗出现后，点「允许」一直「提交失败，请重试」，弹窗无关闭出口，
+页面被遮罩卡住（用户切换到其它工具修复）。
+
+**根因**：DSH `connection.fetch` 的 exact Fetch 路由表按 **path 唯一定位**
+（`Map<path, route>`，方法集挂在路由值上）。v1.5.7 把 GET 与 POST 拆成两次
+`connection.fetch.register` 注册同一路径：第二次注册被宿主以 "already registered" 拒绝，
+异常被 catch 吞掉，实际只留下 GET 路由 → 弹窗能弹（GET 正常），提交 POST 404 →
+客户端重试提示，且当时弹窗没有关闭按钮 → 永久卡住。
+
+**修复**（同日）：① 改为**一次注册** `methods:['GET','POST']`，handler 按 `request.method`
+分发；② 适配层 mock 改成「同路径重复注册即抛错」，allow 用例直接走 `route.fetch` 提交，
+把双路由写法在测试层钉死；③ 浏览器半身新增 × / Esc 关闭出口与「接口不可用」提示，
+关闭后停止本页轮询（宿主保持 pending，刷新重新询问）。
+
+**同类风险复查与加固**：
+
+| 风险 | 处理 |
+|---|---|
+| 热重载/服务重挂载再次注册同一 path（第二个实例与旧实例重叠） | 宿主路由改为按 connection 的模块级 claimant bus：只注册一次，新实例接管 handler，最后一个 claim 释放时注销；适配层加入 `ctx.inject` 重入用例（只 1 条路由、无 duplicate 警告、GET 仍可用） |
+| 路由 handler 抛异常 → rejected promise（宿主 500/无响应） | 统一 catch 成 JSON 500，客户端显示可重试错误，不会挂死 |
+| POST 失败/接口消失时弹窗无法退出 | × / Esc + 「授权接口已不可用」提示；关闭后 `stopped` 停止轮询、宿主保持 pending |
+| 本页已作答但宿主仍 pending（决定没写成功）→ 30s 空转轮询 | 检测到 `settled && pending` 直接停止轮询，刷新后重新询问 |
+| 连续 404（插件被禁用）时无限轮询 | 6 次退避后停止，弹窗仍在时提示可关闭后刷新 |
+| 关闭与生命周期清理冲突（关闭后 dispose 不再清 DOM） | 生命周期幂等用独立的 `disposed` 标志，`dispose()` 始终清理 DOM/样式/监听器/定时器 |
+| 多标签页/重复点击 | 既有 `already:true` / `pending:false` 收敛 + 释放式 claim，不重复弹窗 |
+
+回归证据：`node --test test-adapter/compat-consent.test.mjs`（8/8，含重入用例）、
+`test/client-half.test.mjs`（9/9，含 ×/Esc 与停止轮询断言）、`test/compat-consent.test.mjs`（9/9）；
+全量 `node --test` = 1358 tests / 1356 pass / 0 fail / 2 skip；`node tools/verify-1.4.0.mjs`
+= 8/8 PASS（见 32.1）。真机复验：重载插件后弹窗出现，允许 → 决定写入
+`$DSH_HOME/rofm/.compat-consent.json`（本机实测 `decision:"allowed"`），再点 × 可正常关闭、页面不卡。
+
+### 32.8 安装/更新时序与「只问一次」语义（2026-11-12 加固）
+
+**判定链**（全部满足才弹）：rofm 被 DSH 加载 → compat 检测开启 → 检测到 qq-bridge/Derpyu →
+`autoPatchDerpyu !== false` → `derpyuConsent === "ask"` → **机器级**状态文件里没有决定 →
+Web GUI 页面加载了 `client.js` 并轮询到 `pending:true`。
+
+**授权决定位置（本轮加固）**：`$DSH_HOME/rofm/.compat-consent.json`（默认 `~/.dsh/rofm/`），
+不再放在插件安装目录的 `memory/`。因此 DSH 更新/重装（npm 包目录被替换）、改 `storage.dir`、
+换 profile 都不会丢失决定或重问；旧版放在 `memory/` 的安装级记录在首次读取时迁移。
+**拒绝 = 关闭设置开关，重新打开即允许**（2026-11-12 二次修订）：拒绝时记录 `closed:"bundle"`、当前进程
+立即停用，并异步关闭 rofm 在设置里的开关；之后在设置里重新打开 rofm，启动时自动升级为 `allowed`、
+注入白名单、不再弹窗。仅无 `pluginManager` 时回退为硬关闭（删状态文件或 `derpyuConsent:"allow"`）。
+
+**场景矩阵**：
+
+| # | 场景 | 能否正确响应 | 弹窗时机 | 备注 |
+|---|---|---|---|---|
+| 1 | 已有 qq-bridge + 旧 rofm，更新到本版本（AI 改文件 / DSH 更新） | 能 | 新版本插件重载或 DSH 重启后；页面加载 `client.js` 约 2.5s | 旧版没有状态文件→视为第一次；历史补丁不阻止弹窗；若同进程热更新自「双路由」旧构建，建议完全重启 DSH（旧路由可能残留，路由注册失败会 WARN） |
+| 2 | 已有 qq-bridge，AI/DSH 安装 rofm | 能 | rofm 启动后（`application: applied` 即生效）+ 页面刷新/动态加载 `client.js` 后约 2.5s | 安装前没有 rofm 半身；DSH 运行中安装时页面可能需刷新一次以加载新 client bundle，宿主 API 已 live |
+| 3 | 已有 rofm，AI/DSH 安装 qq-bridge | 能 | **刷新页面后**弹窗（页面加载首次查询） | 浏览器半身**没有常驻轮询**（未检测到 qq-bridge 时零后台轮询，普通 rofm 化）；页面若已打开需刷新一次；宿主在下次查询时按 profile mtime 重新检测 |
+| 4 | 对 AI 说「安装 rofm 和 qq-bridge」 | 能 | 两者装好后打开/刷新页面时弹窗 | 顺序无关；后装 qq-bridge 按场景 3 需刷新页面 |
+| 5 | 无论允许/不允许都只响应最开始一次 | 允许/拒绝都满足 | 只在决定缺失时弹 | 允许：只问一次；拒绝：不再弹，且在设置里重新打开 rofm 即按允许处理（不弹）；例外（安全降级）：状态文件写失败、被删除/损坏、`$DSH_HOME` 换到另一台机器/另一个账号时视为“未决定”会再问 |
+
+**回归证据**：`test-adapter/compat-consent.test.mjs` 的 pending 用例模拟“先 rofm 后装 qq-bridge”：
+先移除 fake profile 里的 qq-bridge → `GET` 返回 `detected:false`（客户端此时停止轮询），
+再恢复 → 下一次 `GET` 变回 `pending:true`（无需重启插件；页面已打开时需刷新才会发起该次查询）；deny 用例证明 deny 会关闭设置开关
+（mock `pluginManager` 收到 `('dsh-rofm', false)`），随后“用户重新打开 rofm”的新实例把决定升级为
+`allowed`、注入白名单并重新注册全部工具（不再弹窗）；旧 `memory/` 的 legacy deny 则保持硬关闭
+（工具/section/路由均为 0）。全量 `node --test` 通过；
+`node tools/verify-1.4.0.mjs` 8/8 PASS。
+
+**仍然存在的边界**（有意保留，避免误改第三方文件）：无 GUI/无浏览器页面时保持 pending（不弹也不写）；
+热更新自旧构建且旧路由未注销时，新实例路由注册失败只 WARN + 需完全重启；状态文件写失败会退回“下次再问”。
+
+### 32.9 拒绝后「设置里重新打开 rofm」语义修订（2026-11-12 二次修订）
+
+用户要求：**拒绝后只要在设置里重新打开 rofm，就可以正常使用 rofm（包括注入白名单）**。原
+「拒绝=常驻关闭、只能删状态文件/显式 allow」的语义无法通过设置开关恢复，已改为：
+
+- 拒绝时：`writeConsent('denied', {closed:'bundle'})` → 当前进程 `disableRuntime()`（工具/section/
+  监听器注销）→ 异步调用宿主 `pluginManager.setBundleEnabled('dsh-rofm', false)`，把 rofm 在
+  “设置 → 插件”里的开关关掉；不再写 `config.local.json enabled:false`。
+- 用户在设置里重新打开 rofm：插件重新加载，`start()` 读到 `denied + closed:"bundle"` → 视为
+  **自行开启 = 允许**：升级状态为 `allowed`、清掉遗留 `config.local.json enabled:false`、执行
+  `refreshAutopatch`（注入白名单）、正常注册全部工具；**不再弹窗**。
+- 回退路径（宿主没有 `pluginManager` 服务 / 关闭开关失败）：记录 `closed:"hard"` 并写
+  `config.local.json enabled:false`，保持旧的硬关闭；重新开启需删状态文件（会重新询问）或
+  `compat.derpyuConsent:"allow"`。
+- 测试（适配层 mock `pluginManager`）：deny 后断言 `pluginManager.setBundleEnabled('dsh-rofm', false)`
+  被调用、决定 `closed:"bundle"`、`config.local.json` 没有 `enabled` 键；随后用同一状态新建插件
+  （模拟用户重新打开）→ 断言不弹窗、`consentDenied=false`、`autopatchApplied=true`、工具全部注册、
+  状态升级为 `allowed`。无 `pluginManager` 的分支断言 `closed:"hard"` + `enabled:false` + 重启仍
+  inert。单元测试补 `closed` 往返与 `clearLocalDisable`。全量 `node --test` = 1358 tests / 0 fail；
+  `node tools/verify-1.4.0.mjs` = 8/8 PASS。
+
+### 32.10 零后台轮询修订（2026-11-12）
+
+用户要求：**没检测到 qq-bridge 时连轮询都完全停掉**（普通 rofm 不得有后台请求）。
+
+- `client.js` 的非 pending 分支现在直接 `stopped = true`：没有 qq-bridge / 已决定 / 预授权 /
+  补丁关闭 → 页面加载首次查询后即停止，不再有 30s 常驻复查。
+- 失败重试（2.5s→30s 退避、连续 404 六次停止）仅用于页面加载时宿主接口尚未就绪的握手，
+  不再用于「等 qq-bridge 后装」。
+- 已知代价（文档已同步）：qq-bridge 在本页面打开之后才安装 → 需要**刷新页面**才会弹窗
+  （宿主持久保持 pending，刷新后首次 GET 即弹）；rofm 未加载页面时安装 qq-bridge，则下次打开页面弹。
+- 回归：`test/client-half.test.mjs` 改为断言源码里不存在 `watchLater` 常驻复查、且非 pending
+  必须停止轮询；`node --test` = 1358 tests / 0 fail；`tools/verify-1.4.0.mjs` = 8/8 PASS。
+
+## 33. v1.5.8：插件图标替换（2026-11-13）
+
+### 33.1 变更
+
+- **图标**：`icon.svg` → `icon.png`。源图是用户提供的 1024×1024「水面涟漪」插画；用 Pillow
+  （LANCZOS）缩放到 256×256，再按 22% 圆角做 alpha 遮罩（四角透明），输出 151,242 B 的 PNG。
+- **清单**：`package.json` 顶层新增 `"icon": "icon.png"`；`exports["./icon"]` 由 `./icon.svg` 改为
+  `./icon.png`；`files` 里 `icon.svg` → `icon.png`；仓库根的 `icon.svg` 删除。README 目录树与
+  §3 的图标说明同步。
+- 运行时、数据格式、配置项均未改动（无迁移）。
+
+### 33.2 与 DSH 插件显示元信息规范的核对
+
+本机 DSH 0.2.2-rc.2 的 `package-meta`（`iconOf()`）规定：
+
+- 顶层 `package.json` 的 `icon`（相对清单目录）**优先**，没有才用 `<specifier>/icon` 导出资源；
+  顶层 icon 的解析前提是包导出 `./package.json`（本包已导出）；
+- 图标必须留在清单目录 / 包目录内，扩展名只接受 `.svg` / `.png` / `.jpg` / `.jpeg` / `.webp`；
+- 原始字节 ≤ 256 KiB（`MAX_ICON_BYTES = 256 * 1024`）；
+- 宿主把它转成 `data:<mime>;base64,…`，插件页用 `<img>`（CSS `object-fit: contain`；行图标 30px、
+  卡片 40px 容器）渲染，解码失败回退内置默认图。
+
+本包：PNG、151,242 B（< 256 KiB）、位于包根、路径相对清单目录。`npm pack --dry-run` 确认
+`icon.png` 在 tarball 内，且 `memory/` 只有 `.gitkeep`（无运行数据）。
+
+### 33.3 验证（2026-11-13，node v24.21.0）
+
+- `node --test` = **1358 tests / 1354 pass / 0 fail / 4 skip**（用例数与 1.5.7 相同；4 个 skip 是本机
+  平台条件跳过，`tools/gate-baseline.json` 的 `maxFullSuiteSkipped` = 4 内）。
+- `node tools/verify-1.4.0.mjs` = **8/8 PASS**：privacy / unit-tests（1358 / 1354 pass / 0 fail /
+  4 skip）/ simulate / selfcheck / cli-help / memory-audit / time-view / e2e-adapter 12/12 /
+  e2e-real-data 8/8；`steps: 8/8 PASS · node:test cases: 1358 unique`。
+- `npm pack --dry-run` = `dsh-rofm-1.5.8.tgz`，62 files，package 957.8 kB / unpacked 2.6 MB
+  （含 `icon.png` 151.2 kB），未包含任何 `memory/sessions/*` 运行数据。
+- `tools/privacy-check.mjs` PASS（跟踪文件无本机私有值）。
+
+### 33.4 未覆盖
+
+- **视觉渲染未截图**：插件页图标由 DSH Web GUI 渲染，本仓库没有浏览器截图能力（与 §3 的限制相同）。
+  机制层（解析顺序、扩展名白名单、256 KiB 上限、data URL 渲染路径）已按宿主源码核对；
+  DSH 重载插件行 / 重启后即可在「设置 → 插件」看到新图标。

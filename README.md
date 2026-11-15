@@ -19,7 +19,17 @@
 > （N = 累计归档段数），归档不再把宿主会重新注入的 pinned 上下文写进注记；新增
 > `tools/selfcheck.mjs` 独立自检工具（见 §7）。
 >
-> **v1.5.8（本版：插件图标换成「水面涟漪」插画；1.5.6 之后首次对外发布，含 1.5.7 授权弹窗）**
+> **v1.5.9（本版：Derpyu 唤醒提示词归档还原，修复模板/令牌被当成记忆召回）**
+>
+> - **问题**：qq-bridge 把整段「唤醒提示词」以 `source.kind="user"` 注入会话，rofm 归档时把它
+>   当成普通用户消息存进 memory folder；之后召回又把模板段落当“记忆”注入，形成自激循环。
+> - **修复**：仅在 **compat 检测命中 Derpyu + 当前会话是 `qqb-*`** 时，归档副本还原为
+>   `【本次消息快照】` 里的对话行（正文以 `[QQ 唤醒快照]` 开头）；召回查询也用这段对话，
+>   而不是模板。模板、角色卡与 `【会话令牌】` 不再入库。活会话消息、桥接与 onebot/WebUI 路径不动。
+> - **回滚**：`compat.derpyuWakeSanitize=false` 一键回到 1.5.8 行为；旧数据不迁移。
+> - 版本 1.5.8 → **1.5.9**。详见 §3.2.11 与 CHANGELOG 1.5.9。
+>
+> **v1.5.8（插件图标换成「水面涟漪」插画；1.5.6 之后首次对外发布，含 1.5.7 授权弹窗）**
 >
 > - **图标**：插件图标换成用户提供的「水面涟漪」插画——`icon.png`（256×256、圆角透明、151 KB），
 >   替换原 `icon.svg`；`package.json` 顶层 `icon` 与 `exports["./icon"]` 同时指向新文件，
@@ -1896,7 +1906,7 @@ v1.3.0 起，dsh-rofm 只对下面**两个** QQ 渠道插件做兼容（不追�
 | 渠道插件 | 形态 | 消息来源 | 会话 id | rofm 需要适配的点 |
 |---|---|---|---|---|
 | `dsh-onebot-qq`（npm，OneBot 11 / NapCat） | Host 插件 | `source.kind = "plugin:dsh-onebot"` | `onebot-<chatId>`；冲突/退役后追加 `-<base36 时间戳>` | 触发 kind 名字不同、群成员身份只写在正文里、图片/视频/文件以 `[图片:<路径>]` 注解投递（语音无路径）、群聊必须 @ 机器人 |
-| `Derpyu520/qq-bridge` | 独立桥接进程 + agent preset + MCP | `source.kind = "user"`（DSH `session/prompt` 的 user-rpc） | `qqb-<g\|p>-<数字id>-<32位hex>`；`/reset`、切模式会重建并换 hex | 会话 id 轮换、preset 工具白名单会拒绝 rofm 的本地记忆工具（v1.4.2 起为四个）、preset 自带压缩器 |
+| `Derpyu520/qq-bridge` | 独立桥接进程 + agent preset + MCP | `source.kind = "user"`（DSH `session/prompt` 的 user-rpc） | `qqb-<g\|p>-<数字id>-<32位hex>`；`/reset`、切模式会重建并换 hex | 会话 id 轮换、preset 工具白名单会拒绝 rofm 的本地记忆工具（v1.4.2 起为四个）、preset 自带压缩器；**唤醒提示词归档前会还原为其中的【本次消息快照】对话，模板/令牌不入库（`compat.derpyuWakeSanitize`，v1.5.9）** |
 
 ### 3.2.1 检测与开关
 
@@ -2058,6 +2068,7 @@ rofm 的归档阈值 60% **先于** preset/宿主压缩器的 80%，正常路径
   "memberMinAlpha": 0.5,
   "autoPatchDerpyu": true,
   "derpyuConsent": "ask",
+  "derpyuWakeSanitize": true,
   "channelScore": "model",
   "mediaRoots": [],
   "maxImageBytes": 8388608,
@@ -2080,6 +2091,7 @@ rofm 的归档阈值 60% **先于** preset/宿主压缩器的 80%，正常路径
 | `memberMinAlpha` | `0.5` | 非主人触发时的 α 下限；`0` = 关闭门控 |
 | `autoPatchDerpyu` | `true` | 自动向 Derpyu 注入工具白名单（§3.2.5）；`false` = 完全不碰第三方文件 |
 | `derpyuConsent` | `"ask"` | **v1.5.7**：第一次注入前是否先弹窗授权。`"ask"` = Web GUI 系统提示窗（默认）；`"allow"` = 预授权不弹窗（headless/CI）。拒绝后立即关闭 rofm 并关闭其在设置里的开关；之后在设置里重新打开 rofm 即视为允许（含白名单注入）。无 `pluginManager` 时回退为 `config.local.json enabled:false` |
+| `derpyuWakeSanitize` | `true` | **v1.5.9**：Derpyu 唤醒提示词归档前还原为 `【本次消息快照】` 的对话行，模板/角色卡/会话令牌不入库；自动召回也只查询这段对话。`false` = 一键回滚到 1.5.8 行为（未装桥 / 非 Derpyu 会话不受影响） |
 | `channelScore` | `"model"` | `model` / `heuristic` |
 | `mediaRoots` | `[]` | onebot 本地图片允许的根目录（**建议写绝对路径**，支持 `~/` 展开；空 = 不归档图片；Linux 大小写敏感、Windows 忽略大小写，见 §2.4） |
 | `maxImageBytes` | `8388608` | 单张图片大小上限（字节） |
@@ -2200,7 +2212,29 @@ dot 目录、文件）一律忽略；只读 `index.json` 与 `context.json`，�
 - **与 `storage.perSession`**：跨聊天查询依赖“一个聊天一个目录”的边界；`perSession=false` 时无法区分聊天 → 工具直接拒绝。
 - **与 `memory_recall` / 自动回忆**：两者都不会读群聊 store；本工具也不会动召回车道、注入块或 `recall-state.json`。
 
-### 3.2.11 已知限制
+### 3.2.11 Derpyu 唤醒提示词归档还原（v1.5.9）
+
+qq-bridge 的每条唤醒都是**一条** `source.kind="user"` 消息：角色卡 + 规则 + `【会话令牌】` +
+`【本次消息快照】` JSON + 尾部指令。它不是用户说的话，而是桥接的**传输外壳**。v1.5.9 之前 rofm
+把它整段归档，模板与令牌因此成为 memory folder 的正文，随后又作为“记忆”被召回。
+
+v1.5.9 只在「**compat 检测命中 Derpyu** + 会话 id 是 `qqb-*` + `compat.derpyuWakeSanitize !== false`」
+时生效，且只改两处：
+
+| 位置 | 行为 |
+|---|---|
+| 归档副本（主动 + 被动） | 有快照 → `[QQ 唤醒快照]` + `messages`/`recent` 的对话行；快照为空 → `[QQ 唤醒：无新消息]`；JSON 解析失败 → 一行标记 + WARN；无快照的 shell 唤醒 → `[QQ 唤醒：无新消息]` |
+| 自动召回查询 | 只拿快照里的对话去检索；没有新对话的唤醒**跳过本轮自动召回**，不再拿模板段落当查询 |
+
+- 对话行格式：`[at] sender：text`（`at` 存在才加），同一 packet 内按 `messageId || seq` 去重，
+  `text` 优先、`plain` 兜底；会话令牌脱敏、孤立代理项清洗、正文最多 8000 字符。
+- **活会话消息、turn 保护、桥接、onebot / WebUI / 子代理路径都不动**；识别不到唤醒提示词时原样归档。
+- **token 口径分离**：压缩释放核算仍用 token-meter 测量到的原消息 token（上下文实际释放量），
+  folder 的 `meta.stats` 用清洗后的正文计算。
+- 旧数据不迁移：新归档立刻干净；已经入库的模板 folder 不重写、不删除。
+- 回滚：`compat.derpyuWakeSanitize=false`（行为回到 1.5.8）。
+
+### 3.2.12 已知限制
 
 - **Derpyu 图片不可归档**：正文只有 `[图片]` 标记、没有本地路径；
 - **群成员门控仅 onebot**：Derpyu 的触发消息是桥合成唤醒，没有发送者身份；
@@ -2234,7 +2268,8 @@ dsh-rofm/
 │   ├── qq-media.js          # ★ v1.3.0 onebot 本地图片路径解析/realpath 白名单校验/staging 暂存与清理
 │   ├── compaction.js        # 用 DSH 官方 compaction 事务替换被归档的上下文
 │   ├── config-store.js      # config.json 热加载（含 compat 块校验；v1.4.0 ADAPTER_DEFAULTS 新键）
-│   ├── surface.js           # Session surface → 可归档 entry（v1.3.0 追加第三方 user kind；v1.4.0 checkWindowSanity/protectTurnOf/event.time 透传）
+│   ├── surface.js           # Session surface → 可归档 entry（v1.3.0 追加第三方 user kind；v1.4.0 checkWindowSanity/protectTurnOf/event.time 透传；v1.5.9 wakeSanitize）
+│   ├── wake-prompt.js       # ★ v1.5.9 Derpyu 唤醒提示词识别/归档还原/召回查询（纯字符串、无 DSH import）
 │   └── message-text.js      # 消息 → 纯文本
 ├── engine/                  # ★ 独立记忆引擎：零依赖、无 DSH import、可单独运行
 │   ├── index.js             # 公共 API（含 β 常量/normalizeBeta/formatBeta/RECALL_BLOCK_PREAMBLE + v1.4.0 新导出）
@@ -2472,7 +2507,7 @@ node engine/cli.mjs --help        # 独立引擎 CLI
 | # | 步骤 | 内容 |
 |---|---|---|
 | 0 | privacy | `node tools/privacy-check.mjs`（门禁 preflight，不计入 8 steps；跟踪 config 含个人信息即 FAIL） | — |
-| 1 | unit-tests | `node --test` 全量（**1358 tests / 1356 pass / 0 fail / 2 skip**；门禁实测 ~50s（机器负载不同）；下限由 `tools/gate-baseline.json` 维护——当前 1358） |
+| 1 | unit-tests | `node --test` 全量（**1379 tests / 1375 pass / 0 fail / 4 skip**；门禁实测 ~50s（机器负载不同）；下限由 `tools/gate-baseline.json` 维护——当前 1379） |
 | 2 | simulate | `node test/simulate.mjs`（legacy 回归；<1s） |
 | 3 | selfcheck | `node tools/selfcheck.mjs`（配置/存储/时代/时间/公平性/事件/日志；~2s） |
 | 4 | cli-help | `node engine/cli.mjs --help` |
@@ -2481,14 +2516,14 @@ node engine/cli.mjs --help        # 独立引擎 CLI
 | 7 | e2e-adapter | `node --test test/e2e-adapter-simulate.test.mjs`（**12 用例**；skip 视为失败） |
 | 8 | e2e-real-data | `node --test test/e2e-real-data-readonly.test.mjs`（**8 用例**，基于 `test/fixtures/memory-snapshot/**` 夹具；skip 视为失败） |
 
-**结果（1.5.7 实测，2026-11-10）：8/8 PASS**；汇总 node:test 用例 = **1358 unique（1378 summed with e2e re-runs）**——
+**结果（1.5.9 实测，2026-11-15）：8/8 PASS**；汇总 node:test 用例 = **1379 unique（1399 summed with e2e re-runs）**——
 e2e 两步已包含在全量 `--test` 里，**不重复计入 unique**；脚本同时打印含两次 e2e 重跑的 summed 数；
-**1356 pass / 2 skip / 0 fail**（2 skip 为 Node zstd 平台条件跳过，非缺陷）。
+**1375 pass / 4 skip / 0 fail**（4 skip 为 Node zstd 平台条件跳过，非缺陷）。
 `npm run check` 是同一套检查的等价展开（把 e2e 换成 `npm test` 一步）。
 门禁不是“0 fail 即绿”：**测试数下限由 `tools/gate-baseline.json` 维护**
 （`minFullSuiteTests` / `maxFullSuiteSkipped` / e2e 12/8，取“记录值”与“静态扫描用例数×98%”的较大者；
 基线缺失/损坏直接 FAIL）。**新增或删除测试时必须同步更新该文件**，否则门禁会按旧下限误判。
-反证已通过：删掉一个 53-test 文件 → 门禁 FAIL（expected ≥1358, got 1305）；e2e 全 skip → FAIL；伪造失败 → FAIL。
+反证已通过：删掉一个 53-test 文件 → 门禁 FAIL（expected ≥1379, got 1326）；e2e 全 skip → FAIL；伪造失败 → FAIL。
 
 > 仓库零依赖，不需要 `npm install`；`npm test` 只是 `node --test` 的快捷方式。
 > 也可分别运行 `node --test test/*.test.mjs`（引擎）与

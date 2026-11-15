@@ -14,7 +14,8 @@
 > 不再代表当前版本（数字统一以 `npm test` 实测为准，不在文档里写死）。
 > **v1.4.0 的验证记录见 §20**（确定性召回/公平性、时间辅助、小窗口、数据时代、兼容与性能）——
 > §20/§21 是 **v1.4.0 的历史记录**（2026-11-01/02 实测，数字已过时，仅作历史留档）。
-> **当前版本 v1.5.8 的最终验证记录见 §33**（2026-11-13 实测，图标替换 + 全量测试/门禁/自检/e2e）；
+> **当前版本 v1.5.9 的最终验证记录见 §34**（2026-11-15 实测，Derpyu 唤醒提示词归档还原 +
+> 全量测试/门禁/自检/e2e）；§33 是 v1.5.8 的图标替换记录（2026-11-13）；
 > §32 是 v1.5.7 的授权弹窗验证记录（2026-11-10/12，v1.5.8 未改其代码，结论仍适用）；
 > §22–§31 为 v1.4.1–v1.5.6 的历史记录（其中 v1.4.3 见 §24、v1.6.0 见 §27、v1.5.5 见 §30、v1.5.6 见 §31）。
 
@@ -2125,3 +2126,37 @@ Web GUI 页面加载了 `client.js` 并轮询到 `pending:true`。
 - **视觉渲染未截图**：插件页图标由 DSH Web GUI 渲染，本仓库没有浏览器截图能力（与 §3 的限制相同）。
   机制层（解析顺序、扩展名白名单、256 KiB 上限、data URL 渲染路径）已按宿主源码核对；
   DSH 重载插件行 / 重启后即可在「设置 → 插件」看到新图标。
+
+## 34. v1.5.9：Derpyu 唤醒提示词归档还原（2026-11-15）
+
+### 34.1 变更
+
+- 新增纯模块 `lib/wake-prompt.js`：识别 Derpyu 唤醒提示词，归档副本还原为
+  `【本次消息快照】` 的对话行（`[QQ 唤醒快照]` + `[at] sender：text`），
+  自动召回查询也只使用这段对话；无新对话的唤醒跳过本轮自动召回。
+- 生效条件严格限定为：compat 检测命中 Derpyu + 会话 id 为 `qqb-*` +
+  `compat.derpyuWakeSanitize !== false`。未装桥 / compat off / onebot / WebUI / 子代理
+  与 1.5.8 行为一致。
+- 只改归档副本与召回查询：活会话消息、turn 保护、桥接行为、token-meter 释放核算不动；
+  folder 标题取首条聊天行，`meta.stats` 用清洗后正文；旧数据不迁移。
+- 配置新增 `compat.derpyuWakeSanitize`（默认 `true`，`false` 一键回滚）。
+
+### 34.2 验证（2026-11-15，node v24.21.0）
+
+- `node --test` = **1379 tests / 1375 pass / 0 fail / 4 skip**（新增 21 例：
+  `test/wake-prompt.test.mjs` 13、`test/passive-archive.test.mjs` 2、
+  `test/compat.test.mjs` 1、`test-adapter/plugin-mock.test.mjs` 5）。
+- `node tools/verify-1.4.0.mjs` = **8/8 PASS**：privacy / unit-tests（1379 / 1375 pass /
+  0 fail / 4 skip）/ simulate / selfcheck / cli-help / memory-audit / time-view /
+  e2e-adapter 12/12 / e2e-real-data 8/8；`steps: 8/8 PASS · node:test cases: 1379 unique`。
+- 关键断言：全卡唤醒只出对话、无 `【角色卡`/`【会话令牌】`；空快照/超时唤醒为一行标记；
+  pretty JSON 走括号配对回退；截断 JSON 只留失败标记；普通消息/onebot/一代小唤醒/半角伪造
+  原样返回；Derpyu folder 正文与标题干净，`entry.tokens` 仍为测量值；
+  非 Derpyu 会话与 `derpyuWakeSanitize=false` 保持模板原样；空唤醒不产生召回块。
+
+### 34.3 未覆盖
+
+- 本机当前会话里没有可直接复现的真实桥接唤醒样本，验证使用与一条真实唤醒同构的
+  fixture（角色卡 + 令牌 + 快照 + 尾部指令）；上线后可用 CLI 日志
+  `wake sanitize: kind=wake-snapshot, template N chars -> conversation M chars` 观察真机字符数。
+- 旧数据（已入库的模板 folder）不在本版范围：不迁移、不删除、不重写。

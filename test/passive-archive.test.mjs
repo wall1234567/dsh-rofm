@@ -14,6 +14,7 @@ import { after, test } from 'node:test'
 
 import { loadConfig, loadIndex, readFolder, readStats } from '../engine/index.js'
 import { PassiveArchiver, extractShadowedMessages } from '../lib/passive-archive.js'
+import { sanitizeWakeForArchive } from '../lib/wake-prompt.js'
 
 // ---------------------------------------------------------------------------
 // fixtures
@@ -320,8 +321,71 @@ test('handle: archives the shadowed conversation into the scoped memory dir (heu
   assert.deepEqual(watermarkSeqs(memoryDir), [1, 2])
   assert.deepEqual(watermark.sessions['session-1'].folderIds, [folderId])
   assert.ok(Number.isFinite(watermark.updatedAt))
-  const leftovers = fs.readdirSync(memoryDir).filter((name) => name.endsWith('.tmp'))
+  // Only the watermark's own atomic temp file is relevant. A full-suite run can
+  // see unrelated `.tmp` files created by the OS/AV in %TEMP%; those must not
+  // turn an atomic-write assertion into a flaky failure.
+  const leftovers = fs.readdirSync(memoryDir).filter((name) => name.endsWith('.tmp') && name.includes('passive-watermark'))
   assert.deepEqual(leftovers, [], 'the watermark is written atomically (tmp + rename)')
+})
+
+test('handle: v1.5.9 stores a Derpyu wake prompt as its snapshot conversation only', () => {
+  const token = '0123456789abcdef0123456789abcdef'
+  const wake = [
+    '【角色卡】',
+    '你是群里的助手。',
+    '【角色卡结束】',
+    `【会话令牌】${token}`,
+    '【本次消息快照】',
+    JSON.stringify({
+      messages: [
+        { seq: 11, messageId: 'm-11', sender: '观戏走天地.逍遥', text: '今晚开黑吗', at: '21:58' },
+        { seq: 12, messageId: 'm-12', sender: '观戏走天地.逍遥', text: '8 点老地方', at: '21:59' },
+      ],
+      recent: [],
+    }),
+    '【回复检查】先看快照',
+  ].join('\n')
+  const events = [
+    userEvent(1, wake),
+    assistantEvent(2, '在的，八点老地方见。'),
+    summaryEvent(3, [1, 2]),
+  ]
+  const session = fakeSession(events, { id: `qqb-g-1134030529-${'a'.repeat(32)}` })
+  const { host, memoryDir, logs } = fakeHost()
+  host.normalizeWakeText = (content) => sanitizeWakeForArchive(content)
+
+  const result = new PassiveArchiver(host).handle(session, events[2])
+  assert.equal(result.archived, 2)
+  assert.equal(result.folderIds.length, 1)
+
+  const folder = readFolder(memoryDir, result.folderIds[0])
+  const { meta, messages } = folder
+  assert.equal(messages[0].role, 'user')
+  assert.equal(messages[0].content, '[QQ 唤醒快照]\n[21:58] 观戏走天地.逍遥：今晚开黑吗\n[21:59] 观戏走天地.逍遥：8 点老地方')
+  assert.ok(!messages[0].content.includes('【角色卡'))
+  assert.ok(!messages[0].content.includes('【会话令牌】'))
+  assert.ok(!messages[0].content.includes(token))
+  assert.equal(messages[1].content, '在的，八点老地方见。')
+  // Archive stats/title describe the cleaned conversation, not the template.
+  assert.ok(meta.stats.chars < wake.length, 'folder stats use the cleaned body')
+  assert.equal(meta.title, '[21:58] 观戏走天地.逍遥：今晚开黑吗')
+  // The sequence watermark still records the original message seq.
+  assert.deepEqual(watermarkSeqs(memoryDir, session.id), [1, 2])
+  assert.ok(
+    logs.some(([level, message]) => level === 'debug' && /wake sanitize kind=wake-snapshot/.test(message)),
+    'the sanitize is observable in the host log (lengths only)',
+  )
+})
+
+test('handle: without the v1.5.9 hook a wake prompt is archived verbatim (rollback)', () => {
+  const wake = `【本次消息快照】\n${JSON.stringify({ messages: [{ seq: 1, sender: '甲', text: '你好' }] })}\n【回复检查】`
+  const events = [userEvent(1, wake), assistantEvent(2, '你好'), summaryEvent(3, [1, 2])]
+  const session = fakeSession(events)
+  const { host, memoryDir } = fakeHost()
+  const result = new PassiveArchiver(host).handle(session, events[2])
+  assert.equal(result.archived, 2)
+  const folder = readFolder(memoryDir, result.folderIds[0])
+  assert.ok(folder.messages[0].content.includes('【本次消息快照】'), 'no hook = pre-v1.5.9 byte-identical behaviour')
 })
 
 test('handle: replaying the same event is a no-op, even from a fresh archiver instance', () => {

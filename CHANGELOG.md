@@ -7,6 +7,43 @@ The project follows a lightweight [SemVer](https://semver.org/) scheme.
 
 （下一个版本的变更写在这里。）
 
+## [1.5.9] — 2026-11-15
+
+**Derpyu 唤醒提示词归档还原：模板/角色卡/会话令牌不再被当成记忆归档与召回。**
+
+- **问题**：qq-bridge 把整段唤醒提示词（角色卡 + 规则 + `【会话令牌】` + `【本次消息快照】`
+  JSON + 尾部指令）以 `source.kind="user"` 注入会话。rofm 归档时把它当普通用户消息存进
+  memory folder，召回时又按模板段落匹配，形成“模板被归档 → 模板词召回模板 folder”的自激循环。
+- **修复（新模块 `lib/wake-prompt.js`，纯字符串、无 DSH import）**：
+  - 识别：`【本次消息快照】`（桥独占标记）优先；否则已知段头命中 ≥2 视为 shell 唤醒；
+    普通消息 / onebot / 一代 chat 小唤醒 / 半角伪造标记一律 `kind:'none'` 原样返回。
+  - 归档还原：从 `messages` + `recent` 拼对话行（`[at] sender：text`，按 `messageId || seq`
+    去重，`text` 优先、`plain` 兜底），会话令牌脱敏、孤立代理项清洗、≤8000 字符；
+    正文为 `[QQ 唤醒快照]` + 对话行。空快照/shell → `[QQ 唤醒：无新消息]`；
+    JSON 解析失败 → `[QQ 唤醒：快照无法解析，已省略模板]` + WARN（只记长度）。
+  - 生效条件（严格）：compat 检测命中 Derpyu **且** 会话 id 为 `qqb-*` **且**
+    `compat.derpyuWakeSanitize !== false`。未装桥 / compat off / onebot / WebUI / 子代理
+    的行为与 1.5.8 逐字节一致。
+- **接入**：主动归档 `lib/surface.js buildSurfaceEntries({ wakeSanitize })`；被动归档
+  `lib/passive-archive.js` 的 host `normalizeWakeText` 钩子；自动召回
+  `onInboxInserted` 只查询快照对话，无新对话的唤醒跳过本轮自动召回。
+- **口径**：只改归档副本与召回查询；活会话消息、turn 保护、桥接行为不动。
+  `entry.tokens` / 压缩释放核算仍是 token-meter 测量值（上下文实际释放量），
+  folder `meta.stats` 用清洗后正文计算；folder 标题取首条聊天行。
+  旧数据不迁移：新归档立刻干净，已入库的模板 folder 不重写、不删除。
+- **配置**：新增 `compat.derpyuWakeSanitize`（默认 `true`；`false` = 一键回滚到 1.5.8）。
+  `DEFAULT_COMPAT_CONFIG` / `normalizeCompatConfig` / 随包 `config.json` / README §3.2.9 同步；
+  非法值回退 `true` 并 warning。
+- **可观测**：每次还原打一条长度对比日志（`wake sanitize: kind=…, template N chars -> conversation M chars`）；
+  解析失败 WARN。不含正文。
+- **测试**：新增 `test/wake-prompt.test.mjs`（13）；`test/passive-archive.test.mjs` 增 2；
+  `test/compat.test.mjs` 增 1；`test-adapter/plugin-mock.test.mjs` 增 5（Derpyu 归档、
+  非 Derpyu / compat off / 回滚不变、召回只查对话、空唤醒跳过召回、门限矩阵）。全量
+  `node --test` = 1379 tests（1375 pass / 0 fail / 4 skip）。
+- **版本 / 文档**：`package.json` / `engine/package.json` = 1.5.9；README banner + §3.2 表 +
+  §3.2.9 配置 + §3.2.11；`docs/SPEC.md` §3 归档语义；`docs/PUBLISHING.md` 当前版本；
+  `tools/gate-baseline.json` 同步。
+
 ## [1.5.8] — 2026-11-13
 
 **插件图标换成「水面涟漪」插画；本版是 1.5.6 之后第一次对外发布，因此 1.5.7 的白名单授权弹窗随本版首发。**

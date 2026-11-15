@@ -62,6 +62,7 @@ test('normalizeCompatConfig: a missing block yields defaults with no warnings', 
     assert.equal(compat.memberMinAlpha, 0.5)
     assert.equal(compat.autoPatchDerpyu, true)
     assert.equal(compat.derpyuConsent, 'ask', 'v1.5.7: the whitelist patch asks before writing')
+    assert.equal(compat.derpyuWakeSanitize, true, 'v1.5.9: Derpyu wake restoration is on by default')
     assert.equal(compat.channelScore, 'model')
     assert.deepEqual(compat.mediaRoots, [])
     assert.equal(compat.maxImageBytes, 8 * 1024 * 1024)
@@ -124,6 +125,21 @@ test('normalizeCompatConfig: only a wrong ownerIds entry type is reported', () =
   assert.deepEqual(compat.ownerIds, ['123', '5'])
   assert.equal(warnings.length, 1)
   assert.ok(warnings[0].startsWith('compat.ownerIds'))
+})
+
+test('normalizeCompatConfig: derpyuWakeSanitize defaults true and accepts an explicit rollback', () => {
+  const defaults = normalizeCompatConfig(undefined)
+  assert.equal(defaults.compat.derpyuWakeSanitize, true, 'v1.5.9: restoration is on by default')
+  assert.deepEqual(defaults.warnings, [])
+
+  const off = normalizeCompatConfig({ derpyuWakeSanitize: false })
+  assert.equal(off.compat.derpyuWakeSanitize, false)
+  assert.deepEqual(off.warnings, [])
+
+  const invalid = normalizeCompatConfig({ derpyuWakeSanitize: 'no' })
+  assert.equal(invalid.compat.derpyuWakeSanitize, true)
+  assert.equal(invalid.warnings.length, 1)
+  assert.ok(invalid.warnings[0].startsWith('compat.derpyuWakeSanitize'))
 })
 
 test('compatDefaults returns a fresh mutable copy each time', () => {

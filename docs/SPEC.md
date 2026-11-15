@@ -6,6 +6,18 @@ anything from DeepSeek Harness (DSH). It can be executed standalone with
 `node engine/cli.mjs ...` and it is the only place where memory logic lives.
 The DSH plugin (`index.js` at the repo root) is a thin adapter around it.
 
+> **Revision note (2026-11-15, v1.5.9).** Derpyu wake-prompt restoration: when
+> compat detects qq-bridge, the session id is a `qqb-*` channel and
+> `compat.derpyuWakeSanitize !== false`, both archive paths store the conversation
+> inside the bridge's `【本次消息快照】` instead of the transport shell (persona card,
+> rules, session token, trailing instructions). The automatic recall query uses that
+> same conversation, and a wake with no new conversation skips automatic recall.
+> No live-session message, bridge behaviour, onebot/WebUI path or token-meter
+> release accounting changes; old folders are not rewritten or migrated.
+> `compat.derpyuWakeSanitize=false` is the one-switch rollback. The pure transform
+> is `lib/wake-prompt.js`; the archive semantics are documented in §3. Both
+> `package.json` files are **1.5.9**.
+>
 > **Revision note (2026-11-13, v1.5.8).** Packaging-only release: the Plugin
 > Manager icon moves from `icon.svg` to `icon.png` (256×256, rounded corners, 151 KB),
 > declared through the manifest `icon` field (which takes priority over the `./icon`
@@ -942,6 +954,35 @@ it `（缺失）` instead of failing.
 
 `context.json`: `{ "version": 1, "id": "...", "createdAt": …, "messages": MemMessage[] }`.
 The messages keep their original roles ordering; `time` is copied when known.
+
+**Archived object = conversation, not a bridge's transport shell (v1.5.9).**
+Derpyu/qq-bridge delivers each wake as one `source.kind="user"` message that contains a
+persona card, rules, `【会话令牌】`, the `【本次消息快照】` JSON packet and trailing
+instructions. That shell is infrastructure, not something the user said, so it must not
+become memory. When (and only when) compat detection hits Derpyu, the session id is a
+`qqb-*` channel and `compat.derpyuWakeSanitize !== false`, both archive paths store the
+snapshot conversation instead:
+
+```
+[QQ 唤醒快照]
+[21:58] 观戏走天地.逍遥：今晚开黑吗
+[21:59] 观戏走天地.逍遥：8 点老地方
+```
+
+`messages` (unread, oldest first) and `recent` are merged in order and de-duplicated by
+`messageId || seq`; `text` wins over `plain`; a row renders as `[at] sender：text`
+(`at` optional). If the snapshot has no rows the body is `[QQ 唤醒：无新消息]`; a shell
+wake without a snapshot uses the same marker; unparseable snapshot JSON is replaced by
+`[QQ 唤醒：快照无法解析，已省略模板]` plus a WARN (length only, never content). The
+conversation is token-redacted, well-formed and bounded to 8000 characters.
+
+The live session message, the bridge itself, onebot/WebUI/subagent paths and the
+current-turn protection are untouched: only the archive copy (`context.json` text and
+folder `meta.title`/`meta.stats`) and the automatic recall query change. Token accounting
+stays separate: compression release uses the token-meter measurement of the original
+message (what the context actually released), while `meta.stats` is computed from the
+cleaned body. No old folder is rewritten or deleted; `compat.derpyuWakeSanitize=false`
+restores the pre-1.5.9 behaviour. The pure transform lives in `lib/wake-prompt.js`.
 
 `index.json` (fast recall path; must always be consistent with folders):
 

@@ -296,6 +296,7 @@
     "memberMinAlpha": 0.5,
     "autoPatchDerpyu": true,
     "derpyuConsent": "ask",
+    "derpyuWakeSanitize": true,
     "channelScore": "model",
     "mediaRoots": [],
     "maxImageBytes": 8388608,
